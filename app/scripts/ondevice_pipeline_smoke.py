@@ -55,9 +55,27 @@ async def main():
     os.environ["LD_LIBRARY_PATH"] = f"{PREFIX}/lib"
     task = asyncio.create_task(sup.run())
     await asyncio.sleep(25)  # ~5 realtime segments
-    event_time = time.time() - 8
     detector = CandidateDetector(f"{PREFIX}/bin/ffmpeg", buf, db)
     candidates = await asyncio.to_thread(detector.process_new_segments)
+    # Automatic-chain acceptance: extraction must be driven by a real
+    # detected candidate. An injected timestamp would prove only the
+    # supervised chain, not the automatic one.
+    conn = connect(db)
+    row = conn.execute(
+        "SELECT detected_at, kind FROM candidate_events"
+        " WHERE session_id=1 ORDER BY detected_at LIMIT 1").fetchone()
+    conn.close()
+    if row is None:
+        sup.stopping.set()
+        await asyncio.wait_for(task, timeout=20)
+        print("EVIDENCE " + json.dumps({
+            "segments": len(buf.segments()),
+            "candidates_recorded": candidates,
+            "automatic_chain": False,
+            "failure": "no candidate detected - extraction not attempted",
+        }))
+        return
+    event_time = float(row[0])
     clip_path = f"{WORK}/clip.mp4"
     clip = await asyncio.to_thread(
         extract_clip, f"{PREFIX}/bin/ffmpeg", buf, event_time, clip_path,
@@ -96,6 +114,8 @@ async def main():
     print("EVIDENCE " + json.dumps({
         "segments": len(buf.segments()),
         "candidates_recorded": candidates,
+        "event_driven": True,
+        "event_kind": row[1],
         "candidate_kinds": kinds,
         "clip_extracted": bool(clip and clip_bytes > 10000),
         "clip_bytes": clip_bytes,

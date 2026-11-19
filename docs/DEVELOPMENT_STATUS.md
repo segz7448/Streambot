@@ -20,7 +20,7 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 013 | Telegram delivery | LIVE-ACCEPTED 2026-11-19: synthetic clip delivered to paired owner (Telegram message_id 15) after upload-timeout hardening (b0b0e96); owner-scoped by construction (paired admin only) |
 | 014 | Live distribution (relay) | NOT STARTED (no code) |
 | 015 | Monitoring & recovery | PARTIAL (supervisor + health + job recovery in foundation; bot recovery rollout live: restart-safe updates + watermark, no-evict failed set, condensed recoverable logs; confirm-to-handle crash gap documented, persistent pre-ack inbox not built) |
-| 016 | Acceptance test | PARTIAL: fixture chain (record->detect->extract) device-run; full chained fixture->edit->QC->deliver in progress; REAL-SOURCE acceptance not run and cannot run until a verified authorized Twitch ingestion route exists |
+| 016 | Acceptance test | PARTIAL: supervised fixture chain (record->time-injected extract->edit->QC->deliver) device-run 2026-11-19 (delivered msg 16); AUTOMATIC event-triggered chain NOT yet verified - that run recorded 0 candidates and extraction was triggered by an injected timestamp, so detect->clip automation remains unproven until one real detected candidate drives extraction and delivery without manual injection; REAL-SOURCE acceptance not run and cannot run until a verified authorized Twitch ingestion route exists |
 | 017 | Documentation & release | README + this file started |
 
 Added scope (owner, 2026-11-18): YouTube publishing module (OAuth 2.0,
