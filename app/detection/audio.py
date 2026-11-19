@@ -35,20 +35,33 @@ def loudness_samples(ffmpeg: str, path: str) -> list[LoudnessSample]:
 
 def spikes_episode(samples: list[LoudnessSample], baseline: float | None,
                     min_rise_lufs: float, floor_lufs: float,
-                    episode_active: bool) -> tuple[list[tuple[float, float]], bool]:
+                    episode_active: bool,
+                    silence_end_seconds: float = 1.5) -> tuple[list[tuple[float, float]], bool]:
     """Core spike scan with episode carry-in. Returns (spikes, active_at_end)
     so a caller analyzing consecutive chunks can suppress a duplicate spike
-    for one moment that spans a chunk boundary."""
+    for one moment that spans a chunk boundary.
+
+    Brief below-floor gaps (real dropouts, or the ~0.2-0.3s cold-start
+    transient ebur128 reports at the start of each new segment file) do
+    not end an episode; only silence sustained >= silence_end_seconds
+    does. Without this, a boundary-spanning burst re-fires right after
+    each chunk's cold-start (device-verified failure mode)."""
     episode_end_lufs = min_rise_lufs / 2
     spikes: list[tuple[float, float]] = []
     window: list[float] = []
     in_episode = episode_active
     ep_time = 0.0
     ep_peak = -float("inf")
+    silence_start: float | None = None
     for s in samples:
         if s.momentary <= floor_lufs:
-            in_episode = False  # silence ends the episode
+            if in_episode:
+                if silence_start is None:
+                    silence_start = s.t
+                elif s.t - silence_start >= silence_end_seconds:
+                    in_episode = False  # sustained silence ends the episode
             continue
+        silence_start = None
         base = baseline if baseline is not None else (
             sum(window) / len(window) if window else None)
         if in_episode:
@@ -76,11 +89,11 @@ def loudness_spikes(samples: list[LoudnessSample], baseline: float | None,
 
     Episode merging: one sustained loud episode produces ONE spike, not
     one per rising edge. After a spike, no new spike can start until the
-    signal falls back below base + min_rise_lufs/2 (or hits the silence
-    floor) - so a 4s burst yields a single candidate, while two bursts
-    separated by a return toward baseline stay distinct moments. The
-    returned lufs tracks the episode's peak; the timestamp stays at the
-    episode's first rising edge (pre-roll covers context)."""
+    signal falls back below base + min_rise_lufs/2 (or silence sustained
+    past a short tolerance) - so a 4s burst yields a single candidate,
+    while two bursts separated by a return toward baseline stay distinct
+    moments. The returned lufs tracks the episode's peak; the timestamp
+    stays at the episode's first rising edge (pre-roll covers context)."""
     spikes, _ = spikes_episode(samples, baseline, min_rise_lufs,
                                 floor_lufs, episode_active=False)
     return spikes

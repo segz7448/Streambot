@@ -65,6 +65,28 @@ class LoudnessSpikeTests(unittest.TestCase):
         spikes = audio.loudness_spikes(samples, baseline=-30.0)
         self.assertEqual(len(spikes), 2)
 
+    def test_carried_episode_survives_chunk_cold_start(self):
+        # device-verified failure mode: ebur128 reports below-floor
+        # momentary for the first ~0.3s of each new segment file; a
+        # carried episode must not end on that transient and re-fire.
+        seg_a = ([audio.LoudnessSample(t * 0.5, -30.0) for t in range(8)]
+                 + [audio.LoudnessSample(4.0 + i * 0.5, -15.0) for i in range(4)])
+        spikes_a, active = audio.spikes_episode(seg_a, -30.0, 6.0, -60.0, False)
+        self.assertTrue(active)
+        self.assertEqual(len(spikes_a), 1)
+        seg_b = ([audio.LoudnessSample(i * 0.1, -70.0) for i in range(3)]
+                 + [audio.LoudnessSample(0.3 + i * 0.5, -15.0) for i in range(4)]
+                 + [audio.LoudnessSample(2.3 + i * 0.5, -30.0) for i in range(6)])
+        spikes_b, active = audio.spikes_episode(seg_b, -30.0, 6.0, -60.0, active)
+        self.assertEqual(spikes_b, [])  # no duplicate spike across boundary
+        self.assertFalse(active)  # quiet tail closed the episode
+
+    def test_sustained_silence_ends_carried_episode(self):
+        seg_b = ([audio.LoudnessSample(i * 0.5, -70.0) for i in range(6)]
+                 + [audio.LoudnessSample(3.0 + i * 0.5, -15.0) for i in range(3)])
+        spikes, active = audio.spikes_episode(seg_b, -30.0, 6.0, -60.0, True)
+        self.assertEqual(len(spikes), 1)  # genuinely new burst after a gap
+
 
 class DetectorTests(unittest.TestCase):
     def setUp(self):
