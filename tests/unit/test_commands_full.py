@@ -237,3 +237,77 @@ class PublishCommandTests(unittest.TestCase):
     def test_publish_in_side_effecting(self):
         from app.bot import ops
         self.assertIn("publish", ops.SIDE_EFFECTING)
+
+
+class YouTubeAuthTests(unittest.TestCase):
+
+    def _dir_with_client(self, secret_mode=0o600):
+        d = Path(tempfile.mkdtemp())
+        (d / "youtube_client_id").write_text("cid")
+        sp = d / "youtube_client_secret"
+        sp.write_text("cs")
+        os.chmod(sp, secret_mode)
+        return d
+
+    def tearDown(self):
+        # never leak the module-level lock between tests
+        cf._YOUTUBEAUTH_LOCK.acquire(blocking=False)
+        try:
+            cf._YOUTUBEAUTH_LOCK.release()
+        except RuntimeError:
+            pass
+
+    def test_setup_instructions_without_client(self):
+        d = Path(tempfile.mkdtemp())
+        r = cf.youtubeauth_reply(d, "")
+        self.assertIn("Google OAuth client first", r)
+        self.assertIn("Not configured", cf.youtubeauth_reply(d, "status"))
+
+    def test_bind_failure_releases_lock_and_close_runs(self):
+        d = self._dir_with_client()
+        with mock.patch("app.distribution.youtube.HTTPServer",
+                        side_effect=OSError("address in use")):
+            r1 = cf.youtubeauth_reply(d, "")
+        self.assertIn("Could not start", r1)
+        # the lock survived: a second attempt must not say "already
+        # waiting" - it must try (and fail the same way) again
+        with mock.patch("app.distribution.youtube.HTTPServer",
+                        side_effect=OSError("address in use")):
+            r2 = cf.youtubeauth_reply(d, "")
+        self.assertIn("Could not start", r2)
+        self.assertNotIn("already waiting", r2)
+
+    def test_world_readable_secret_refused_before_lock_leak(self):
+        d = self._dir_with_client(secret_mode=0o644)
+        r1 = cf.youtubeauth_reply(d, "")
+        self.assertIn("readable by others", r1)
+        r2 = cf.youtubeauth_reply(d, "")
+        self.assertIn("readable by others", r2)  # lock not stuck
+
+    def test_success_stores_token_0600_and_closes_server(self):
+        d = self._dir_with_client()
+        flow = mock.Mock()
+        flow.authorization_url = "https://accounts.google.com/x"
+        flow.wait_for_code.return_value = "code"
+        flow.exchange.return_value = {"refresh_token": "rtok"}
+        with mock.patch("app.distribution.youtube.LoopbackAuth",
+                        return_value=flow):
+            r = cf.youtubeauth_reply(d, "")
+        self.assertIn("youtube.upload", r)
+        import time as _t
+        for _ in range(200):
+            # completion ends with lock release; waiting for that also
+            # covers the finally (server_close) running first
+            if cf._YOUTUBEAUTH_LOCK.acquire(blocking=False):
+                cf._YOUTUBEAUTH_LOCK.release()
+                break
+            _t.sleep(0.02)
+        self.assertEqual((d / "youtube_refresh_token").read_text(),
+                         "rtok")
+        self.assertEqual((d / "youtube_refresh_token").stat().st_mode
+                         & 0o777, 0o600)
+        flow._server.server_close.assert_called_once()
+        # lock free for the next run
+        self.assertTrue((d / "youtube_refresh_token").exists())
+        r2 = cf.youtubeauth_reply(d, "")
+        self.assertIn("already authorized", r2)

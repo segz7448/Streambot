@@ -433,8 +433,23 @@ def youtubeauth_reply(state_dir: Path, args: str) -> str:
     if not _YOUTUBEAUTH_LOCK.acquire(blocking=False):
         return ("A consent run is already waiting for you. Open the "
                 "link I sent, or wait for it to expire (5 minutes).")
+    # the client id is public by design; the client secret is not
+    for path, label in ((secret_path, "youtube_client_secret"),):
+        if path.exists() and path.stat().st_mode & 0o077:
+            _YOUTUBEAUTH_LOCK.release()
+            record_error(state_dir,
+                         f"youtubeauth refused: {label} is group/world-"
+                         "readable")
+            return (f"Refused: {label} is readable by others. "
+                    "Re-provision it 0600 through the secret channel. "
+                    "Nothing was started.")
     from ..distribution.youtube import LoopbackAuth
-    flow = LoopbackAuth(cid, secret, host="127.0.0.1", port=0)
+    try:
+        flow = LoopbackAuth(cid, secret, host="127.0.0.1", port=0)
+    except Exception as exc:
+        _YOUTUBEAUTH_LOCK.release()
+        record_error(state_dir, f"youtubeauth could not start: {exc}")
+        return f"Could not start the consent listener: {exc}"
 
     def complete():
         try:
@@ -452,6 +467,10 @@ def youtubeauth_reply(state_dir: Path, args: str) -> str:
         except Exception as exc:
             record_error(state_dir, f"youtubeauth failed: {exc}")
         finally:
+            try:
+                flow._server.server_close()
+            except Exception:
+                pass
             _YOUTUBEAUTH_LOCK.release()
 
     threading.Thread(target=complete, daemon=True).start()
