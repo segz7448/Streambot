@@ -432,6 +432,10 @@ def deliver_one_clip(state_dir: Path, clip_id: int,
     durability. Returns one of: delivered, reconciled, uncertain,
     skipped_uncertain, unavailable, not_held, missing.
 
+    The whole check/send/commit sequence runs under a per-clip file
+    lock, so concurrent callers (auto-deliver, manual flush, replay)
+    cannot both pass the journal check while one upload is in flight.
+
     unavailable = the send could not even be attempted (no token
     configured, no paired admin): the clip stays plainly HELD, NOT
     marked uncertain, because nothing can have reached Telegram.
@@ -444,6 +448,29 @@ def deliver_one_clip(state_dir: Path, clip_id: int,
     is reconciled to DELIVERED without resending. No exactly-once
     claim: the uncertain state is the honest answer for a send
     interrupted mid-flight."""
+    import fcntl as _fcntl
+    import os as _os
+    import time as _time
+    from ..core.database import connect
+    # Serialize check/send/commit per clip across ALL callers (session
+    # finish hook, mode C ingest, manual flush, replay reconcile) and
+    # across processes: without this, two callers can both pass the
+    # journal check while one upload is in flight and send the same
+    # clip twice. The lock file is never unlinked: unlinking while a
+    # waiter holds the fd would split the lock onto a new inode.
+    lock_fd = _os.open(str(state_dir / f"deliver-{clip_id}.lock"),
+                       _os.O_CREAT | _os.O_RDWR, 0o600)
+    _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+    try:
+        return _deliver_one_clip_locked(state_dir, clip_id, deliver_fn)
+    finally:
+        _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        _os.close(lock_fd)
+
+
+def _deliver_one_clip_locked(state_dir: Path, clip_id: int,
+                             deliver_fn=None) -> str:
+    """Body of deliver_one_clip, called with the per-clip lock held."""
     import os as _os
     import time as _time
     from ..core.database import connect

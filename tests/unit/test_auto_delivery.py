@@ -422,3 +422,94 @@ class CrashWindowReconciliationTests(unittest.TestCase):
         self.assertEqual(self.process_calls, [])
         self.assertEqual(sent, [])
         self.assertIn("Already processed", out)
+
+
+class ConcurrentDeliveryTests(unittest.TestCase):
+    """Reviewer race: concurrent callers must not both pass the journal
+    check while one upload is in flight."""
+
+    def test_slow_sender_concurrent_callers_single_send(self):
+        import threading
+        import time
+        d = pathlib.Path(tempfile.mkdtemp())
+        (cid,) = _db_with_held(d, 1)
+        calls = []
+
+        def slow(p, c):
+            calls.append(p)
+            time.sleep(0.3)  # in-flight upload window
+            return 101
+
+        results = {}
+
+        def call(name):
+            results[name] = ops.deliver_one_clip(d, cid,
+                                                 deliver_fn=slow)
+
+        a = threading.Thread(target=call, args=("auto",))
+        a.start()
+        time.sleep(0.05)  # A is mid-upload when B arrives
+        call("flush")     # blocks on the lock, then reconciles
+        a.join()
+        self.assertEqual(calls, ["/x0.mp4"])  # exactly one send
+        # the late caller finds the clip already DELIVERED by the
+        # in-flight one: no resend, no reconcile ambiguity
+        self.assertEqual(sorted(results.values()),
+                         ["delivered", "not_held"])
+        self.assertEqual(_status(d, cid), "DELIVERED")
+
+    def test_concurrent_caller_after_failure_sees_uncertain(self):
+        import threading
+        import time
+        d = pathlib.Path(tempfile.mkdtemp())
+        (cid,) = _db_with_held(d, 1)
+        calls = []
+
+        def slow_fail(p, c):
+            calls.append(p)
+            time.sleep(0.2)
+            raise RuntimeError("network died mid-send")
+
+        def call():
+            return ops.deliver_one_clip(d, cid, deliver_fn=slow_fail)
+
+        a = threading.Thread(target=call)
+        a.start()
+        time.sleep(0.05)
+        second = ops.deliver_one_clip(
+            d, cid, deliver_fn=lambda p, c: calls.append(p) or 1)
+        a.join()
+        self.assertEqual(calls, ["/x0.mp4"])  # B never sent
+        self.assertEqual(second, "skipped_uncertain")
+        self.assertEqual(_status(d, cid), "HELD")
+
+    def test_flush_and_replay_reconcile_concurrently(self):
+        import threading
+        import time
+        d = pathlib.Path(tempfile.mkdtemp())
+        (cid,) = _db_with_held(d, 1)
+        calls = []
+
+        def slow(p, c):
+            calls.append(p)
+            time.sleep(0.2)
+            return 202
+
+        flush_out = {}
+
+        def flush():
+            flush_out["text"] = ops.deliveries_reply(d, "flush",
+                                                     deliver_fn=slow)
+
+        t = threading.Thread(target=flush)
+        t.start()
+        time.sleep(0.05)
+        # a replay reconcile for the same clip mid-flush
+        replay = ops.auto_deliver_clips(d, [cid], deliver_fn=slow)
+        t.join()
+        self.assertEqual(calls, ["/x0.mp4"])  # one actual send total
+        self.assertEqual(_status(d, cid), "DELIVERED")
+        self.assertIn("Delivered 1", flush_out["text"])
+        # the concurrent replay caused no second send and no uncertain
+        self.assertEqual(replay["delivered"], 0)
+        self.assertEqual(replay["uncertain"], 0)

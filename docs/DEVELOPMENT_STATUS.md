@@ -438,3 +438,10 @@ REVIEW HARDENING (reviewer pass on the auto-delivery candidate):
   reports them in clean copy instead of crashing mid-flush.
 - _media busy flag cleanup now covers the reply send as well as the
   ingest, so no exception ordering can strand the flag.
+- Delivery check/send/commit is serialized per clip with a held file
+  lock (state/deliver-<id>.lock, never unlinked) across all callers -
+  session hook, mode C ingest, manual flush, replay reconcile - and
+  across processes, closing the concurrent duplicate-send race. Tests:
+  slow-sender concurrent callers produce exactly one send; a caller
+  arriving after a mid-flight failure sees skipped_uncertain and never
+  resends; a flush concurrent with a replay reconcile sends once.
