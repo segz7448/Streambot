@@ -107,8 +107,8 @@ class AutoClipper:
                     (event["id"],))
                 continue
             conn.execute(
-                "INSERT INTO clips (event_id, session_id, file_path,"
-                " duration_seconds, status, created_at)"
+                "INSERT OR IGNORE INTO clips (event_id, session_id,"
+                " file_path, duration_seconds, status, created_at)"
                 " VALUES (?,?,?,?,?,?)",
                 (event["id"], self.buffer.session_id, str(path),
                  self.buffer.segment_seconds, "PENDING", time.time()))

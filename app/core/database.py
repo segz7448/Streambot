@@ -124,6 +124,15 @@ MIGRATIONS: list[tuple[int, str]] = [
         message TEXT NOT NULL
     );
     """),
+    (2, """
+    -- At-least-once extraction with exactly-once clips rows: if the
+    -- process dies after extract_clip wrote the file but before the
+    -- clips row commits, the retried pass re-extracts to the same
+    -- deterministic path (idempotent) and INSERT OR IGNORE keeps the
+    -- row count at one.
+    CREATE UNIQUE INDEX IF NOT EXISTS clips_event_unique
+        ON clips(event_id) WHERE event_id IS NOT NULL;
+    """),
 ]
 
 JOB_STATES = (

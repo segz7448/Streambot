@@ -123,6 +123,39 @@ class AutoClipTests(unittest.TestCase):
         clipper.provider = HeuristicProvider()
         self.assertEqual(clipper.process_pending(), 1)
 
+    def test_crash_after_extract_before_commit_no_duplicate_rows(self):
+        # Simulate death between a successful extraction and the DB
+        # commit: first pass raises after writing the file. The retried
+        # pass re-extracts (same deterministic path, idempotent) and the
+        # unique index + INSERT OR IGNORE keep exactly one clips row.
+        calls = {"n": 0}
+
+        def flaky(ffmpeg, buffer, ts, out):
+            calls["n"] += 1
+            Path(out).write_text("clip-bytes")
+            if calls["n"] == 1:
+                raise SystemExit("simulated crash after file write")
+            return Path(out)
+
+        clipper = self._clipper(flaky)
+        # first pass dies mid-flight (uncaught crash propagates)
+        self.assertRaises(SystemExit, clipper.process_pending)
+        conn = connect(self.db)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM clips").fetchone()[0], 0)
+        self.assertEqual(conn.execute(
+            "SELECT status FROM candidate_events").fetchone()[0],
+            "PENDING")
+        conn.close()
+        # retry after restart: file overwritten in place, one row only
+        self.assertEqual(clipper.process_pending(), 1)
+        conn = connect(self.db)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM clips").fetchone()[0], 1)
+        conn.close()
+        # and a further pass is a no-op (terminal-state dedup)
+        self.assertEqual(clipper.process_pending(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
