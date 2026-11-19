@@ -232,3 +232,49 @@ STILL MISSING / NOT ESTABLISHED:
   require owner-side setup/consent not yet in place.
 - AI intelligence beyond audio-spike heuristics: no authorized $0
   provider.
+
+## Memory, planner, durability round 3 (2026-11-19, ~04:05 PST)
+
+CODE main@1c548b5, 162/162. DEPLOYED: 2cfba911 running 4a176b5;
+1c548b5 (planner precision, uncertain-op reconciliation, integration)
+pushed-not-deployed.
+
+YouTube policy, exact sources (fetched 2026-11-19):
+- https://support.google.com/youtube/answer/15424877 - square/vertical
+  up to 3 minutes categorized as Shorts (after 2024-10-15; music/artist
+  channels after 2025-12-08); a Short over 1 minute with ANY active
+  copyright claim is blocked globally; Audio Library songs mostly 90s
+  per 3-minute Short.
+- https://support.google.com/youtube/answer/10059070 - title max 100
+  chars (upload flow); "maximum resolution 1080p" appears ONLY in the
+  in-app Shorts creation flow.
+- https://support.google.com/youtube/answer/12779649 - desktop upload:
+  up to 3 minutes, square/vertical; NO resolution cap stated; no API
+  upload resolution cap verified -> none enforced.
+Planner defaults to the full 180s Shorts cap (owner's stated target).
+The >60s claim-block is a surfaced risk, not a default: shorter
+duration does not clear copyright; original-audio rights remain the
+owner's. Creative preferences (title template, tags, watermark) are
+memory-stored owner overrides, distinct from policy.
+
+Durability: side-effecting commands (clipnow, relay) stranded without a
+journal record are marked UNCERTAIN and reported to the admin, never
+blind-retried - the success-before-journal-commit ambiguity is
+preserved for reconciliation. Integration: /addsource records channels
+in memory; /clipnow plans via the planner and records clips.
+
+FEASIBLE INTELLIGENCE ASSESSMENT at $0 on authorized resources:
+- Deliverable and honest: signal heuristics (audio spikes now; ffmpeg
+  scene-change/freezedetect/blackdetect and signal-fusion ranking are
+  implementable stdlib-only), persistent memory with provenance, and an
+  owner feedback loop (owner states preferences; memory applies them).
+  These are heuristics + memory, NOT understanding.
+- Not feasible under current constraints: semantic gameplay
+  understanding (recognizing kills/plays/funny moments) needs a real
+  vision/audio model. The phone runs a stdlib-only prefix without pip;
+  no external inference provider is approved (Groq rejected); no model
+  binaries may enter git.
+- Not available: an always-on agent backend for runtime decisions - no
+  supported authorized execution route exists for that; not promised.
+Capability gap for semantic selection stands and is reported, not
+papered over.
