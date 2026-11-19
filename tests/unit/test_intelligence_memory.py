@@ -44,13 +44,13 @@ class PlannerTests(unittest.TestCase):
         plan = plan_clip("audio_spike", "somechannel", self.mem,
                          game="Elden Ring")
         self.assertEqual(plan.target_seconds, EDITORIAL_DEFAULT_SECONDS)
-        self.assertTrue(any("risk" in r for r in plan.reasons))
         sized = plan_clip("audio_spike", "somechannel", self.mem,
                           game="Elden Ring", content_seconds=12)
         self.assertEqual(sized.target_seconds, 12)  # never padded
         long_ev = plan_clip("audio_spike", "c", self.mem,
                             content_seconds=400)
         self.assertEqual(long_ev.target_seconds, SHORTS_MAX_SECONDS)
+        self.assertTrue(any("risk" in r for r in long_ev.reasons))
         self.assertEqual(plan.preset, "vertical")
         self.assertLessEqual(len(plan.title), 100)
         self.assertIn("eldenring", plan.tags)
