@@ -68,9 +68,12 @@ def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
         for seg in plan.segments:
             fh.write(f"file '{seg.path}'\n")
         list_path = fh.name
-    proc = subprocess.run(
-        extract_args(ffmpeg, list_path, plan, out_path),
-        capture_output=True, text=True, timeout=300)
+    try:
+        proc = subprocess.run(
+            extract_args(ffmpeg, list_path, plan, out_path),
+            capture_output=True, text=True, timeout=300)
+    finally:
+        Path(list_path).unlink(missing_ok=True)  # clean only our own temp
     if proc.returncode != 0:
         raise RuntimeError(f"clip extraction failed rc={proc.returncode}: "
                            f"{proc.stderr[-300:]!r}")

@@ -44,9 +44,17 @@ class RollingBuffer:
         return self.root / f"session-{self.session_id}"
 
     def segment_args(self, input_url: str) -> list[str]:
-        """FFmpeg args producing numbered segments for this session."""
+        """FFmpeg args producing numbered segments for this session.
+        Protocol access is whitelisted per feed kind: a local recording
+        may open files only; a registered http(s) feed may speak only
+        the protocols that carry it (redirects to file:// or other
+        schemes are refused by ffmpeg)."""
         pattern = str(self.dir / "seg-%06d.ts")
+        whitelist = ("http,https,tcp,tls"
+                     if input_url.startswith(("http://", "https://"))
+                     else "file")
         return ["-hide_banner", "-loglevel", "warning",
+                "-protocol_whitelist", whitelist,
                 "-i", input_url, "-c", "copy",
                 "-f", "segment", "-segment_time", str(self.segment_seconds),
                 "-reset_timestamps", "1", pattern]

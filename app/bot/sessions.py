@@ -59,6 +59,16 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
         feed = validate_feed(feed_spec, state_dir / "feeds")
     except ValueError as exc:
         return f"Refused: {exc}. Session NOT started."
+    if not feed.startswith(("http://", "https://")):
+        # a local recording feed is validated exactly like a mode C
+        # upload before any process starts (fail closed)
+        from ..clipping.retrospective import (ValidationError,
+                                              validate_recording)
+        try:
+            validate_recording(ffprobe, feed)
+        except ValidationError as exc:
+            return (f"Refused: local feed failed validation ({exc}). "
+                    "Session NOT started.")
     with _lock:
         existing = _sessions.get(username)
         if existing is not None and not existing._stopping.is_set():

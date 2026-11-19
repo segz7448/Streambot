@@ -56,8 +56,24 @@ class ClipSession:
         if self._thread:
             self._thread.join(timeout)
 
-    def _finish_clips(self, conn, session_id: int, out_dir: Path,
+    def _finish_clips(self, session_id: int, out_dir: Path,
                       runtime_dir: Path) -> None:
+        """Edit + QC pending clips. Runs on a worker thread (via
+        asyncio.to_thread) so ffmpeg never stalls the recorder's event
+        loop; opens its own DB connection for that thread."""
+        from ..editing.editor import edit_clip
+        from ..editing.presets import PRESETS
+        from ..intelligence.memory import Memory
+        from ..intelligence.planner import plan_clip
+        from ..qc.verify import check_media
+        conn = connect(str(self.state_dir / "nova.db"))
+        try:
+            self._finish_clips_db(conn, session_id, out_dir, runtime_dir)
+        finally:
+            conn.close()
+
+    def _finish_clips_db(self, conn, session_id: int, out_dir: Path,
+                         runtime_dir: Path) -> None:
         from ..editing.editor import edit_clip
         from ..editing.presets import PRESETS
         from ..intelligence.memory import Memory
@@ -153,15 +169,21 @@ class ClipSession:
             HealthRegistry())          # live-feed restart is future work
         task = asyncio.create_task(sup.run())
         crashed = False
+        finishing = False
         try:
             while not self._stopping.is_set():
                 await asyncio.sleep(self.tick_seconds)
                 await asyncio.to_thread(detector.process_new_segments)
                 await asyncio.to_thread(clipper.process_pending)
-                conn = connect(db_path)
-                self._finish_clips(conn, session_id, work,
-                                   self.state_dir / "runtime")
-                conn.close()
+                if not finishing:
+                    # edit/QC is heavy; never block the recorder loop
+                    finishing = True
+                    try:
+                        await asyncio.to_thread(
+                            self._finish_clips, session_id, work,
+                            self.state_dir / "runtime")
+                    finally:
+                        finishing = False
                 if task.done():
                     exc = task.exception() if not task.cancelled() \
                         else None
@@ -183,9 +205,10 @@ class ClipSession:
             try:
                 await asyncio.to_thread(detector.process_new_segments)
                 await asyncio.to_thread(clipper.process_pending)
+                await asyncio.to_thread(
+                    self._finish_clips, session_id, work,
+                    self.state_dir / "runtime")
                 conn = connect(db_path)
-                self._finish_clips(conn, session_id, work,
-                                   self.state_dir / "runtime")
                 conn.execute(
                     "UPDATE stream_sessions SET state=?, ended_at=?"
                     " WHERE id=?",

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import tempfile
 import unittest
 
@@ -75,3 +76,26 @@ class RelayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FeedHostGuardTests(unittest.TestCase):
+    """Mode A feed URLs must not be silently network-unrestricted."""
+
+    def test_private_and_local_hosts_refused(self):
+        from app.distribution.relay import validate_feed
+        for url in ("http://127.0.0.1:8080/admin",
+                    "http://10.0.0.5/feed",
+                    "http://192.168.1.10/feed",
+                    "http://169.254.169.254/latest/meta-data",
+                    "http://localhost/feed",
+                    "http://router.local/feed",
+                    "http://0.0.0.0/feed"):
+            with self.assertRaises(ValueError, msg=url):
+                validate_feed(url, Path("/tmp/feeds"))
+
+    def test_public_feed_accepted(self):
+        from app.distribution.relay import validate_feed
+        self.assertEqual(
+            validate_feed("https://cdn.example.com/broadcaster-feed",
+                          Path("/tmp/feeds")),
+            "https://cdn.example.com/broadcaster-feed")

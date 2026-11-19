@@ -150,6 +150,18 @@ async def ingest_media(update, bot, state_dir: Path) -> str:
     src = uploads / f"{uid}.mp4"
     await tg_file.download_to_drive(src)
     cleanup_uploads(uploads)
+    # declared size is a claim, not a fact: verify the actual payload
+    # against the same bound after the transfer
+    actual = src.stat().st_size if src.exists() else 0
+    if actual == 0 or actual > MAX_VIDEO_BYTES:
+        try:
+            src.unlink()
+        except OSError:
+            pass
+        text = ("Refused: the downloaded bytes did not match the "
+                "declared bounds. Removed, nothing processed.")
+        ops.journal_record(state_dir, uid, "ingest", text)
+        return text
     ff, fp = ffmpeg_paths()
     from ..clipping.retrospective import (ValidationError,
                                           process_recording,

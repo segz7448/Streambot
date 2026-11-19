@@ -52,9 +52,12 @@ class BotService:
         self.app.add_handler(MessageHandler(
             (filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND,
             self._media, block=False))
-        # one video at a time: processing is heavy on this host
-        import asyncio as _asyncio
-        self._media_sem = _asyncio.Semaphore(1)
+        # one video at a time: processing is heavy on this host. A plain
+        # flag, not Semaphore.locked()+acquire: check-and-set with no
+        # await in between is atomic on the single event loop, so an
+        # overload is REJECTED with a busy reply instead of queueing an
+        # unbounded waiter inside acquire().
+        self._media_busy = False
         # true pre-ack: wrap the update queue's put so command updates
         # are persisted before the framework advances its offset
         from . import ops as _ops
@@ -298,17 +301,20 @@ class BotService:
             self.watermark.mark_handled(update.update_id)
             return
         try:
-            if self._media_sem.locked():
+            if self._media_busy:
                 self.inbox.remove(update.update_id)
                 self.watermark.mark_handled(update.update_id)
                 await message.reply_text(
                     "I'm still processing the previous video. Send this "
                     "one again when it's done.")
                 return
-            async with self._media_sem:
+            self._media_busy = True
+            try:
                 from . import media as bot_media
                 reply = await bot_media.ingest_media(
                     update, context.bot, self._state_dir())
+            finally:
+                self._media_busy = False
             if reply:
                 await message.reply_text(reply)
             self.inbox.remove(update.update_id)
@@ -329,6 +335,19 @@ class BotService:
 
     def run(self) -> None:
         log.info("telegram service starting (long polling)")
+        # single-instance enforcement: crash recovery assumes exactly one
+        # writer owns this state dir. A second poller refuses to start.
+        import fcntl
+        import os as _os
+        lock_fd = _os.open(str(self._state_dir() / "service.lock"),
+                           _os.O_CREAT | _os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit(
+                "another NOVA service instance holds the state lock; "
+                "refusing to start a second poller")
+        self._lock_fd = lock_fd  # held for the life of the process
         from . import sessions as _sess_mod
         from ..pipeline.session import recover_interrupted_sessions
         recovered = recover_interrupted_sessions(self._state_dir())

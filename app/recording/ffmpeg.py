@@ -11,6 +11,7 @@ import asyncio
 import json
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -39,10 +40,30 @@ class FFmpegProcess:
     async def start(self) -> None:
         self._proc = await asyncio.create_subprocess_exec(
             *self.args,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE)
         self.pid = self._proc.pid
         self.started_at = time.time()
+        # Drain stderr continuously: an unconsumed pipe buffer (64 KiB)
+        # fills on a long capture and the child blocks on write,
+        # silently hanging recording. Keep only a bounded tail for
+        # diagnostics.
+        self._stderr_tail: "deque[bytes]" = deque(maxlen=100)
+        self._drain_task = asyncio.create_task(self._drain_stderr())
+
+    async def _drain_stderr(self) -> None:
+        assert self._proc is not None and self._proc.stderr is not None
+        try:
+            while True:
+                line = await self._proc.stderr.readline()
+                if not line:
+                    break
+                self._stderr_tail.append(line)
+        except Exception:
+            pass  # drain must never kill the capture
+
+    def stderr_tail(self) -> bytes:
+        return b"".join(getattr(self, "_stderr_tail", [])[-20:])
 
     async def stop(self, grace: float = 5.0) -> int:
         if not self._proc:
@@ -60,10 +81,16 @@ class FFmpegProcess:
     async def wait(self) -> tuple[int, bytes]:
         assert self._proc is not None
         try:
-            _, stderr = await asyncio.wait_for(
-                self._proc.communicate(),
+            await asyncio.wait_for(
+                self._proc.wait(),
                 timeout=self.timeout_seconds or None)
-            return self._proc.returncode or 0, stderr
+            drain = getattr(self, "_drain_task", None)
+            if drain is not None:
+                try:
+                    await asyncio.wait_for(drain, timeout=2.0)
+                except Exception:
+                    drain.cancel()
+            return self._proc.returncode or 0, self.stderr_tail()
         except asyncio.TimeoutError:
             await self.stop(grace=1.0)
             raise FFmpegError(f"ffmpeg timed out after {self.timeout_seconds}s")

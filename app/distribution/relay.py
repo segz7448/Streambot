@@ -21,6 +21,27 @@ _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 _CANONICAL_KEYLESS = re.compile(r"^rtmps?://[^/?#@\s]+/?$", re.IGNORECASE)
 
 
+def _public_host(host: str) -> bool:
+    """SSRF guard for owner-registered feed URLs: refuse loopback,
+    private, link-local, reserved, multicast and unspecified literal
+    IPs plus obvious local names. A public hostname is not resolved
+    here (a DNS check would be TOCTOU); the registration boundary is
+    that the owner placed this broadcaster-provided URL in feeds/.
+    """
+    import ipaddress
+    h = host.lower().rstrip(".")
+    if h == "localhost" or h.endswith(
+            (".localhost", ".local", ".internal", ".lan")):
+        return False
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return True  # public hostname; see docstring
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast
+                or ip.is_unspecified)
+
+
 def validate_feed(feed: str, input_root: Path) -> str:
     """A restream feed is either a credential-free http(s) URL or a
     local file under the authorized input root. Anything else - other
@@ -42,6 +63,8 @@ def validate_feed(feed: str, input_root: Path) -> str:
             raise ValueError("feed URL carries credentials/parameters")
         if not p.hostname:
             raise ValueError("feed URL has no host")
+        if not _public_host(p.hostname):
+            raise ValueError("feed host is not a public address")
         return f
     root = input_root.resolve()
     p = (Path(f).resolve() if os.path.isabs(f) else (root / f).resolve())
