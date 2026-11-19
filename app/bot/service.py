@@ -51,6 +51,24 @@ class BotService:
                              "storage consumption")
         self.router.register("sources", self._sources,
                              "list registered channels")
+        self.router.register("clipnow", self._clipnow,
+                             "create a Twitch clip via the official API "
+                             "(requires configured Twitch OAuth)")
+        self.router.register("destinations", self._destinations,
+                             "list/add/remove clip delivery destinations: "
+                             "/destinations [add <chat_id> <label>|remove <chat_id>]")
+
+    def _state_dir(self) -> Path:
+        return Path(os.environ.get("NOVA_STATE_DIR",
+                                   os.path.expanduser("~/.nova-clip")))
+
+    def _clipnow(self, cmd) -> str:
+        from . import ops
+        return ops.clipnow_reply(self._state_dir(), cmd.args)
+
+    def _destinations(self, cmd) -> str:
+        from . import ops
+        return ops.destinations_reply(self._state_dir(), cmd.args)
 
     # --- real handler implementations (registered => advertised) ---
 

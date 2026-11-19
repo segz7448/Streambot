@@ -132,3 +132,24 @@ deployed to agt-3f177cf6 (live deployment e7a6c026 still runs b0b0e96).
   (support.google.com/youtube/answer/7300965); module defaults to
   private. Unit-mocked only - mocks do not establish API compatibility;
   first live call is a gated step requiring owner OAuth consent.
+
+### YouTube OAuth route — UNRESOLVED, no auth choice settled (2026-11-19)
+
+Per review, the broad youtube scope is not settled merely because the
+device flow permits it. Assessment for a headless phone-hosted daemon:
+
+- Device flow ("TVs and Limited Input devices" client): allows the broad
+  youtube scope only for uploads (youtube.upload is NOT in its allowed
+  scope list). Eligibility is also questionable: the flow is intended
+  for limited-input devices, and a server-side daemon may not qualify
+  under Google's client-type policy. LEAST-PRIVILEGE VIOLATION + policy
+  gray zone.
+- Installed-app flow with loopback redirect: supports youtube.upload
+  (least privilege) but needs an interactive browser reaching localhost
+  on the host - the headless AGT phone has none, and the OOB fallback is
+  deprecated.
+- Service accounts: not supported for YouTube channel operations.
+
+No authorization is approved; the auth choice stays unresolved until
+verified and any required owner consent can name the actual access.
+The module remains gated on YouTubeNotConfigured either way.
