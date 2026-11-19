@@ -11,11 +11,11 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 004 | Media buffer | DEVICE-VERIFIED on agt-3f177cf6 (rolling capture: 8 realtime segments over 40s; storage 4,028,840 B under 4 MiB cap with total recorded content exceeding the cap, proving rotation; 6-segment event window retention; idempotent reconcile; clean supervised stop; harness commit 4496743). Live-source acceptance still pending Phase 006 |
 | 005 | Twitch discovery | CODE READY (Helix client, tests 22/22); live acceptance needs user-approved Twitch app credentials |
 | 006 | Authorized ingestion | NOT STARTED |
-| 007 | Telegram bot | NOT STARTED (needs bot token via secure transfer) |
+| 007 | Telegram bot | IN PROGRESS (bot token secured on-device 2026-11-19 via age-encrypted transfer to owner-verified phone key, getMe verified; framework integration next) |
 | 008 | Event detection | DEVICE-VERIFIED heuristics on agt-3f177cf6 (audio spikes at exact loudness transition, scene change t=10.0 score 0.806 with continuous-encode fixture; real-content threshold tuning pending; NOT AI understanding) |
 | 009 | AI intelligence | NOT STARTED |
 | 010 | Automatic clipping | EXTRACTION device-proven (645KB clip from rolling buffer via module chain); automatic event-driven boundary selection pending Phase 009 |
-| 011 | Video editing | DEVICE-VERIFIED on agt-3f177cf6 for the vertical preset (1080x1920 output probed from 320x240 source, libass subtitle burn produced 400KB output, loudnorm applied); square/horizontal share the same graph construction, not separately device-run |
+| 011 | Video editing | DEVICE-VERIFIED on agt-3f177cf6 for the vertical preset (1080x1920 output probed from 320x240 source, loudnorm applied; subtitle burn pixel-proven 2026-11-19 after font-rendering fix, commit 7a87fe7); square/horizontal share the same graph construction, not separately device-run |
 | 012 | Quality control | DEVICE-VERIFIED on agt-3f177cf6 (media verification passed on real edited output; duplicate detection confirmed both directions: derived file flagged, unrelated file not) |
 | 013 | Telegram delivery | NOT STARTED |
 | 014 | Live distribution | NOT STARTED |
@@ -26,6 +26,33 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 Added scope (owner, 2026-11-18): YouTube publishing module (OAuth 2.0,
 private/unlisted by default, no browser automation, no publication claims
 until YouTube confirms).
+
+## Subtitle font-rendering defect and fix (2026-11-19)
+
+First on-device subtitle burn rendered unreadably (words touching, wrong
+scale). Diagnosis on-device: the relocated Termux prefix ships a fontconfig
+whose compiled-in paths point at the original Termux install location
+("Fontconfig error: Cannot load default config file"), and the ASS style's
+font alias "Sans" then resolved to a broken fallback with zero-width spaces.
+Minimal on-device experiment ("AA BB CC DD", explicit DejaVu Sans) rendered
+perfectly, isolating the cause. Fix (commit 7a87fe7): default_ass defaults
+to the explicit "DejaVu Sans" shipped with the prefix, and
+app/subtitles/fonts.py writes a minimal runtime fonts.conf pointing at the
+prefix's real font directory plus /system/fonts, exported as FONTCONFIG_FILE
+to the ffmpeg subprocess. Verified by pixel inspection of an extracted
+output frame (caption wraps in three readable lines, spaces intact,
+bottom safe area) rendered through the real edit_clip module on-device.
+Caveat: still-frame proof of rendering, not subtitle sync.
+
+## Secure bot-token transport (2026-11-19)
+
+Telegram bot token transferred to the phone without plaintext in jobs,
+logs, process args or git: encrypted locally with age v1.3.2 to the
+phone-held key (public key re-verified live against the owner-verified
+value from 2026-11-17), ciphertext-only in one signed job, decrypted
+on-device to $HOME/instinct-clip/secrets/tg_token (mode 0600), ciphertext
+removed. Phone-side getMe from the file succeeded; bot identity confirmed
+distinct (@Zenasrobot). The token never transits chat or the repo.
 
 ## Phase 001 — AGT audit (2026-11-19 07:28-07:31 UTC)
 
