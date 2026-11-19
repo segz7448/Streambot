@@ -24,14 +24,18 @@ from ..core.logging import get_logger
 from .commands import CommandRouter
 from .logfilter import install as install_log_filter
 from .pairing import PairingStore
+from .watermark import UpdateWatermark
 
 log = get_logger("bot.service")
 install_log_filter()
 
 
 class BotService:
-    def __init__(self, token: str, store: PairingStore):
+    def __init__(self, token: str, store: PairingStore,
+                 watermark: UpdateWatermark | None = None):
         self.store = store
+        self.watermark = watermark or UpdateWatermark(
+            str(store.path.parent / "updates.json"))
         self.router = CommandRouter(admin_ids=[])
         self.app = Application.builder().token(token).build()
         self.app.add_handler(CommandHandler("pair", self._pair))
@@ -49,19 +53,22 @@ class BotService:
         user = update.effective_user
         if user is None or update.message is None:
             return
+        if self.watermark.already_handled(update.update_id):
+            return
         if self.store.admin_id() is not None:
             await update.message.reply_text("Pairing is already complete.")
-            return
-        code = context.args[0] if context.args else ""
-        if code and self.store.try_pair(code, user.id):
-            log.info("owner pairing completed for user_id=%s", user.id)
-            await update.message.reply_text(
-                "Pairing complete. This account is now the NOVA Clip "
-                "Engine administrator. Send /help to begin.")
         else:
-            log.warning("failed pairing attempt user_id=%s", user.id)
-            await update.message.reply_text(
-                "Invalid or expired pairing code.")
+            code = context.args[0] if context.args else ""
+            if code and self.store.try_pair(code, user.id):
+                log.info("owner pairing completed for user_id=%s", user.id)
+                await update.message.reply_text(
+                    "Pairing complete. This account is now the NOVA Clip "
+                    "Engine administrator. Send /help to begin.")
+            else:
+                log.warning("failed pairing attempt user_id=%s", user.id)
+                await update.message.reply_text(
+                    "Invalid or expired pairing code.")
+        self.watermark.mark_handled(update.update_id)
 
     async def _command(self, update: Update,
                        context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -69,18 +76,24 @@ class BotService:
         message = update.message
         if user is None or message is None:
             return
+        if self.watermark.already_handled(update.update_id):
+            return
         admin = self._admin(user.id)
         if admin is None:
             log.warning("unauthorized command attempt user_id=%s", user.id)
+            self.watermark.mark_handled(update.update_id)
             return  # fail closed: no reply, no oracle
         self.router.admin_ids = {admin}
         reply = self.router.dispatch(message.text or "", user_id=user.id)
         if reply:
             await message.reply_text(reply)
+        self.watermark.mark_handled(update.update_id)
 
     def run(self) -> None:
         log.info("telegram service starting (long polling)")
-        self.app.run_polling(drop_pending_updates=True)
+        # keep the pending backlog: commands sent during a restart must be
+        # processed, not discarded; the watermark makes replays idempotent
+        self.app.run_polling(drop_pending_updates=False)
 
 
 def main() -> None:
