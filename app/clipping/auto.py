@@ -26,6 +26,7 @@ class AutoClipper:
                  provider: IntelligenceProvider, ffmpeg: str,
                  out_dir: str, min_score: float = 0.6,
                  pre_seconds: float = 20.0, post_seconds: float = 10.0,
+                 merge_seconds: float = 5.0,
                  extract_fn: Callable = extract_clip):
         self.buffer = buffer
         self.db_path = db_path
@@ -35,6 +36,7 @@ class AutoClipper:
         self.min_score = min_score
         self.pre_seconds = pre_seconds
         self.post_seconds = post_seconds
+        self.merge_seconds = merge_seconds
         self.extract_fn = extract_fn
 
     def _pending_events(self, conn) -> list[dict]:
@@ -82,10 +84,39 @@ class AutoClipper:
             conn.close()
             return 0
         by_ts = {m.timestamp: m for m in moments}
+        # Cross-kind merge: one moment can fire both an audio_spike and a
+        # scene_change; clipping both yields two clips of the same content.
+        # Within merge_seconds keep the higher-scored event and mark the
+        # other MERGED (visible in the DB, never silently dropped). Distinct
+        # moments further apart are unaffected.
+        scored = sorted(
+            ((e, by_ts[e["at"]].score if e["at"] in by_ts else e["conf"])
+             for e in events),
+            key=lambda es: es[0]["at"])
+        merged_ids: set[int] = set()
+        kept: list[tuple[dict, float]] = []
+        for event, score in scored:
+            if kept and event["at"] - kept[-1][0]["at"] < self.merge_seconds:
+                prev, pscore = kept[-1]
+                if score > pscore:
+                    conn.execute(
+                        "UPDATE candidate_events SET status='MERGED' WHERE id=?",
+                        (prev["id"],))
+                    merged_ids.add(prev["id"])
+                    kept[-1] = (event, score)
+                else:
+                    conn.execute(
+                        "UPDATE candidate_events SET status='MERGED' WHERE id=?",
+                        (event["id"],))
+                    merged_ids.add(event["id"])
+                continue
+            kept.append((event, score))
+        scores = {e["id"]: s for e, s in kept}
         produced = 0
         for event in events:
-            moment = by_ts.get(event["at"])
-            score = moment.score if moment else event["conf"]
+            if event["id"] in merged_ids:
+                continue
+            score = scores.get(event["id"], event["conf"])
             if score < self.min_score:
                 conn.execute(
                     "UPDATE candidate_events SET status='REJECTED' WHERE id=?",

@@ -33,6 +33,12 @@ def ensure_state_table(db_path: str) -> None:
         conn.execute("ALTER TABLE detection_state ADD COLUMN baseline_lufs REAL")
     except Exception:
         pass
+    # older databases predate the episode-continuity column
+    try:
+        conn.execute("ALTER TABLE detection_state"
+                     " ADD COLUMN episode_active INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -48,16 +54,21 @@ class CandidateDetector:
         self.scene_fn = scene_fn
 
     def analyze_segment(self, path: str,
-                        baseline: float | None = None
-                        ) -> tuple[list[dict], float | None]:
+                        baseline: float | None = None,
+                        episode_active: bool = False
+                        ) -> tuple[list[dict], float | None, bool]:
         """Heuristic candidates for one segment plus its median loudness,
         so the caller can carry a cross-segment baseline (a loud segment
-        that starts exactly on a segment boundary has no internal rise)."""
+        that starts exactly on a segment boundary has no internal rise),
+        plus the episode flag so one sustained moment spanning a segment
+        boundary records one candidate, not one per segment."""
         candidates: list[dict] = []
         seg_median: float | None = None
         try:
             samples = self.audio_fn(self.ffmpeg, path)
-            for t, lufs in audio.loudness_spikes(samples, baseline):
+            spikes, episode_active = audio.spikes_episode(
+                samples, baseline, 6.0, -60.0, episode_active)
+            for t, lufs in spikes:
                 candidates.append({"kind": "audio_spike", "offset": t,
                                    "confidence": min(1.0, (lufs + 60) / 60)})
             vals = sorted(s.momentary for s in samples if s.momentary > -60.0)
@@ -71,7 +82,7 @@ class CandidateDetector:
                                    "confidence": min(1.0, score)})
         except Exception as exc:
             log.warning("visual analysis failed for %s: %s", path, exc)
-        return candidates, seg_median
+        return candidates, seg_median, episode_active
 
     def process_new_segments(self) -> int:
         """Analyze finalized segments newer than the last processed one.
@@ -79,16 +90,18 @@ class CandidateDetector:
         ensure_state_table(self.db_path)
         conn = connect(self.db_path)
         row = conn.execute(
-            "SELECT last_analyzed_sequence, baseline_lufs FROM"
+            "SELECT last_analyzed_sequence, baseline_lufs, episode_active FROM"
             " detection_state WHERE session_id=?",
             (self.buffer.session_id,)).fetchone()
         last = row[0] if row else -1
         baseline = row[1] if row else None
+        episode_active = bool(row[2]) if row else False
         segs = [s for s in self.buffer.segments() if s.sequence > last]
         finalized = segs[:-1] if segs else []
         written = 0
         for seg in finalized:
-            cands, seg_median = self.analyze_segment(str(seg.path), baseline)
+            cands, seg_median, episode_active = self.analyze_segment(
+                str(seg.path), baseline, episode_active)
             for cand in cands:
                 conn.execute(
                     "INSERT INTO candidate_events"
@@ -108,14 +121,16 @@ class CandidateDetector:
                     baseline + 0.2 * (seg_median - baseline))
         conn.execute(
             "INSERT INTO detection_state"
-            " (session_id, last_analyzed_sequence, baseline_lufs)"
-            " VALUES (?,?,?) ON CONFLICT(session_id)"
+            " (session_id, last_analyzed_sequence, baseline_lufs, episode_active)"
+            " VALUES (?,?,?,?) ON CONFLICT(session_id)"
             " DO UPDATE SET last_analyzed_sequence"
             "=excluded.last_analyzed_sequence,"
-            " baseline_lufs=excluded.baseline_lufs",
+            " baseline_lufs=excluded.baseline_lufs,"
+            " episode_active=excluded.episode_active",
             (self.buffer.session_id,
              last if finalized else (row[0] if row else -1),
-             baseline))
+             baseline,
+             1 if episode_active else 0))
         conn.commit()
         conn.close()
         return written

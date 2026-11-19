@@ -142,6 +142,53 @@ class DetectorTests(unittest.TestCase):
         # confidence from the episode peak (-12 LUFS), not the first edge
         self.assertAlmostEqual(rows[0][1], min(1.0, (-12.0 + 60) / 60))
 
+    def test_episode_spanning_segment_boundary_records_once(self):
+        # reviewer repro: quiet baseline, loud tail of segment A continuing
+        # at the start of segment B must yield ONE candidate, not two.
+        self._make_segments(3)
+
+        def audio_fn(ff, p):
+            if "seg-000000" in str(p):
+                return ([audio.LoudnessSample(t * 0.5, -30.0) for t in range(8)]
+                        + [audio.LoudnessSample(4.0 + i * 0.5, -15.0)
+                           for i in range(4)])  # loud tail, episode open
+            return ([audio.LoudnessSample(i * 0.5, -15.0) for i in range(4)]
+                    + [audio.LoudnessSample(2.0 + i * 0.5, -30.0)
+                       for i in range(6)])  # continuation then quiet
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=audio_fn, scene_fn=lambda ff, p: [])
+        det.process_new_segments()
+        conn = connect(self.db)
+        n = conn.execute("SELECT count(*) FROM candidate_events"
+                         " WHERE kind='audio_spike'").fetchone()[0]
+        ep = conn.execute("SELECT episode_active FROM detection_state"
+                          " WHERE session_id=1").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 1)
+        self.assertEqual(ep, 0)  # episode closed by the quiet tail
+
+    def test_two_bursts_across_boundary_stay_separate(self):
+        self._make_segments(3)
+
+        def audio_fn(ff, p):
+            if "seg-000000" in str(p):
+                return ([audio.LoudnessSample(t * 0.5, -30.0) for t in range(8)]
+                        + [audio.LoudnessSample(4.0 + i * 0.5, -15.0)
+                           for i in range(3)]
+                        + [audio.LoudnessSample(5.5, -30.0)])  # burst ends
+            return ([audio.LoudnessSample(i * 0.5, -30.0) for i in range(5)]
+                    + [audio.LoudnessSample(2.5 + i * 0.5, -14.0)
+                       for i in range(3)]
+                    + [audio.LoudnessSample(4.0, -30.0)])
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=audio_fn, scene_fn=lambda ff, p: [])
+        det.process_new_segments()
+        conn = connect(self.db)
+        n = conn.execute("SELECT count(*) FROM candidate_events"
+                         " WHERE kind='audio_spike'").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2)  # genuinely separated moments preserved
+
     def test_analysis_failure_does_not_raise(self):
         self._make_segments(2)
         def boom(ff, p):

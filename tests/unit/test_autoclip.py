@@ -99,6 +99,40 @@ class AutoClipTests(unittest.TestCase):
         self.assertEqual(clipper.process_pending(), 1)
         self.assertEqual(clipper.process_pending(), 0)
 
+    def _add_event(self, detected_at, kind, conf):
+        conn = connect(self.db)
+        conn.execute("INSERT INTO candidate_events"
+                     " (session_id, detected_at, kind, confidence)"
+                     " VALUES (1,?,?,?)", (detected_at, kind, conf))
+        conn.commit()
+        conn.close()
+
+    def test_cross_kind_same_moment_merges_to_one_clip(self):
+        # an audio_spike and a scene_change fired by one moment must not
+        # each produce a clip of the same content; the higher-scored event
+        # wins and the other is marked MERGED, never silently dropped.
+        self._add_event(101.5, "scene_change", 0.8)
+        produced = self._clipper(lambda *a, **k: Path("/tmp/clip.mp4"))\
+            .process_pending()
+        self.assertEqual(produced, 1)
+        conn = connect(self.db)
+        statuses = sorted(r[0] for r in conn.execute(
+            "SELECT status FROM candidate_events ORDER BY detected_at"))
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM clips").fetchone()[0], 1)
+        conn.close()
+        self.assertEqual(statuses, ["CLIPPED", "MERGED"])
+
+    def test_distinct_moments_not_merged(self):
+        self._add_event(140.0, "audio_spike", 0.9)
+        produced = self._clipper(lambda *a, **k: Path("/tmp/clip.mp4"))\
+            .process_pending()
+        self.assertEqual(produced, 2)
+        conn = connect(self.db)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM clips").fetchone()[0], 2)
+        conn.close()
+
     def test_quota_exhaustion_queues_jobs_no_silent_substitution(self):
         from app.intelligence.providers import QuotaExhausted
 

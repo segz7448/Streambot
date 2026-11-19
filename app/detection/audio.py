@@ -33,6 +33,41 @@ def loudness_samples(ffmpeg: str, path: str) -> list[LoudnessSample]:
     return samples
 
 
+def spikes_episode(samples: list[LoudnessSample], baseline: float | None,
+                    min_rise_lufs: float, floor_lufs: float,
+                    episode_active: bool) -> tuple[list[tuple[float, float]], bool]:
+    """Core spike scan with episode carry-in. Returns (spikes, active_at_end)
+    so a caller analyzing consecutive chunks can suppress a duplicate spike
+    for one moment that spans a chunk boundary."""
+    episode_end_lufs = min_rise_lufs / 2
+    spikes: list[tuple[float, float]] = []
+    window: list[float] = []
+    in_episode = episode_active
+    ep_time = 0.0
+    ep_peak = -float("inf")
+    for s in samples:
+        if s.momentary <= floor_lufs:
+            in_episode = False  # silence ends the episode
+            continue
+        base = baseline if baseline is not None else (
+            sum(window) / len(window) if window else None)
+        if in_episode:
+            if spikes and s.momentary > ep_peak:
+                ep_peak = s.momentary
+                spikes[-1] = (ep_time, ep_peak)
+            if base is not None and s.momentary - base < episode_end_lufs:
+                in_episode = False  # fell back toward baseline
+        elif base is not None and s.momentary - base >= min_rise_lufs:
+            if not spikes or s.t - spikes[-1][0] >= 2.0:
+                in_episode = True
+                ep_time = s.t
+                ep_peak = s.momentary
+                spikes.append((s.t, s.momentary))
+        window.append(s.momentary)
+        del window[:-50]
+    return spikes, in_episode
+
+
 def loudness_spikes(samples: list[LoudnessSample], baseline: float | None,
                     min_rise_lufs: float = 6.0,
                     floor_lufs: float = -60.0) -> list[tuple[float, float]]:
@@ -46,30 +81,6 @@ def loudness_spikes(samples: list[LoudnessSample], baseline: float | None,
     separated by a return toward baseline stay distinct moments. The
     returned lufs tracks the episode's peak; the timestamp stays at the
     episode's first rising edge (pre-roll covers context)."""
-    episode_end_lufs = min_rise_lufs / 2
-    spikes: list[tuple[float, float]] = []
-    window: list[float] = []
-    in_episode = False
-    ep_time = 0.0
-    ep_peak = -float("inf")
-    for s in samples:
-        if s.momentary <= floor_lufs:
-            in_episode = False  # silence ends the episode
-            continue
-        base = baseline if baseline is not None else (
-            sum(window) / len(window) if window else None)
-        if in_episode:
-            if s.momentary > ep_peak:
-                ep_peak = s.momentary
-                spikes[-1] = (ep_time, ep_peak)
-            if base is not None and s.momentary - base < episode_end_lufs:
-                in_episode = False  # fell back toward baseline
-        elif base is not None and s.momentary - base >= min_rise_lufs:
-            if not spikes or s.t - spikes[-1][0] >= 2.0:
-                in_episode = True
-                ep_time = s.t
-                ep_peak = s.momentary
-                spikes.append((s.t, s.momentary))
-        window.append(s.momentary)
-        del window[:-50]
+    spikes, _ = spikes_episode(samples, baseline, min_rise_lufs,
+                                floor_lufs, episode_active=False)
     return spikes
