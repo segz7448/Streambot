@@ -12,7 +12,11 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 005 | Twitch discovery | CODE READY (Helix client, tests 22/22); live acceptance needs user-approved Twitch app credentials |
 | 006 | Authorized ingestion | NOT STARTED |
 | 007 | Telegram bot | NOT STARTED (needs bot token via secure transfer) |
-| 008-012 | Detection, AI, clipping, editing, QC | NOT STARTED |
+| 008 | Event detection | DEVICE-VERIFIED heuristics on agt-3f177cf6 (audio spikes at exact loudness transition, scene change t=10.0 score 0.806 with continuous-encode fixture; real-content threshold tuning pending; NOT AI understanding) |
+| 009 | AI intelligence | NOT STARTED |
+| 010 | Automatic clipping | EXTRACTION device-proven (645KB clip from rolling buffer via module chain); automatic event-driven boundary selection pending Phase 009 |
+| 011 | Video editing | NOT STARTED |
+| 012 | Quality control | NOT STARTED |
 | 013 | Telegram delivery | NOT STARTED |
 | 014 | Live distribution | NOT STARTED |
 | 015 | Monitoring & recovery | PARTIAL (supervisor + health + job recovery in foundation) |
