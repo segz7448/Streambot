@@ -14,9 +14,11 @@ HONEST LIMITS (verified against official docs):
    with clips:edit, but without download rights the file cannot be
    pulled through any supported endpoint.
 => The officially supported end-to-end shapes are: the owner's OWN
-   channel, channels where the owner is an editor, and channels whose
-   owners grant the app access. Arbitrary-channel automation is not
-   officially deliverable.
+   channel, and channels where the owner holds a channel editor role.
+   The calling token's USER must be the broadcaster or an editor; a
+   third party merely granting OAuth to their account confers nothing
+   unless that consented user is the broadcaster or an editor.
+   Arbitrary-channel automation is not officially deliverable.
 
 No credentials are stored here; tokens come from files placed by the
 owner's OAuth flow (separate, gated step). Nothing in this module runs
