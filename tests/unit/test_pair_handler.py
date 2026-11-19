@@ -21,9 +21,9 @@ def _stub_telegram():
             return self
 
         def build(self):
-            bot = types.SimpleNamespace(get_updates=None)
-            return types.SimpleNamespace(add_handler=lambda *a, **k: None,
-                                         bot=bot)
+            return types.SimpleNamespace(
+                add_handler=lambda *a, **k: None,
+                update_queue=types.SimpleNamespace(put=None))
 
     class Application:
         @staticmethod

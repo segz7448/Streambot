@@ -22,22 +22,25 @@ class PreAckWrapperTests(unittest.TestCase):
         self.inbox = PreAckInbox(str(self.dir / "inbox.json"))
         self.wm = UpdateWatermark(str(self.dir / "updates.json"))
 
-    def _run(self, updates):
-        async def orig(*a, **k):
-            return updates
+    def _put(self, update):
+        seen = []
+        async def orig(u):
+            seen.append(u)
         wrapped = ops.make_pre_ack_wrapper(self.inbox, self.wm, orig)
-        return asyncio.run(wrapped("x"))
+        asyncio.run(wrapped(update))
+        return seen
 
-    def test_commands_persisted_before_return(self):
-        out = self._run([_upd(1, "/status"), _upd(2, "hello"),
-                         _upd(3, "/clipnow chan")])
-        self.assertEqual(len(out), 3)
+    def test_commands_persisted_before_queueing(self):
+        seen = self._put(_upd(1, "/status"))
+        self.assertEqual(len(seen), 1)  # original put still called
+        self._put(_upd(2, "hello"))
+        self._put(_upd(3, "/clipnow chan"))
         texts = [e["text"] for e in self.inbox.pending()]
         self.assertEqual(texts, ["/status", "/clipnow chan"])
 
     def test_already_handled_not_re_added(self):
         self.wm.mark_handled(5)
-        self._run([_upd(5, "/status")])
+        self._put(_upd(5, "/status"))
         self.assertEqual(self.inbox.pending(), [])
 
 

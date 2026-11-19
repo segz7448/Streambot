@@ -49,11 +49,12 @@ class BotService:
         self.app.add_handler(CommandHandler("pair", self._pair))
         self.app.add_handler(
             MessageHandler(filters.TEXT & filters.COMMAND, self._command))
-        # true pre-ack: persist command updates before the framework can
-        # advance the getUpdates offset past them
+        # true pre-ack: wrap the update queue's put so command updates
+        # are persisted before the framework advances its offset
         from . import ops as _ops
-        self.app.bot.get_updates = _ops.make_pre_ack_wrapper(
-            self.inbox, self.watermark, self.app.bot.get_updates)
+        queue = self.app.update_queue
+        queue.put = _ops.make_pre_ack_wrapper(self.inbox, self.watermark,
+                                              queue.put)
         self.router.register("status", self._status,
                              "application health")
         self.router.register("storage", self._storage,

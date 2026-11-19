@@ -69,33 +69,29 @@ def stoprelay_reply(state_dir: Path) -> str:
     return "No restream is running."
 
 
-def make_pre_ack_wrapper(inbox, watermark, orig_get_updates):
-    """TRUE pre-ack durability: persist each command update BEFORE
-    returning it to the framework. Telegram's server-side ack only
-    happens when the NEXT getUpdates call carries the advanced offset,
-    which is after this wrapper returns - so a crash anywhere after this
-    point leaves the update in the inbox for the startup drain, and a
-    crash before the next poll is covered by Telegram redelivery. The
-    framework queue window is closed by construction."""
-    async def wrapper(*args, **kwargs):
-        updates = await orig_get_updates(*args, **kwargs)
-        for u in updates:
-            try:
-                text = (u.message.text if getattr(u, "message", None)
-                        else "") or ""
-                if not text.startswith("/"):
-                    continue
-                uid = int(u.update_id)
-                if watermark.already_handled(uid):
-                    continue
-                user = getattr(u, "effective_user", None)
-                inbox.add(uid, int(user.id) if user else 0, text)
-            except Exception:
-                import logging
-                logging.getLogger("bot.ops").exception(
-                    "pre-ack inbox write failed")
-        return updates
-    return wrapper
+def make_pre_ack_wrapper(inbox, watermark, orig_put):
+    """TRUE pre-ack durability: wraps the framework update queue's put,
+    persisting each command update BEFORE it is queued. The framework
+    advances its offset only after queueing, and Telegram's server-side
+    ack happens on the NEXT getUpdates call - so a persisted update can
+    never be acked past without an inbox entry, and the startup drain
+    replays anything not marked handled. The framework queue window is
+    closed by construction."""
+    async def put(update):
+        try:
+            text = (update.message.text
+                    if getattr(update, "message", None) else "") or ""
+            if text.startswith("/"):
+                uid = int(update.update_id)
+                if not watermark.already_handled(uid):
+                    user = getattr(update, "effective_user", None)
+                    inbox.add(uid, int(user.id) if user else 0, text)
+        except Exception:
+            import logging
+            logging.getLogger("bot.ops").exception(
+                "pre-ack inbox write failed")
+        return await orig_put(update)
+    return put
 
 
 JOURNAL = "op_journal.json"
