@@ -25,6 +25,8 @@ SRC = f"{HOME}/instinct-clip/test/src.mp4"
 
 
 async def main():
+    import shutil
+    shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK, exist_ok=True)
     db = f"{WORK}/nova.db"
     conn = connect(db)
