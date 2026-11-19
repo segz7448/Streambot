@@ -53,6 +53,52 @@ output frame (caption wraps in three readable lines, spaces intact,
 bottom safe area) rendered through the real edit_clip module on-device.
 Caveat: still-frame proof of rendering, not subtitle sync.
 
+## Sustained automatic-pipeline acceptance (2026-11-19)
+
+On agt-3f177cf6 against deployment f38f2ecb (= main@f234a81), a 168s
+session over a ~64KB/s loopback HTTP feed (90s fixture: testsrc + AAC
+tone with a deliberate loud burst at content t=45-49s), harness driving
+the same startclip/stopclip path as bot commands, loopback admitted by a
+harness-only monkeypatch (deployed relay.py verified byte-identical to
+HEAD, still refuses non-public feeds):
+
+- Feed server killed mid-transfer: ffmpeg dropped (rc=183), bounded
+  backoff (5s then 10s), second reconnect succeeded after server
+  restart. 28 segments seg-000000..seg-000027, contiguous numbering
+  across the reconnect (no overwrite, no rewind).
+- Detector resumed past the boundary: 3 audio_spike candidates, all in
+  post-reconnect segment 19 (the burst, unserved before the kill), all
+  CLIPPED; detection_state last_analyzed_sequence=26, baseline_lufs
+  carried (-29.45).
+- Downstream valid: 3 clips edited on-device, QC passed, HELD
+  (739855-842528 B, 21.8-24.6s), ffprobe h264+AAC (original audio).
+  Nothing delivered (HELD only).
+- Durability across process end (distinct from ffmpeg restart): fresh
+  process reads back detection_state, clip rows (preset vertical),
+  session ENDED, state/memory.json entries present.
+- Known artifacts, labeled: finite-feed re-GET repeats content from t=0
+  (documented; live feeds resume at the edge). One 4s burst produced 3
+  overlapping clips (spikes at 0.4/2.4/4.5s) — the clipper does not
+  dedupe nearby candidates; queued as an improvement, not a reconnect
+  defect.
+
+## Google OAuth client provisioning (2026-11-19)
+
+User-authorized on identity ayiijumo@gmail.com: GCP project Streambot
+(streambot-515214, no billing, no trial), YouTube Data API v3 enabled,
+consent screen External/Testing (app Streambot, test user
+ayiijumo@gmail.com, scope youtube.upload only), Desktop OAuth client
+"Streambot phone". Client id/secret moved with no plaintext in jobs,
+logs, args, chat or git: in-page WebCrypto hybrid encryption
+(AES-256-GCM, key wrapped RSA-OAEP-256 to an ephemeral sandbox keypair),
+sandbox decrypt, age v1.3.2 to the owner-verified phone key,
+ciphertext-only signed job, on-device decrypt to
+state/youtube_client_id + state/youtube_client_secret (0600),
+ciphertexts and local plaintext removed. OAuth consent NOT run:
+Testing-mode 7-day refresh-token expiry and the unverified-app warning
+must reach the user first. Google API Services User Data Policy
+agreement checkbox was required to create the client config.
+
 ## Secure bot-token transport (2026-11-19)
 
 Telegram bot token transferred to the phone without plaintext in jobs,
