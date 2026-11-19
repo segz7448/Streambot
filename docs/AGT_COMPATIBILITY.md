@@ -9,7 +9,7 @@ Evidence job ids: 1727b0f1-ae38-4398-ad55-831997db6ea5 (identity), 3f1a768a-7e3f
 - Kernel: Linux 4.19.157-perf aarch64 (Android 13, arm64-v8a, Redmi 10C).
 - CPU: 8 cores (nproc reported 7 available).
 - C library: Bionic (toybox 0.8.6-android; telemetry: "bash on bionic, no proot" for the shell layer; proot is used only for cloudflared). glibc/manylinux binaries will NOT run.
-- Uptime at audit: ~51h; host online, tunnel CONNECTED, battery 77% (not charging; restarts pause below 25% unplugged).
+- Uptime at audit: host online and reachable.
 
 ## 2. Runtime toolchain (live probe, supersedes guide Section 7)
 Present:
@@ -24,15 +24,13 @@ Missing:
 - Storage: /data 42.7 GB total, 18.3 GB free; current AGT deployments dir uses 18.4 MB
 - Limits: 32768 open files, 13727 max processes, no CPU time cap, no root
 - Outbound network works: api.twitch.tv reachable (401 without auth as expected), api.github.com 200 in ~3.2s
-- Inbound: only via Cloudflare tunnel subdomains of the owner's tunnel domain for ported deployments (HTTP only on these subdomains per guide; HTTPS certificate coverage undecided)
-- Background execution: AGT supervisor restarts deployments with backoff and restores after reboot; battery guard pauses below 25% unplugged; phone sleep/pause can interrupt check-ins (observed 11-17/18)
+- Inbound: only via Cloudflare tunnel subdomains for ported deployments (HTTP only on these subdomains per guide; HTTPS certificate coverage undecided)
+- Background execution: AGT supervisor restarts deployments with backoff and restores after reboot; a battery guard pauses work when low and unplugged; host sleep can interrupt check-ins.
 
 ## 4. Current workloads (do not touch)
-Running: several pre-existing owner workloads, including a Go-based Telegram
-bot (verified live 11-18 09:45 PT; PRESERVE) and a pure-Python web service
-on :8787 (proof pure-Python services run here). busybox httpd on :8080 also
-running. All left untouched; names and ids withheld here intentionally.
-Stopped: stale entries from the same workloads (no supported removal from list).
+Pre-existing owner workloads run on this host, including a Go-based Telegram
+bot (verified live during the audit; PRESERVE) and a pure-Python web service
+on :8787 (proof pure-Python services run here). All left untouched.
 Ports observed in use: 8080, 8787.
 
 ## 5. Implications for NOVA Clip Engine
@@ -50,4 +48,4 @@ Ports observed in use: 8080, 8787.
 ## 7. Open items carried to Phase 002/003
 - pip bootstrap (get-pip.py) or vendored pure-Python deps — decide in Phase 002.
 - FFmpeg bionic build acquisition and on-device verification — Phase 003, highest technical risk.
-- Repo host/visibility decision (Streambot) — pending owner confirmation; AGT git-deploy requires a publicly cloneable repo.
+- Repo host/visibility decision (Streambot) — RESOLVED: owner chose a public repo (github.com/segz7448/Streambot), which also satisfies AGT git-deploy's public-clone requirement.

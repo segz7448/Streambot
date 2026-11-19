@@ -11,7 +11,7 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 004 | Media buffer | DEVICE-VERIFIED on the owner's AGT phone (rolling capture: 8 realtime segments over 40s; storage 4,028,840 B under 4 MiB cap with total recorded content exceeding the cap, proving rotation; 6-segment event window retention; idempotent reconcile; clean supervised stop; harness commit 4496743). Live-source acceptance still pending Phase 006 |
 | 005 | Twitch discovery | CODE READY (Helix client, tests 22/22); live acceptance needs user-approved Twitch app credentials |
 | 006 | Authorized ingestion | NOT STARTED |
-| 007 | Telegram bot | LIVE but UNPAIRED: deployment nova-clip-bot running since 01:36 PST (PTB 22.8 vendored, sha256-verified wheels; token on-device via age-encrypted transfer, getMe OK both sides; $HOME-path crash loop found and fixed, first crashed deployment removed in owner's view). Pairing challenge expired unpaired 01:53 PST; awaiting owner action. Committed-not-rolled-out pending safe stop/start: log condenser, drop_pending_updates=False + watermark (acknowledged crash-gap limit: confirm-to-handle window open until a persistent pre-ack inbox exists), failed-set refinement + no-evict (overflow alerts, never silent suppression), AutoClipper + providers |
+| 007 | Telegram bot | LIVE but UNPAIRED: deployment nova-clip-bot running (PTB 22.8 vendored, sha256-verified wheels; token on-device via age-encrypted transfer, getMe OK both sides; $HOME-path crash loop found and fixed). Awaiting owner pairing. Committed-not-rolled-out pending safe stop/start: log condenser, drop_pending_updates=False + watermark (acknowledged crash-gap limit: confirm-to-handle window open until a persistent pre-ack inbox exists), failed-set refinement + no-evict (overflow alerts, never silent suppression), AutoClipper + providers |
 | 008 | Event detection | DEVICE-VERIFIED heuristics on the owner's AGT phone (audio spikes at exact loudness transition, scene change t=10.0 score 0.806 with continuous-encode fixture; real-content threshold tuning pending; NOT AI understanding) |
 | 009 | AI intelligence | CODE READY: provider interface with $0 heuristic default (never labeled AI) and explicit-config-only OpenAI-compatible adapter that refuses to default anything (a92f1d4); Groq recommended to owner with official-source retention/limits/ZDR facts and explicit signup consent pending. Quota exhaustion queues jobs and reports AI OFFLINE - no silent heuristic substitution |
 | 010 | Automatic clipping | CODE READY + crash-hardened: AutoClipper consumes pending/queued events, scores via configured provider, extracts via real extractor, exactly-once clips rows (unique index + INSERT OR IGNORE; crash-window test proves retry cannot duplicate; 4fae05f). Live-source acceptance still pending Phase 006 |
@@ -106,6 +106,14 @@ ciphertexts and local plaintext removed. OAuth consent NOT run:
 Testing-mode 7-day refresh-token expiry and the unverified-app warning
 must reach the owner first. Google API Services User Data Policy
 agreement checkbox was required to create the client config.
+
+Remaining recovery gap (documented 2026-11-19): no vault copy of the
+client secret exists - the vault has no supported ingest from the
+on-device runtime file, and browser-page capture would expose the value.
+Safe regeneration path: any session signed into the owner's Google
+identity (login held in the owner's vault) can re-view or regenerate
+the client secret in the Google console. The phone's 0600 files remain
+the runtime copy.
 
 (An earlier revision of this entry named the identity and project;
 removed because this public repo is not a permission record and setup

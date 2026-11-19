@@ -37,16 +37,38 @@ def loudness_spikes(samples: list[LoudnessSample], baseline: float | None,
                     min_rise_lufs: float = 6.0,
                     floor_lufs: float = -60.0) -> list[tuple[float, float]]:
     """Timestamps where momentary loudness jumps >= min_rise_lufs over the
-    recent baseline and is above the silence floor. Returns (t, lufs)."""
+    recent baseline and is above the silence floor. Returns (t, lufs).
+
+    Episode merging: one sustained loud episode produces ONE spike, not
+    one per rising edge. After a spike, no new spike can start until the
+    signal falls back below base + min_rise_lufs/2 (or hits the silence
+    floor) - so a 4s burst yields a single candidate, while two bursts
+    separated by a return toward baseline stay distinct moments. The
+    returned lufs tracks the episode's peak; the timestamp stays at the
+    episode's first rising edge (pre-roll covers context)."""
+    episode_end_lufs = min_rise_lufs / 2
     spikes: list[tuple[float, float]] = []
     window: list[float] = []
+    in_episode = False
+    ep_time = 0.0
+    ep_peak = -float("inf")
     for s in samples:
         if s.momentary <= floor_lufs:
+            in_episode = False  # silence ends the episode
             continue
         base = baseline if baseline is not None else (
             sum(window) / len(window) if window else None)
-        if base is not None and s.momentary - base >= min_rise_lufs:
+        if in_episode:
+            if s.momentary > ep_peak:
+                ep_peak = s.momentary
+                spikes[-1] = (ep_time, ep_peak)
+            if base is not None and s.momentary - base < episode_end_lufs:
+                in_episode = False  # fell back toward baseline
+        elif base is not None and s.momentary - base >= min_rise_lufs:
             if not spikes or s.t - spikes[-1][0] >= 2.0:
+                in_episode = True
+                ep_time = s.t
+                ep_peak = s.momentary
                 spikes.append((s.t, s.momentary))
         window.append(s.momentary)
         del window[:-50]

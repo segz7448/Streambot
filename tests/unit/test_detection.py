@@ -32,6 +32,39 @@ class LoudnessSpikeTests(unittest.TestCase):
         spikes = audio.loudness_spikes(samples, baseline=-30.0)
         self.assertEqual(len(spikes), 1)
 
+    def test_sustained_episode_merges_to_one_spike(self):
+        # regression for the on-phone defect: a 4-5s loud burst produced 3
+        # overlapping clips (rising edges at 0.4/2.4/4.5s). One episode,
+        # one spike, reported at the episode peak.
+        quiet = [audio.LoudnessSample(t * 0.5, -30.0) for t in range(6)]
+        loud = [audio.LoudnessSample(3.0 + i * 0.5, v) for i, v in
+                enumerate([-18.0, -15.0, -12.0, -14.0, -16.0, -19.0, -22.0])]
+        tail = [audio.LoudnessSample(6.5 + i * 0.5, -30.0) for i in range(4)]
+        spikes = audio.loudness_spikes(quiet + loud + tail, baseline=-30.0)
+        self.assertEqual(len(spikes), 1)
+        self.assertAlmostEqual(spikes[0][0], 3.0)
+        self.assertAlmostEqual(spikes[0][1], -12.0)
+
+    def test_distinct_episodes_stay_separate(self):
+        quiet = [audio.LoudnessSample(t * 0.5, -30.0) for t in range(6)]
+        burst1 = [audio.LoudnessSample(3.0 + i * 0.5, -15.0) for i in range(4)]
+        gap = [audio.LoudnessSample(5.0 + i * 0.5, -30.0) for i in range(6)]
+        burst2 = [audio.LoudnessSample(8.0 + i * 0.5, -14.0) for i in range(4)]
+        spikes = audio.loudness_spikes(
+            quiet + burst1 + gap + burst2, baseline=-30.0)
+        self.assertEqual(len(spikes), 2)
+        self.assertAlmostEqual(spikes[0][0], 3.0)
+        self.assertAlmostEqual(spikes[1][0], 8.0)
+
+    def test_silence_ends_episode(self):
+        samples = ([audio.LoudnessSample(t * 0.5, -30.0) for t in range(6)]
+                   + [audio.LoudnessSample(3.0, -15.0)]
+                   + [audio.LoudnessSample(3.5, -70.0)]
+                   + [audio.LoudnessSample(4.0 + i * 0.5, -30.0) for i in range(3)]
+                   + [audio.LoudnessSample(5.5, -15.0)])
+        spikes = audio.loudness_spikes(samples, baseline=-30.0)
+        self.assertEqual(len(spikes), 2)
+
 
 class DetectorTests(unittest.TestCase):
     def setUp(self):
@@ -85,6 +118,29 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(det.process_new_segments(), 0)
         self._make_segments(1, start=3)  # newer segment; previous tail finalizes
         self.assertEqual(det.process_new_segments(), 1)
+
+    def test_sustained_episode_writes_one_event(self):
+        # regression for the on-phone defect: one sustained loud burst in a
+        # segment must record ONE audio_spike candidate, not one per rising
+        # edge, so the clipper produces one clip per moment.
+        self._make_segments(3)
+        burst = ([audio.LoudnessSample(t * 0.5, -30.0) for t in range(6)]
+                 + [audio.LoudnessSample(3.0 + i * 0.5, v) for i, v in
+                    enumerate([-18.0, -15.0, -12.0, -14.0, -16.0, -19.0])]
+                 + [audio.LoudnessSample(6.0 + i * 0.5, -30.0) for i in range(4)])
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=lambda ff, p: burst,
+                                scene_fn=lambda ff, p: [])
+        written = det.process_new_segments()
+        self.assertEqual(written, 2)  # 2 finalized segments x 1 merged spike
+        conn = connect(self.db)
+        rows = conn.execute(
+            "SELECT kind, confidence FROM candidate_events"
+            " WHERE kind='audio_spike'").fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 2)
+        # confidence from the episode peak (-12 LUFS), not the first edge
+        self.assertAlmostEqual(rows[0][1], min(1.0, (-12.0 + 60) / 60))
 
     def test_analysis_failure_does_not_raise(self):
         self._make_segments(2)
