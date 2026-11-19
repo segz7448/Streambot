@@ -47,10 +47,32 @@ class InboxTests(unittest.TestCase):
         sent = []
         result = drain_inbox(self.dir, router, watermark, self.inbox,
                              reply=lambda uid, text: sent.append((uid, text)))
-        self.assertEqual(result, {"replayed": 1, "dropped": 1, "failed": 0})
+        self.assertEqual(result, {"replayed": 1, "dropped": 1,
+                                  "failed": 0, "uncertain": 0})
         self.assertEqual(self.inbox.pending(), [])
         self.assertTrue(watermark.already_handled(10))
         self.assertEqual(sent, [(42, "done")])
+
+    def test_side_effecting_strand_preserved_for_reconciliation(self):
+        # crash after a /clipnow side effect but before journal commit:
+        # drain must NOT blind-retry (a second clip), it marks the
+        # operation uncertain and notifies
+        watermark = UpdateWatermark(str(self.dir / "updates.json"))
+        router = self._router([])
+        router.register("clipnow", lambda c: (_ for _ in ()).throw(
+            AssertionError("must not re-execute")), "side effect")
+        self.inbox.add(30, 42, "/clipnow chan")
+        watermark.mark_failed(30)
+        sent = []
+        result = drain_inbox(self.dir, router, watermark, self.inbox,
+                             reply=lambda uid, text: sent.append(text))
+        self.assertEqual(result["uncertain"], 1)
+        self.assertEqual(result["replayed"], 0)
+        self.assertEqual(self.inbox.pending(), [])
+        self.assertTrue(any("NOT repeated" in s for s in sent))
+        from app.bot.ops import journal_uncertain
+        unc = journal_uncertain(self.dir)
+        self.assertEqual(unc[0]["update_id"], 30)
 
     def test_drain_keeps_failures_for_next_boot(self):
         watermark = UpdateWatermark(str(self.dir / "updates.json"))

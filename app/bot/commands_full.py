@@ -32,6 +32,11 @@ def addsource_reply(state_dir: Path, username: str) -> str:
             " (username, created_at, updated_at) VALUES (?,?,?)",
             (username, now, now))
     if cur.rowcount:
+        from ..intelligence.memory import Memory
+        mem = Memory(str(state_dir / "memory.json"))
+        mem.remember("channel", f"twitch:{username}",
+                     "registered via /addsource",
+                     "owner telegram command")
         return (f"Source {username} registered. A username is a channel "
                 "identifier, not video authorization: clipping starts "
                 "only when an authorized input is available "

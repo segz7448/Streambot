@@ -4,8 +4,7 @@ import unittest
 from pathlib import Path
 
 from app.intelligence.memory import Memory
-from app.intelligence.planner import (CLAIM_SAFE_MAX_SECONDS,
-                                      SHORTS_MAX_SECONDS, plan_clip)
+from app.intelligence.planner import SHORTS_MAX_SECONDS, plan_clip
 
 
 class MemoryTests(unittest.TestCase):
@@ -43,7 +42,8 @@ class PlannerTests(unittest.TestCase):
     def test_default_plan_uses_verified_rules(self):
         plan = plan_clip("audio_spike", "somechannel", self.mem,
                          game="Elden Ring")
-        self.assertEqual(plan.target_seconds, CLAIM_SAFE_MAX_SECONDS)
+        self.assertEqual(plan.target_seconds, SHORTS_MAX_SECONDS)
+        self.assertTrue(any("risk" in r for r in plan.reasons))
         self.assertEqual(plan.preset, "vertical")
         self.assertLessEqual(len(plan.title), 100)
         self.assertIn("eldenring", plan.tags)
@@ -54,6 +54,10 @@ class PlannerTests(unittest.TestCase):
                           "owner")
         plan = plan_clip("audio_spike", "chan", self.mem)
         self.assertEqual(plan.target_seconds, SHORTS_MAX_SECONDS)
+        self.mem.remember("preference", "shorts_target_seconds", "45",
+                          "owner")
+        plan = plan_clip("audio_spike", "chan", self.mem)
+        self.assertEqual(plan.target_seconds, 45)
         self.mem.remember("preference", "watermark", "@zenas", "owner")
         plan = plan_clip("audio_spike", "chan", self.mem)
         self.assertEqual(plan.watermark, "@zenas")
