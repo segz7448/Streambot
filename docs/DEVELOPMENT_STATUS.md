@@ -102,3 +102,33 @@ Known limitations: no Telegram/Twitch/FFmpeg functionality yet; dependencies
 must stay stdlib-only until pip bootstrap is verified on-device.
 
 Remaining work: Phases 003-017 per the brief.
+
+## Phase 006/014 additions — ingestion route + distribution (2026-11-19, ~02:55 PST)
+
+PUSHED (main@98e11d5, 123/123 unit tests) — code-complete tiers only, NOT
+deployed to agt-3f177cf6 (live deployment e7a6c026 still runs b0b0e96).
+
+- app/ingestion/twitch_clips.py: official Twitch Clips route. Create Clip
+  (clips:edit, any live channel, authenticating user owns the clip),
+  poll Get Clips, Get Clips Download (beta). VERIFIED LIMIT: download is
+  reserved to the broadcaster or channel editors
+  (channel:manage:clips / editor:manage:clips); the calling token's USER
+  must hold that role - third-party OAuth alone confers nothing.
+  Arbitrary-channel file pull and continuous capture are not officially
+  deliverable. Status: implemented, NOT live accepted (gated on Twitch
+  dev app + owner OAuth consent).
+- app/distribution/relay.py: (a) Telegram clip forwarding to
+  owner-registered destinations (0600 store, partial failures visible);
+  (b) RTMP restream of an explicitly owner-provided feed to
+  owner-configured RTMP endpoints - the requested RTMP scope, kept
+  separate from (a); refuses with no feed or no destinations. Neither
+  live-tested.
+- app/distribution/youtube.py: YouTube Data API v3 publisher, verified
+  against official docs: device flow requires a "TVs and Limited Input
+  devices" OAuth client; its allowed scope list excludes youtube.upload
+  but includes the broad youtube scope accepted by videos.insert
+  (SCOPE constant corrected). Uploads via an API project that has not
+  passed YouTube's compliance audit are locked private and unappealable
+  (support.google.com/youtube/answer/7300965); module defaults to
+  private. Unit-mocked only - mocks do not establish API compatibility;
+  first live call is a gated step requiring owner OAuth consent.
