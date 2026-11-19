@@ -84,10 +84,13 @@ h264+AAC with original audio (19.9s / 15.9s).
 Explicit remaining limitations (not claimed solved): the cross-kind
 merge covers only the pending batch, not an event clipped in a prior
 pass; fixture is synthetic tone + static video, not real gameplay.
-The reconnect-gap limitation (carried episode suppressing a genuinely
-new post-restart burst) is closed in 1c8903f: a real wall-time gap
-between segment files resets the episode, detected within a pass and
-across passes via persisted last_seg_mtime.
+The reconnect-gap mitigation in 1c8903f is best-effort ONLY, not a
+closure (per review): the wall-time mtime threshold misses common
+short reconnects (e.g. a brief drop with 10s segments stays under the
+2x-segment threshold), and mtimes of copied/registered media are not
+reliable gap evidence. An explicit reconnect-run marker in session
+state is the proper fix, deferred as follow-up after deployed
+acceptance.
 
 ## Synthetic loopback reconnect + downstream clip evidence (2026-11-19)
 
