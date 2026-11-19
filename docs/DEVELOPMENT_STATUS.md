@@ -133,23 +133,32 @@ deployed to agt-3f177cf6 (live deployment e7a6c026 still runs b0b0e96).
   private. Unit-mocked only - mocks do not establish API compatibility;
   first live call is a gated step requiring owner OAuth consent.
 
-### YouTube OAuth route — UNRESOLVED, no auth choice settled (2026-11-19)
+### YouTube OAuth route — RESOLVED to least privilege, owner consent pending (2026-11-19)
 
-Per review, the broad youtube scope is not settled merely because the
-device flow permits it. Assessment for a headless phone-hosted daemon:
+RECOMMENDED SUPPORTED ROUTE: Desktop app OAuth client + loopback
+redirect + PKCE, scope youtube.upload ONLY. Google's Desktop Apps doc
+explicitly covers "developer CLI tools, background sync utilities, or
+scripts" (developers.google.com/identity/protocols/oauth2/native-app),
+so this phone-hosted daemon fits that client type. The owner completes
+consent in any browser on the SAME phone (he owns the Android host; the
+daemon's earlier "no browser" assumption was wrong) - the redirect lands
+on the daemon's 127.0.0.1 listener (app.distribution.youtube.LoopbackAuth,
+implemented with PKCE S256 + state check, unit-tested incl. a real local
+HTTP round-trip and state-mismatch refusal).
 
-- Device flow ("TVs and Limited Input devices" client): allows the broad
-  youtube scope only for uploads (youtube.upload is NOT in its allowed
-  scope list). Eligibility is also questionable: the flow is intended
-  for limited-input devices, and a server-side daemon may not qualify
-  under Google's client-type policy. LEAST-PRIVILEGE VIOLATION + policy
-  gray zone.
-- Installed-app flow with loopback redirect: supports youtube.upload
-  (least privilege) but needs an interactive browser reaching localhost
-  on the host - the headless AGT phone has none, and the OOB fallback is
-  deprecated.
-- Service accounts: not supported for YouTube channel operations.
+Device flow REJECTED: its allowed scope list excludes youtube.upload and
+would force the broad youtube scope; a daemon is not the intended
+limited-input device.
 
-No authorization is approved; the auth choice stays unresolved until
-verified and any required owner consent can name the actual access.
-The module remains gated on YouTubeNotConfigured either way.
+Constraints the owner must hear before consenting:
+- Unverified project in Testing mode: owner must be a listed test user,
+  sees an unverified-app warning, and the refresh token EXPIRES 7 DAYS
+  after consent (weekly re-consent) until the project passes Google's
+  sensitive-scope verification
+  (support.google.com/cloud/answer/10311615).
+- Uploads from a project that has not passed YouTube's compliance audit
+  are locked private and unappealable
+  (support.google.com/youtube/answer/7300965); the module defaults to
+  private.
+No authorization has been requested or taken; consent, when asked, names
+the exact access (youtube.upload only).

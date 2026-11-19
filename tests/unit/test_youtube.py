@@ -24,16 +24,33 @@ class YouTubePublisherTests(unittest.TestCase):
         with self.assertRaises(YouTubeNotConfigured):
             YouTubePublisher("cid", "")
 
-    def test_device_flow_posts_client_id(self):
-        posted = {}
-        def fake(url, fields):
-            posted.update(fields)
-            return {"device_code": "dc", "user_code": "ABCD",
-                    "verification_url": "https://www.google.com/device"}
-        with mock.patch("app.distribution.youtube._post_form", side_effect=fake):
-            data = YouTubePublisher.begin_device_flow("cid")
-        self.assertEqual(posted["client_id"], "cid")
-        self.assertIn("user_code", data)
+    def test_loopback_flow_builds_least_privilege_url(self):
+        auth = YouTubePublisher.__new__(YouTubePublisher)  # unused
+        from app.distribution.youtube import LoopbackAuth
+        flow = LoopbackAuth("cid", host="127.0.0.1", port=0)
+        self.assertIn("youtube.upload", flow.authorization_url)
+        self.assertNotIn("auth/youtube%20", flow.authorization_url)
+        self.assertIn("code_challenge_method=S256", flow.authorization_url)
+        self.assertIn("127.0.0.1", flow.redirect_uri)
+        self.assertIn("access_type=offline", flow.authorization_url)
+
+    def test_loopback_code_catcher_and_state_check(self):
+        import urllib.request as u
+        from app.distribution.youtube import (LoopbackAuth,
+                                              YouTubeUploadFailed)
+        flow = LoopbackAuth("cid", host="127.0.0.1", port=0)
+        import threading
+        t = threading.Thread(target=lambda: u.urlopen(
+            flow.redirect_uri + f"/?code=abc&state={flow.state}"),
+            daemon=True)
+        t.start()
+        self.assertEqual(flow.wait_for_code(timeout=10), "abc")
+        flow2 = LoopbackAuth("cid", host="127.0.0.1", port=0)
+        t2 = threading.Thread(target=lambda: u.urlopen(
+            flow2.redirect_uri + "/?code=abc&state=WRONG"), daemon=True)
+        t2.start()
+        with self.assertRaises(YouTubeUploadFailed):
+            flow2.wait_for_code(timeout=10)
 
     def test_publish_confirmed_returns_video_id(self):
         pub = YouTubePublisher("cid", "rt")
