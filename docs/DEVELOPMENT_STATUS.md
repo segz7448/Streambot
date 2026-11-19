@@ -445,3 +445,7 @@ REVIEW HARDENING (reviewer pass on the auto-delivery candidate):
   slow-sender concurrent callers produce exactly one send; a caller
   arriving after a mid-flight failure sees skipped_uncertain and never
   resends; a flush concurrent with a replay reconcile sends once.
+Known minor limitation (accepted): NOVA_TOKEN_FILE set but the file
+itself missing/unreadable raises inside the send attempt and is
+classified UNCERTAIN rather than UNAVAILABLE; the clip is then held
+for reconciliation and never blind-resent, which is the safe side.
