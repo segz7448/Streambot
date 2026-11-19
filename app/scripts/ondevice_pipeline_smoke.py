@@ -65,6 +65,30 @@ async def main():
     sup.stopping.set()
     await asyncio.wait_for(task, timeout=20)
     clip_bytes = os.path.getsize(clip_path) if clip and os.path.exists(clip_path) else 0
+
+    # chained stages: edit (vertical preset) -> QC -> optional owner delivery
+    from app.editing.editor import edit_clip          # noqa: E402
+    from app.editing.presets import PRESETS           # noqa: E402
+    from app.qc.verify import check_media             # noqa: E402
+    edited_path = f"{WORK}/clip-edited.mp4"
+    edit_ok = qc_ok = False
+    delivered_id = None
+    if clip_bytes > 10000:
+        edited = await asyncio.to_thread(
+            edit_clip, f"{PREFIX}/bin/ffmpeg", clip_path, edited_path,
+            PRESETS["vertical"], None, 0.5, f"{HOME}/instinct-clip/runtime")
+        edit_ok = os.path.exists(edited_path) and os.path.getsize(edited_path) > 10000
+        if edit_ok:
+            qc = await asyncio.to_thread(
+                check_media, f"{PREFIX}/bin/ffprobe", f"{PREFIX}/bin/ffmpeg",
+                edited_path, 1.0, 100, 100, True)
+            qc_ok = qc.ok
+            if qc_ok and os.environ.get("NOVA_SMOKE_DELIVER") == "1":
+                from app.distribution.telegram_delivery import deliver_clip_sync  # noqa: E402
+                delivered_id = await asyncio.to_thread(
+                    deliver_clip_sync, os.environ["NOVA_TOKEN_FILE"],
+                    os.environ["NOVA_STATE_DIR"], edited_path,
+                    "NOVA chained synthetic end-to-end test - not a real stream clip")
     conn = connect(db)
     kinds = [r[0] for r in conn.execute(
         "SELECT kind FROM candidate_events").fetchall()]
@@ -75,6 +99,9 @@ async def main():
         "candidate_kinds": kinds,
         "clip_extracted": bool(clip and clip_bytes > 10000),
         "clip_bytes": clip_bytes,
+        "edited_vertical": edit_ok,
+        "qc_passed": qc_ok,
+        "delivered_message_id": delivered_id,
         "clean_stop": True,
     }))
 

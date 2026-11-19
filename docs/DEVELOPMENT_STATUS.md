@@ -17,15 +17,24 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 010 | Automatic clipping | CODE READY + crash-hardened: AutoClipper consumes pending/queued events, scores via configured provider, extracts via real extractor, exactly-once clips rows (unique index + INSERT OR IGNORE; crash-window test proves retry cannot duplicate; 4fae05f). Live-source acceptance still pending Phase 006 |
 | 011 | Video editing | DEVICE-VERIFIED on agt-3f177cf6 for the vertical preset (1080x1920 output probed from 320x240 source, loudnorm applied; subtitle burn pixel-proven 2026-11-19 after font-rendering fix, commit 7a87fe7); square/horizontal share the same graph construction, not separately device-run |
 | 012 | Quality control | DEVICE-VERIFIED on agt-3f177cf6 (media verification passed on real edited output; duplicate detection confirmed both directions: derived file flagged, unrelated file not) |
-| 013 | Telegram delivery | NOT STARTED |
-| 014 | Live distribution | NOT STARTED |
-| 015 | Monitoring & recovery | PARTIAL (supervisor + health + job recovery in foundation) |
-| 016 | Acceptance test | NOT STARTED |
+| 013 | Telegram delivery | LIVE-ACCEPTED 2026-11-19: synthetic clip delivered to paired owner (Telegram message_id 15) after upload-timeout hardening (b0b0e96); owner-scoped by construction (paired admin only) |
+| 014 | Live distribution (relay) | NOT STARTED (no code) |
+| 015 | Monitoring & recovery | PARTIAL (supervisor + health + job recovery in foundation; bot recovery rollout live: restart-safe updates + watermark, no-evict failed set, condensed recoverable logs; confirm-to-handle crash gap documented, persistent pre-ack inbox not built) |
+| 016 | Acceptance test | PARTIAL: fixture chain (record->detect->extract) device-run; full chained fixture->edit->QC->deliver in progress; REAL-SOURCE acceptance not run and cannot run until a verified authorized Twitch ingestion route exists |
 | 017 | Documentation & release | README + this file started |
 
 Added scope (owner, 2026-11-18): YouTube publishing module (OAuth 2.0,
 private/unlisted by default, no browser automation, no publication claims
-until YouTube confirms).
+until YouTube confirms). STATUS: NOT STARTED (no code); gated on owner's
+Google OAuth consent.
+
+## Scope accuracy note (2026-11-19 02:15)
+
+Corrected tiers: publisher and relay have no code and are not merely
+"user-blocked" - they are unimplemented. Only Twitch ingestion (route
+verification pending), AI provider (owner declined Groq; $0 on-device
+feasibility under assessment), and YouTube OAuth are owner-decision
+gated. Everything else unfinished is implementation work still owed.
 
 ## Subtitle font-rendering defect and fix (2026-11-19)
 
