@@ -15,6 +15,7 @@ Security posture:
 from __future__ import annotations
 
 import os
+import asyncio
 import sqlite3
 import time
 from pathlib import Path
@@ -269,8 +270,11 @@ class BotService:
                     "executed (it was recorded for reconciliation). "
                     "Please try again later.")
                 return
-            reply = self.router.dispatch(message.text or "", user_id=user.id,
-                                     update_id=update.update_id)
+            # dispatch off the event loop: feed validation resolves DNS
+            # synchronously and must never stall command handling
+            reply = await asyncio.to_thread(
+                self.router.dispatch, message.text or "",
+                user_id=user.id, update_id=update.update_id)
             if reply:
                 await message.reply_text(reply)
             self.inbox.remove(update.update_id)
