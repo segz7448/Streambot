@@ -80,6 +80,11 @@ class PublishCommandTests(unittest.TestCase):
             conn.close()
         if outside:
             clip = d.parent / f"escape-{clip_id}.mp4"
+        elif status == "RETRO":
+            status = "HELD"
+            sess = d / "retrospective" / "900001"
+            sess.mkdir(parents=True, exist_ok=True)
+            clip = sess / f"clip-edited-{clip_id}.mp4"
         else:
             sess = d / "sessions" / "src"
             sess.mkdir(parents=True, exist_ok=True)
@@ -198,6 +203,36 @@ class PublishCommandTests(unittest.TestCase):
         unc = ops.journal_uncertain(d)
         self.assertEqual(len(unc), 1)
         self.assertEqual(unc[0]["command"], "publish")
+
+    def test_retrospective_output_root_accepted(self):
+        d = Path(tempfile.mkdtemp())
+        self._clip(d, status="RETRO")
+        fake = mock.Mock()
+        fake.publish.return_value = "vidR"
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r = cf.publish_reply(d, "1", 559)
+        self.assertIn("PRIVATE", r)
+
+    def test_uncertain_attempt_blocks_new_command_same_clip(self):
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        from app.bot import ops
+        ops.journal_mark_uncertain(d, 900, "publish", "/publish 1")
+        fake = mock.Mock()
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r = cf.publish_reply(d, "1", 901)
+        self.assertIn("uncertain", r.lower())
+        self.assertIn("Reconcile", r)
+        fake.publish.assert_not_called()
+        # a DIFFERENT clip is not blocked
+        self._clip(d, clip_id=2)
+        fake.publish.return_value = "vid2"
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r2 = cf.publish_reply(d, "2", 902)
+        self.assertIn("PRIVATE", r2)
 
     def test_publish_in_side_effecting(self):
         from app.bot import ops

@@ -180,10 +180,10 @@ class ReconnectTests(unittest.TestCase):
             asyncio.run(drive())
             self.assertEqual(worker.reconnects, 1)
             self.assertEqual(len(runner.starts), 2)
-            self.assertNotIn("-start_number", runner.starts[0])
+            self.assertNotIn("-segment_start_number", runner.starts[0])
             # second start continues numbering after on-disk segments
             args = runner.starts[1]
-            self.assertIn("-start_number", args)
+            self.assertIn("-segment_start_number", args)
 
     def test_reconnect_budget_exhausted_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,5 +232,100 @@ class ReconnectTests(unittest.TestCase):
             (buf.dir / "seg-000002.ts").write_bytes(b"x")
             self.assertEqual(buf.next_seq(), 5)
             args = buf.segment_args("file:///f.mp4", start_number=5)
-            i = args.index("-start_number")
+            i = args.index("-segment_start_number")
             self.assertEqual(args[i + 1], "5")
+
+
+class ReconnectBudgetTests(unittest.TestCase):
+    def _worker(self, tmp, procs, **kw):
+        db = str(Path(tmp) / "t.db")
+        conn = connect(db)
+        migrate(conn)
+        conn.execute(
+            "INSERT INTO twitch_sources (username, created_at, updated_at)"
+            " VALUES ('chan', 0, 0)")
+        conn.execute(
+            "INSERT INTO stream_sessions (source_id, state)"
+            " VALUES (1, 'RECORDING')")
+        conn.close()
+        buf = RollingBuffer(tmp, session_id=1, segment_seconds=5)
+        buf.dir.mkdir(parents=True, exist_ok=True)
+        kw.setdefault("sweep_seconds", 0.02)
+        kw.setdefault("reconnect_base_seconds", 0.01)
+        return RecordingWorker(SeqRunner(procs), buf, "fake://src", db,
+                               **kw)
+
+    def test_healthy_uptime_rearms_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            procs = [CrashProc(pid=4400 + i) for i in range(5)]
+            worker = self._worker(tmp, procs, max_reconnects=2,
+                                  healthy_reset_seconds=0.05)
+            ctx = FakeCtx()
+
+            async def drive():
+                task = asyncio.create_task(worker.run(ctx))
+                await asyncio.sleep(0.08)  # healthy > reset window
+                for i, p in enumerate(procs[:-1]):
+                    p.running = False
+                    for _ in range(200):  # wait for the restart
+                        if len(worker.runner.starts) > i + 1:
+                            break
+                        await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.08)  # healthy again
+                ctx.stopping = True
+                await task
+
+            asyncio.run(drive())
+            # every crash followed healthy uptime, so the budget kept
+            # re-arming: last crash counted as 1, never hit the cap
+            self.assertEqual(worker.reconnects, 1)
+
+    def test_cumulative_gap_cap_fails_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            procs = [CrashProc(pid=4500 + i) for i in range(6)]
+            worker = self._worker(tmp, procs, max_reconnects=5,
+                                  max_gap_seconds=0.025)
+            ctx = FakeCtx()
+
+            async def drive():
+                task = asyncio.create_task(worker.run(ctx))
+                for p in procs:
+                    if ctx.stopping:
+                        break
+                    await asyncio.sleep(0.05)
+                    p.running = False
+                try:
+                    await task
+                except RuntimeError:
+                    pass
+
+            asyncio.run(drive())
+            self.assertGreater(worker.gap_seconds, 0.025)
+
+
+class SegmentStartNumberRealTests(unittest.TestCase):
+    """Verify against REAL ffmpeg output filenames, not arg strings:
+    the segment muxer must honor the requested start number."""
+
+    def test_real_ffmpeg_produces_numbered_segments(self):
+        import shutil
+        import subprocess
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("no ffmpeg on this host")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.mp4"
+            subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc=duration=2:size=64x64",
+                 "-f", "lavfi", "-i", "sine=duration=2",
+                 "-c:v", "libx264", "-g", "5", "-c:a", "aac",
+                 "-y", str(src)], check=True, capture_output=True)
+            buf = RollingBuffer(tmp, session_id=1, segment_seconds=1)
+            buf.dir.mkdir(parents=True, exist_ok=True)
+            args = buf.segment_args(str(src), start_number=7)
+            subprocess.run([ffmpeg] + args, check=True,
+                           capture_output=True, timeout=60)
+            names = sorted(p.name for p in buf.dir.glob("seg-*.ts"))
+            self.assertTrue(names, "no segments produced")
+            self.assertEqual(names[0], "seg-000007.ts")

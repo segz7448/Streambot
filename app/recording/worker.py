@@ -7,6 +7,7 @@ database on startup and enforces the storage cap continuously.
 from __future__ import annotations
 
 import asyncio
+import time
 
 from ..core.lifecycle import ServiceContext
 from ..core.logging import get_logger
@@ -21,7 +22,9 @@ class RecordingWorker:
                  source_url: str, db_path: str,
                  sweep_seconds: float = 10.0,
                  max_reconnects: int = 5,
-                 reconnect_base_seconds: float = 5.0):
+                 reconnect_base_seconds: float = 5.0,
+                 healthy_reset_seconds: float = 300.0,
+                 max_gap_seconds: float = 300.0):
         self.runner = runner
         self.buffer = buffer
         self.source_url = source_url
@@ -29,10 +32,15 @@ class RecordingWorker:
         self.sweep_seconds = sweep_seconds
         self.max_reconnects = max_reconnects
         self.reconnect_base_seconds = reconnect_base_seconds
+        self.healthy_reset_seconds = healthy_reset_seconds
+        self.max_gap_seconds = max_gap_seconds
         self.reconnects = 0
+        self.gap_seconds = 0.0
+        self._started_at = 0.0
         self.session_name = f"record-{buffer.session_id}"
 
     async def _start(self, start_number: int):
+        self._started_at = time.monotonic()
         proc = await self.runner.run(
             self.buffer.segment_args(self.source_url, start_number),
             session_id=self.session_name)
@@ -69,6 +77,12 @@ class RecordingWorker:
                         log.info("feed exhausted (clean exit); "
                                  "recording complete")
                         return
+                    # a long healthy run re-arms the budget: the cap
+                    # guards a feed that keeps dropping NOW, not total
+                    # drops over the session's whole life
+                    if (time.monotonic() - self._started_at
+                            >= self.healthy_reset_seconds):
+                        self.reconnects = 0
                     if self.reconnects >= self.max_reconnects:
                         raise RuntimeError(
                             f"ffmpeg exited rc={rc} after "
@@ -82,6 +96,19 @@ class RecordingWorker:
                     self.reconnects += 1
                     delay = min(60.0, self.reconnect_base_seconds
                                 * (2 ** (self.reconnects - 1)))
+                    # the feed keeps playing while we are down: this
+                    # wall-clock gap is NOT represented in the
+                    # sequence-derived content clock, so event windows
+                    # spanning it treat the footage as contiguous.
+                    # Bounded explicitly: too much cumulative gap makes
+                    # clip timing untrustworthy and fails the session.
+                    self.gap_seconds += delay
+                    if self.gap_seconds > self.max_gap_seconds:
+                        raise RuntimeError(
+                            f"feed unstable: {self.gap_seconds:.0f}s "
+                            f"cumulative reconnect gap exceeds the "
+                            f"{self.max_gap_seconds:.0f}s limit; content "
+                            "timing across gaps is approximate")
                     log.warning(
                         "ffmpeg dropped rc=%s; reconnect %d/%d in %.0fs "
                         "(session %s)", rc, self.reconnects,

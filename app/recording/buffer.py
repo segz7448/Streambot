@@ -71,7 +71,9 @@ class RollingBuffer:
                 str(self.segment_seconds),
                 "-reset_timestamps", "1"]
         if start_number:
-            args += ["-start_number", str(start_number)]
+            # the segment muxer's option is -segment_start_number;
+            # plain -start_number is image2-only and silently ignored
+            args += ["-segment_start_number", str(start_number)]
         return args + [pattern]
 
     def segments(self) -> list[Segment]:

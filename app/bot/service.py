@@ -127,6 +127,9 @@ class BotService:
         self.router.register("deliveries", self._deliveries,
                              "list held clips; /deliveries flush sends "
                              "them to you")
+        self.router.register("youtubeauth",
+                             lambda c: cf.youtubeauth_reply(self._state_dir(), c.args),
+                             "YouTube consent run: /youtubeauth [status]")
         self.router.register("publish",
                              lambda c: cf.publish_reply(self._state_dir(), c.args, c.update_id),
                              "upload a clip to YouTube as PRIVATE: "
