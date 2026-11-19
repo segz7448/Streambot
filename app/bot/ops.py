@@ -43,6 +43,18 @@ def relay_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
     if len(parts) < 3 or parts[0] != "start":
         return USAGE_RELAY
     feed, dests = parts[1], parts[2:]
+    from ..distribution.relay import validate_feed, validate_output
+    feed_root = state_dir / "feeds"
+    out_root = state_dir / "streams"
+    out_root.mkdir(parents=True, exist_ok=True)
+    try:
+        feed = validate_feed(feed, feed_root)
+        dests = [validate_output(d, out_root) for d in dests]
+    except ValueError as exc:
+        return (f"Refused: {exc}. Feeds must be credential-free http(s) "
+                "or a file you placed in the feeds directory; "
+                "destinations must be keyless rtmp(s) endpoints or "
+                "names under the streams directory.")
     for dest in dests:
         if secret_in_rtmp_url(dest):
             return ("Refused: that RTMP destination embeds a stream key, "

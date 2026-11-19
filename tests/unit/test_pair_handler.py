@@ -42,9 +42,17 @@ def _stub_telegram():
         def __and__(self, other):
             return self
 
+        def __or__(self, other):
+            return self
+
+        def __invert__(self):
+            return self
+
     class _Filters:
         TEXT = _F()
         COMMAND = _F()
+        VIDEO = _F()
+        Document = types.SimpleNamespace(ALL=_F(), VIDEO=_F())
 
     tg.Update = Update
     tgext.Application = Application

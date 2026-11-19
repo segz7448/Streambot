@@ -26,12 +26,26 @@ def crop_filter(preset: OutputPreset) -> str:
     )
 
 
+def _escape_drawtext(text: str) -> str:
+    """Owner-supplied watermark text for ffmpeg drawtext. Collapsed to a
+    single bounded line with every filter-graph metacharacter escaped;
+    the value travels as one argv element (never a shell), so this only
+    needs to keep the filter graph itself intact."""
+    t = " ".join(text.split())[:100]
+    for ch, rep in (("\\", "\\\\"), (":", "\\:"), ("'", "\\'"),
+                    ("%", "\\%"), (",", "\\,"), (";", "\\;"),
+                    ("[", "\\["), ("]", "\\]")):
+        t = t.replace(ch, rep)
+    return t
+
+
 def build_filter_graph(preset: OutputPreset,
                        subtitle_path: str | None = None,
-                       focus_x: float = 0.5) -> str:
+                       focus_x: float = 0.5,
+                       watermark: str | None = None) -> str:
     """Video filter chain. focus_x shifts the crop window (0=left, 1=right);
     centered by default. Subtitles are burned last so they render at output
-    resolution."""
+    resolution. An owner watermark is drawn bottom-right via drawtext."""
     target_ar = preset.width / preset.height
     x_expr = (f"'if(gt(a,{target_ar:.6f}),(iw-ih*{target_ar:.6f})*{focus_x:.3f},0)'")
     chain = (
@@ -39,6 +53,10 @@ def build_filter_graph(preset: OutputPreset,
         f":h='if(gt(a,{target_ar:.6f}),ih,iw/{target_ar:.6f})':x={x_expr}:y=0,"
         f"scale={preset.width}:{preset.height}"
     )
+    if watermark:
+        chain += (",drawtext=text='" + _escape_drawtext(watermark) +
+                  "':x=w-text_w-24:y=h-text_h-24:fontsize=36"
+                  ":fontcolor=white:borderw=2:bordercolor=black")
     if subtitle_path:
         escaped = subtitle_path.replace(":", "\\:").replace("'", "\\'")
         chain += f",subtitles='{escaped}'"
@@ -47,9 +65,10 @@ def build_filter_graph(preset: OutputPreset,
 
 def edit_args(ffmpeg: str, src: str, out: str, preset: OutputPreset,
               subtitle_path: str | None = None, focus_x: float = 0.5,
-              loudnorm: bool = True) -> list[str]:
+              loudnorm: bool = True, watermark: str | None = None) -> list[str]:
     args = [ffmpeg, "-y", "-i", src,
-            "-vf", build_filter_graph(preset, subtitle_path, focus_x),
+            "-vf", build_filter_graph(preset, subtitle_path, focus_x,
+                                      watermark),
             "-c:v", "libx264", "-preset", "veryfast",
             "-crf", str(preset.video_crf), "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", preset.audio_bitrate,
@@ -62,15 +81,17 @@ def edit_args(ffmpeg: str, src: str, out: str, preset: OutputPreset,
 
 def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
               subtitle_path: str | None = None, focus_x: float = 0.5,
-              runtime_dir: str = ".nova-runtime") -> Path:
+              runtime_dir: str = ".nova-runtime",
+              watermark: str | None = None) -> Path:
     env = dict(os.environ)
-    if subtitle_path:
-        # relocated prefixes ship a fontconfig that points at paths which
-        # no longer exist; without a corrected config libass renders with
-        # broken metrics (device-verified on agt-3f177cf6)
+    if subtitle_path or watermark:
+        # drawtext and libass both resolve fonts through fontconfig;
+        # relocated prefixes ship a fontconfig that points at paths
+        # which no longer exist (device-verified on agt-3f177cf6)
         env.update(ensure_fontconfig_env(ffmpeg, runtime_dir))
     proc = subprocess.run(
-        edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x),
+        edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x,
+                  watermark=watermark),
         capture_output=True, text=True, timeout=600, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"edit failed rc={proc.returncode}: "

@@ -49,6 +49,9 @@ class BotService:
         self.app.add_handler(CommandHandler("pair", self._pair))
         self.app.add_handler(
             MessageHandler(filters.TEXT & filters.COMMAND, self._command))
+        self.app.add_handler(MessageHandler(
+            (filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND,
+            self._media))
         # true pre-ack: wrap the update queue's put so command updates
         # are persisted before the framework advances its offset
         from . import ops as _ops
@@ -113,6 +116,9 @@ class BotService:
         self.router.register("restart",
                              lambda c: cf.RESTART_REPLY,
                              "restart workers (host-controlled)")
+        self.router.register("deliveries", self._deliveries,
+                             "list held clips; /deliveries flush sends "
+                             "them to you")
 
     def _relay(self, cmd) -> str:
         from . import ops
@@ -133,6 +139,10 @@ class BotService:
     def _destinations(self, cmd) -> str:
         from . import ops
         return ops.destinations_reply(self._state_dir(), cmd.args)
+
+    def _deliveries(self, cmd) -> str:
+        from . import ops
+        return ops.deliveries_reply(self._state_dir(), cmd.args)
 
     # --- real handler implementations (registered => advertised) ---
 
@@ -250,6 +260,36 @@ class BotService:
             from . import commands_full as cf
             cf.record_error(self._state_dir(),
                             f"command failed: {exc.__class__.__name__}")
+            raise
+        self.watermark.mark_handled(update.update_id)
+
+    async def _media(self, update: Update,
+                     context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Mode C: the admin sends a video; the retrospective pipeline
+        clips it. Fail-closed for strangers like _command."""
+        user = update.effective_user
+        message = update.message
+        if user is None or message is None:
+            return
+        if self.watermark.already_handled(update.update_id):
+            return
+        admin = self._admin(user.id)
+        if admin is None:
+            log.warning("unauthorized media attempt user_id=%s", user.id)
+            self.inbox.remove(update.update_id)
+            self.watermark.mark_handled(update.update_id)
+            return
+        try:
+            from . import media as bot_media
+            reply = await bot_media.ingest_media(update, context.bot,
+                                                 self._state_dir())
+            if reply:
+                await message.reply_text(reply)
+            self.inbox.remove(update.update_id)
+        except Exception:
+            self.watermark.mark_failed(update.update_id)
+            from . import commands_full as cf
+            cf.record_error(self._state_dir(), "media ingest failed")
             raise
         self.watermark.mark_handled(update.update_id)
 

@@ -212,6 +212,11 @@ def quality_reply(state_dir: Path, args: str) -> str:
         row = conn.execute(
             "SELECT value FROM settings WHERE key='quality'").fetchone()
     current = row[0] if row else "vertical (default)"
+    if arg:
+        from ..intelligence.memory import Memory
+        Memory(str(state_dir / "memory.json")).remember(
+            "preference", "quality", arg, "owner via /quality",
+            confidence="stated")
     return (f"Current quality: {current}. Available: "
             + ", ".join(sorted(PRESETS)) + ". Usage: /quality <preset>")
 

@@ -11,10 +11,62 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 from ..core.logging import get_logger
+
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
+_CANONICAL_KEYLESS = re.compile(r"^rtmps?://[^/?#@\s]+/?$", re.IGNORECASE)
+
+
+def validate_feed(feed: str, input_root: Path) -> str:
+    """A restream feed is either a credential-free http(s) URL or a
+    local file under the authorized input root. Anything else - other
+    protocols, userinfo, query/fragment credentials, flag-shaped
+    strings, symlink escapes - is refused. Returns the safe specifier.
+    """
+    f = feed.strip()
+    if not f or f.startswith("-"):
+        raise ValueError("feed is empty or flag-shaped")
+    if _SCHEME.match(f):
+        from urllib.parse import urlparse
+        try:
+            p = urlparse(f)
+        except ValueError:
+            raise ValueError("feed URL unparseable")
+        if p.scheme.lower() not in ("http", "https"):
+            raise ValueError("only http(s) feeds are supported")
+        if p.username or p.password or p.query or p.fragment:
+            raise ValueError("feed URL carries credentials/parameters")
+        if not p.hostname:
+            raise ValueError("feed URL has no host")
+        return f
+    root = input_root.resolve()
+    p = (Path(f).resolve() if os.path.isabs(f) else (root / f).resolve())
+    if p != root and root not in p.parents:
+        raise ValueError("local feed escapes the authorized input root")
+    return str(p)
+
+
+def validate_output(dest: str, output_root: Path) -> str:
+    """A destination is either a canonical keyless rtmp(s) endpoint or
+    a local file resolved UNDER the dedicated output root (no absolute
+    paths, no '..' or symlink escape, nothing flag-shaped). Anything
+    else is refused. Returns the safe specifier."""
+    d = dest.strip()
+    if not d or d.startswith("-"):
+        raise ValueError("destination is empty or flag-shaped")
+    if _CANONICAL_KEYLESS.match(d):
+        return d
+    if _SCHEME.match(d) or "://" in d or "@" in d:
+        raise ValueError("destination carries a scheme or credentials")
+    root = output_root.resolve()
+    p = (root / d).resolve()  # relative to the output root only
+    if p != root and root not in p.parents:
+        raise ValueError("local output escapes the output root")
+    return str(p)
 
 log = get_logger("distribution.relay")
 
