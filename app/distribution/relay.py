@@ -61,6 +61,29 @@ class Relayer:
         self.store = store
         self.send_video = send_video
 
+    def restream(self, feed_url: str, rtmp_destinations: list[str],
+                 ffmpeg_bin: str = "ffmpeg") -> list[str]:
+        """RTMP restream of an EXPLICITLY owner-provided feed (a source
+        the owner supplies and is authorized to restream, e.g. their own
+        channel output) to owner-configured RTMP endpoints. This is the
+        requested RTMP scope; it is separate from Telegram clip
+        forwarding and needs no Twitch capture route because the feed
+        comes from the owner. Returns one launched process command per
+        destination; the caller owns process lifecycle and stop control
+        (/stoprelay). Never invent a feed: no input, no restream."""
+        if not feed_url:
+            raise ValueError("no owner-provided feed configured")
+        if not rtmp_destinations:
+            raise ValueError("no RTMP destinations configured")
+        cmds = []
+        for dest in rtmp_destinations:
+            cmds.append([
+                ffmpeg_bin, "-re", "-i", feed_url,
+                "-c", "copy", "-f", "flv", dest,
+            ])
+        log.info("restream prepared for %d destination(s)", len(cmds))
+        return cmds
+
     def relay_clip(self, video_path: str, caption: str = "") -> dict:
         """Send one clip to every registered destination. Returns
         {chat_id: message_id-or-error} - partial failures are visible,

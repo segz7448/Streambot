@@ -1,5 +1,17 @@
 """Phase 014 (added scope): YouTube publishing via Data API v3.
 
+VERIFIED against official docs (2026-11-19):
+- Device flow requires an OAuth client of type "TVs and Limited Input
+  devices" created in Google API Console. The device flow's allowed
+  scope list does NOT include youtube.upload; the broad
+  https://www.googleapis.com/auth/youtube scope IS allowed and is
+  accepted by videos.insert, so this flow can authorize uploads.
+  Source: https://developers.google.com/identity/protocols/oauth2/limited-input-device
+- Uploads made through an API project that has not passed a YouTube
+  compliance audit are LOCKED PRIVATE and cannot be appealed; only the
+  audit lifts the restriction. Source:
+  https://support.google.com/youtube/answer/7300965 . This module
+  defaults to private, which is compatible with an unaudited project.
 Official route only: OAuth 2.0 device authorization flow (no browser
 automation), resumable upload (videos.insert), privacyStatus PRIVATE by
 default - the owner publishes explicitly. No publication claim is made
@@ -20,7 +32,9 @@ DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 UPLOAD_URL = ("https://www.googleapis.com/upload/youtube/v3/videos"
               "?uploadType=resumable&part=snippet,status")
-SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+SCOPE = "https://www.googleapis.com/auth/youtube"
+# NOTE: youtube.upload is NOT in the device flow's allowed scope list;
+# the broad youtube scope is allowed and is accepted by videos.insert.
 
 
 class YouTubeNotConfigured(Exception):

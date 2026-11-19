@@ -38,6 +38,21 @@ class RelayTests(unittest.TestCase):
         self.assertTrue(str(results[1]).startswith("FAILED"))
         self.assertEqual(results[2], 99)
 
+    def test_restream_requires_feed_and_destinations(self):
+        relay = Relayer(self.store, lambda c, p, t: 0)
+        with self.assertRaises(ValueError):
+            relay.restream("", ["rtmp://a"])
+        with self.assertRaises(ValueError):
+            relay.restream("http://feed", [])
+
+    def test_restream_builds_owner_feed_commands(self):
+        relay = Relayer(self.store, lambda c, p, t: 0)
+        cmds = relay.restream("http://owner/feed",
+                              ["rtmp://dest1/key"], ffmpeg_bin="ffmpeg")
+        self.assertEqual(len(cmds), 1)
+        self.assertIn("http://owner/feed", cmds[0])
+        self.assertIn("rtmp://dest1/key", cmds[0])
+
 
 if __name__ == "__main__":
     unittest.main()
