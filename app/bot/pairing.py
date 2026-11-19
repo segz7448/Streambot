@@ -16,6 +16,8 @@ import secrets
 import time
 from pathlib import Path
 
+from ..core.state import locked_read, locked_update, locked_write
+
 DEFAULT_TTL_SECONDS = 900
 
 
@@ -24,16 +26,10 @@ class PairingStore:
         self.path = Path(path)
 
     def _read(self) -> dict:
-        try:
-            return json.loads(self.path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        return locked_read(self.path, {})
 
     def _write(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh)
+        locked_write(self.path, data)
 
     def admin_id(self) -> int | None:
         value = self._read().get("admin_user_id")
@@ -49,30 +45,34 @@ class PairingStore:
                         ttl_seconds: int = DEFAULT_TTL_SECONDS,
                         now: float | None = None) -> None:
         now = time.time() if now is None else now
-        data = self._read()
-        data["pending"] = {
-            "code_sha256": hashlib.sha256(code.encode()).hexdigest(),
-            "expires_at": now + ttl_seconds,
-        }
-        self._write(data)
+        def apply(data):
+            data["pending"] = {
+                "code_sha256": hashlib.sha256(code.encode()).hexdigest(),
+                "expires_at": now + ttl_seconds,
+            }
+            return data, None
+        locked_update(self.path, {}, apply)
 
     def try_pair(self, code: str, user_id: int,
                  now: float | None = None) -> bool:
         """Consume the challenge. Succeeds at most once, only while the
         challenge is unexpired and no admin is established yet."""
         now = time.time() if now is None else now
-        data = self._read()
-        if data.get("admin_user_id") is not None:
-            return False
-        pending = data.get("pending") or {}
         digest = hashlib.sha256((code or "").encode()).hexdigest()
-        if (pending.get("code_sha256") != digest
-                or now > pending.get("expires_at", 0)):
-            return False
-        self._write({"admin_user_id": int(user_id)})
-        return True
+
+        def apply(data):
+            if data.get("admin_user_id") is not None:
+                return data, False
+            pending = data.get("pending") or {}
+            if (pending.get("code_sha256") != digest
+                    or now > pending.get("expires_at", 0)):
+                return data, False
+            return {"admin_user_id": int(user_id)}, True
+
+        return locked_update(self.path, {}, apply)
 
     def clear_challenge(self) -> None:
-        data = self._read()
-        data.pop("pending", None)
-        self._write(data)
+        def apply(data):
+            data.pop("pending", None)
+            return data, None
+        locked_update(self.path, {}, apply)

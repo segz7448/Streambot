@@ -59,9 +59,14 @@ class WatermarkTests(unittest.TestCase):
         self.wm.mark_handled(1)
         self.assertTrue(self.wm.already_handled(1))
 
-    def test_corrupt_file_treated_as_fresh(self):
+    def test_corrupt_file_fails_closed(self):
+        # audit @0705670: corrupt state must NOT silently reset to
+        # empty (that loses the handled watermark and replays side
+        # effects); it fails closed instead
+        from app.core.state import StateCorruptError
         Path(self.path).write_text("not json")
-        self.assertFalse(self.wm.already_handled(5))
+        with self.assertRaises(StateCorruptError):
+            self.wm.already_handled(5)
 
 
 if __name__ == "__main__":

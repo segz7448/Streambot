@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..core.state import locked_read, locked_update
 from ..distribution.relay import (DestinationStore, Relayer,
                                   RestreamManager, secret_in_rtmp_url)
 from .inbox import PreAckInbox
@@ -129,11 +130,7 @@ JOURNAL = "op_journal.json"
 
 
 def _journal_read(state_dir: Path) -> dict:
-    import json
-    try:
-        return json.loads((state_dir / JOURNAL).read_text())
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        return {}
+    return locked_read(state_dir / JOURNAL, {})
 
 
 SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries")
@@ -163,13 +160,11 @@ def journal_mark_uncertain(state_dir: Path, update_id: int,
     import os as _os
     if not update_id:
         return
-    data = _journal_read(state_dir)
-    data[str(update_id)] = {"command": command, "status": "uncertain",
-                            "text": text}
-    path = state_dir / JOURNAL
-    fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-    with _os.fdopen(fd, "w") as fh:
-        json.dump(data, fh)
+    def apply(data):
+        data[str(update_id)] = {"command": command, "status": "uncertain",
+                                "text": text}
+        return data, None
+    locked_update(state_dir / JOURNAL, {}, apply)
 
 
 def inbox_quarantine(state_dir: Path, update_id: int, text: str) -> None:

@@ -21,6 +21,8 @@ import os
 import threading
 from pathlib import Path
 
+from ..core.state import locked_read, locked_write
+
 MAX_FAILED = 200
 
 
@@ -30,19 +32,15 @@ class UpdateWatermark:
         self._lock = threading.Lock()
 
     def _read(self) -> tuple[int, list[int]]:
+        data = locked_read(self.path, {})
         try:
-            data = json.loads(self.path.read_text())
             return (int(data.get("handled", 0)),
                     [int(x) for x in data.get("failed", [])])
-        except (FileNotFoundError, json.JSONDecodeError, ValueError,
-                TypeError):
+        except (ValueError, TypeError, AttributeError):
             return 0, []
 
     def _write(self, handled: int, failed: list[int]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"handled": handled, "failed": failed}, fh)
+        locked_write(self.path, {"handled": handled, "failed": failed})
 
     def snapshot(self) -> tuple[int, list[int]]:
         """(handled high-watermark, failed ids) for status reporting."""

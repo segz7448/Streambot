@@ -19,6 +19,8 @@ import os
 import threading
 from pathlib import Path
 
+from ..core.state import locked_read, locked_update, locked_write
+
 MAX_PENDING = 500
 
 
@@ -28,18 +30,11 @@ class PreAckInbox:
         self._lock = threading.Lock()
 
     def _read(self) -> list[dict]:
-        try:
-            data = json.loads(self.path.read_text())
-            return [e for e in data if isinstance(e, dict)]
-        except (FileNotFoundError, json.JSONDecodeError, ValueError,
-                TypeError):
-            return []
+        data = locked_read(self.path, [])
+        return [e for e in data if isinstance(e, dict)]
 
     def _write(self, entries: list[dict]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(entries, fh)
+        locked_write(self.path, entries)
 
     def add(self, update_id: int, user_id: int, text: str) -> bool:
         """Persist a pending command. Bounded with BACKPRESSURE, never
@@ -48,52 +43,56 @@ class PreAckInbox:
         an overflow file, so a rejected command is reconcilable instead
         of acknowledged-and-lost. Unprocessed entries are never dropped
         to make room."""
-        with self._lock:
-            entries = [e for e in self._read()
-                       if e.get("update_id") != update_id]
-            if len(entries) >= MAX_PENDING:
-                import logging
-                logging.getLogger("bot.inbox").critical(
-                    "pre-ack inbox full (%d); refusing update %s - "
-                    "recorded to overflow for reconciliation",
-                    MAX_PENDING, update_id)
-                self._record_overflow(update_id, user_id, text)
-                return False
-            entries.append({"update_id": int(update_id),
-                            "user_id": int(user_id), "text": text})
-            self._write(entries)
-            return True
+        refused = {"full": False}
+
+        def apply(entries):
+            kept = [e for e in entries
+                    if e.get("update_id") != update_id]
+            if len(kept) >= MAX_PENDING:
+                refused["full"] = True
+                return entries, False  # unchanged: nothing acknowledged
+            kept.append({"update_id": int(update_id),
+                         "user_id": int(user_id), "text": text})
+            return kept, True
+
+        ok = locked_update(self.path, [], apply)
+        if refused["full"]:
+            import logging
+            logging.getLogger("bot.inbox").critical(
+                "pre-ack inbox full (%d); refusing update %s - "
+                "recorded to overflow for reconciliation",
+                MAX_PENDING, update_id)
+            self._record_overflow(update_id, user_id, text)
+        return ok
 
     def _record_overflow(self, update_id: int, user_id: int,
                          text: str) -> None:
         """Durable refusal record for reconciliation. Bounded to the
         last 100 refusals; stores ONLY the command name, never raw
         arguments, so the overflow file cannot accumulate secrets."""
-        import json as _json
         path = self.path.with_suffix(".overflow.json")
-        try:
-            rows = _json.loads(path.read_text())
-        except (FileNotFoundError, ValueError):
-            rows = []
         command = (text.lstrip("/").split() or [""])[0][:32]
-        rows.append({"update_id": int(update_id), "user_id": int(user_id),
-                     "command": command})
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            _json.dump(rows[-100:], fh)
+
+        def apply(rows):
+            rows.append({"update_id": int(update_id),
+                         "user_id": int(user_id), "command": command})
+            return rows[-100:], None
+
+        locked_update(path, [], apply)
 
     def remove(self, update_id: int) -> None:
-        with self._lock:
-            self._write([e for e in self._read()
-                         if e.get("update_id") != update_id])
+        def apply(entries):
+            return ([e for e in entries
+                     if e.get("update_id") != update_id], None)
+        locked_update(self.path, [], apply)
 
     def set_attempts(self, update_id: int, attempts: int) -> None:
-        with self._lock:
-            entries = self._read()
+        def apply(entries):
             for e in entries:
                 if e.get("update_id") == update_id:
                     e["attempts"] = int(attempts)
-            self._write(entries)
+            return entries, None
+        locked_update(self.path, [], apply)
 
     def pending(self) -> list[dict]:
         with self._lock:

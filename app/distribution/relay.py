@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from ..core.logging import get_logger
+from ..core.state import locked_read, locked_update, locked_write
 
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 _CANONICAL_KEYLESS = re.compile(r"^rtmps?://[^/?#@\s]+/?$", re.IGNORECASE)
@@ -157,22 +158,18 @@ class DestinationStore:
         self.path = Path(path)
 
     def _read(self) -> list[dict]:
-        try:
-            return json.loads(self.path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            return []
+        return locked_read(self.path, [])
 
     def _write(self, rows: list[dict]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(rows, fh)
+        locked_write(self.path, rows)
 
     def add(self, chat_id: int, label: str) -> None:
-        rows = [r for r in self._read() if r["chat_id"] != chat_id]
-        rows.append({"chat_id": int(chat_id), "label": label,
-                     "added_at": time.time()})
-        self._write(rows)
+        def apply(rows):
+            kept = [r for r in rows if r["chat_id"] != chat_id]
+            kept.append({"chat_id": int(chat_id), "label": label,
+                         "added_at": time.time()})
+            return kept, None
+        locked_update(self.path, [], apply)
 
     def remove(self, chat_id: int) -> bool:
         rows = self._read()
@@ -252,12 +249,9 @@ class RestreamManager:
         return records
 
     def _save(self, records: list[dict]) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.state_file,
-                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            for rec in records:
-                fh.write(json.dumps(rec) + "\n")
+        from ..core.state import locked_update_text
+        text = "".join(json.dumps(rec) + "\n" for rec in records)
+        locked_update_text(self.state_file, "", lambda _old: (text, None))
 
     def active(self) -> list[int]:
         alive = [rec for rec in self._records() if self._alive(rec["pid"])]

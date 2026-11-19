@@ -10,9 +10,10 @@ and recalls; it does not claim understanding.
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
+
+from ..core.state import locked_read, locked_update, locked_write
 
 KINDS = ("username", "channel", "preference", "clip", "pattern",
          "publishing_rule")
@@ -23,16 +24,10 @@ class Memory:
         self.path = Path(path)
 
     def _read(self) -> list[dict]:
-        try:
-            return json.loads(self.path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
-            return []
+        return locked_read(self.path, [])
 
     def _write(self, rows: list[dict]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump(rows, fh)
+        locked_write(self.path, rows)
 
     def remember(self, kind: str, key: str, value: str, source: str,
                  confidence: str = "stated") -> dict:
@@ -43,14 +38,16 @@ class Memory:
             raise ValueError(f"unknown memory kind {kind!r}")
         if confidence not in ("stated", "observed", "inferred"):
             raise ValueError(f"unknown confidence {confidence!r}")
-        rows = [r for r in self._read()
-                if not (r["kind"] == kind and r["key"] == key)]
         entry = {"kind": kind, "key": key, "value": value,
                  "source": source, "confidence": confidence,
                  "updated_at": time.time()}
-        rows.append(entry)
-        self._write(rows)
-        return entry
+
+        def apply(rows):
+            kept = [r for r in rows
+                    if not (r["kind"] == kind and r["key"] == key)]
+            return kept + [entry], entry
+
+        return locked_update(self.path, [], apply)
 
     def recall(self, kind: str | None = None, key_contains: str = ""
                ) -> list[dict]:
@@ -69,8 +66,8 @@ class Memory:
         return None
 
     def forget(self, kind: str, key: str) -> bool:
-        rows = self._read()
-        kept = [r for r in rows
-                if not (r["kind"] == kind and r["key"] == key)]
-        self._write(kept)
-        return len(kept) != len(rows)
+        def apply(rows):
+            kept = [r for r in rows
+                    if not (r["kind"] == kind and r["key"] == key)]
+            return kept, len(kept) != len(rows)
+        return locked_update(self.path, [], apply)
