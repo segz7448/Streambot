@@ -47,5 +47,6 @@ class RecordingWorker:
                 await asyncio.sleep(self.sweep_seconds)
         finally:
             await self.runner.stop_session(self.session_name)
+            self.buffer.enforce_storage_cap()
             self.buffer.reconcile(self.db_path)
             log.info("recording stopped session=%s", self.session_name)

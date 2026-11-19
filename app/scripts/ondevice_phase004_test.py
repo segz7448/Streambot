@@ -45,7 +45,7 @@ async def main():
     def looping_args(input_url):
         args = orig_segment_args(input_url)
         i = args.index("-i")
-        return args[:i] + ["-stream_loop", "-1"] + args[i:]
+        return args[:i] + ["-stream_loop", "-1", "-re"] + args[i:]
     buf.segment_args = looping_args
     worker = RecordingWorker(runner, buf, SRC, db, sweep_seconds=3)
     registry = HealthRegistry()
@@ -54,7 +54,7 @@ async def main():
 
     os.environ["LD_LIBRARY_PATH"] = f"{PREFIX}/lib"
     task = asyncio.create_task(sup.run())
-    await asyncio.sleep(35)  # record ~7 segments
+    await asyncio.sleep(40)  # record ~8 realtime segments
     mid = buf.segments()
     window = buf.event_window(time.time() - 10)
     expected_min = 4
@@ -72,6 +72,8 @@ async def main():
         "reconcile_first_pass": rec1,
         "reconcile_second_pass": rec2,
         "captured_multiple": len(mid) >= expected_min,
+        "cap_enforced_bytes": sum(s.path.stat().st_size for s in end)
+            <= buf.max_storage_bytes + 2 * 2_000_000,
         "clean_stop": not any(p.running for p in runner.processes.values()),
     }
     print("EVIDENCE " + json.dumps(evidence))

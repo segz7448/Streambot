@@ -69,15 +69,20 @@ class RollingBuffer:
         end = event_time + self.post_event_segments * self.segment_seconds
         return [s.path for s in segs if start <= s.created_at <= end]
 
-    def enforce_storage_cap(self, keep_after: float | None = None) -> int:
-        """Delete oldest segments until under the cap. Segments inside the
+    def enforce_storage_cap(self, keep_after: float | None = None,
+                            protect_newest: int = 2) -> int:
+        """Delete oldest segments until under the cap. The newest segments
+        (one may be actively written by ffmpeg) and segments inside the
         retention window of an event (keep_after) are preserved."""
         segs = self.segments()
         total = sum(s.path.stat().st_size for s in segs)
         removed = 0
+        protected = {s.sequence for s in segs[-protect_newest:]} if segs else set()
         for seg in segs:
             if total <= self.max_storage_bytes:
                 break
+            if seg.sequence in protected:
+                continue
             if keep_after is not None and seg.created_at >= keep_after:
                 continue
             try:
