@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import textwrap
 import unittest
 
@@ -112,3 +113,76 @@ class JournalIntegrityTests(unittest.TestCase):
         subprocess.run([sys.executable, "-c", code], cwd=os.getcwd(),
                        capture_output=True)
         self.assertEqual((d / ops.JOURNAL).read_text(), before)
+
+
+class JournalPolicyTests(unittest.TestCase):
+
+    def test_typed_keys_and_legacy_migration(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+        (d / ops.JOURNAL).write_text(
+            json.dumps({"42": {"command": "ingest", "result": "ok"}}))
+        ops.journal_record(d, 43, "clipnow", "done")
+        data = json.loads((d / ops.JOURNAL).read_text())
+        self.assertIn("tg:42", data)
+        self.assertIn("tg:43", data)
+        self.assertNotIn("42", data)
+        self.assertEqual(ops.journal_result(d, 42, "ingest"), "ok")
+        self.assertEqual(ops.journal_result(d, 43, "clipnow"), "done")
+
+    def test_uncertain_never_evicted_at_cap(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+        ops.journal_mark_uncertain(d, 1, "deliveries", "send ambiguous")
+        for i in range(ops.JOURNAL_CAP + 20):
+            ops.journal_record(d, 100 + i, "ingest", "ok")
+        data = json.loads((d / ops.JOURNAL).read_text())
+        uncertain = [k for k, v in data.items()
+                     if v.get("status") == "uncertain"]
+        self.assertEqual(uncertain, ["tg:1"])
+        resolved = [k for k in data if data[k].get("status") != "uncertain"]
+        self.assertLessEqual(len(resolved), ops.JOURNAL_CAP)
+
+    def test_age_eviction_removes_old_resolved_only(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+        old = time.time() - ops.JOURNAL_MAX_AGE_S - 60
+        (d / ops.JOURNAL).write_text(json.dumps({
+            "tg:1": {"command": "ingest", "result": "ok", "ts": old},
+            "tg:2": {"command": "deliveries", "status": "uncertain",
+                     "text": "x", "ts": old}}))
+        ops.journal_record(d, 3, "ingest", "ok")
+        data = json.loads((d / ops.JOURNAL).read_text())
+        self.assertNotIn("tg:1", data)
+        self.assertIn("tg:2", data)
+        self.assertIn("tg:3", data)
+
+
+class OrphanTempTests(unittest.TestCase):
+
+    def test_dead_writer_tmp_removed_live_kept(self):
+        from app.core.state import locked_update
+        d = pathlib.Path(tempfile.mkdtemp())
+        path = d / "state.json"
+        path.write_text("{}")
+        # spawn and reap so the pid is certainly dead
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        orphan = d / f"state.json.tmp.{p.pid}.123"
+        orphan.write_text("partial")
+        live = d / f"state.json.tmp.{os.getpid()}.456"
+        live.write_text("in flight")
+        locked_update(path, {}, lambda data: ({"a": 1}, None))
+        self.assertFalse(orphan.exists())
+        self.assertTrue(live.exists())
+
+    def test_corrupt_file_preserved_and_logged(self):
+        from app.core import state as st
+        d = pathlib.Path(tempfile.mkdtemp())
+        path = d / "bad.json"
+        path.write_text("{not json")
+        with self.assertLogs("core.state", level="ERROR") as cm:
+            with self.assertRaises(st.StateCorruptError):
+                st.locked_read(path, {})
+        self.assertEqual(path.read_text(), "{not json")
+        self.assertIn("operator reconciliation required", cm.output[0])

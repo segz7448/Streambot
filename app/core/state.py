@@ -19,9 +19,13 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
+import re
 import threading
 from pathlib import Path
+
+_log = logging.getLogger("core.state")
 
 
 class StateCorruptError(Exception):
@@ -46,6 +50,13 @@ def _read_unlocked(path: Path, default):
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
+        # Fail closed and PRESERVE the corrupt file: it may hold the
+        # admin pairing, the inbox backlog or the delivery journal.
+        # The operator must reconcile it by hand; we never reset it.
+        _log.error(
+            "STATE CORRUPT, failing closed: %s (%s). The file is "
+            "preserved untouched; operator reconciliation required.",
+            path, exc)
         raise StateCorruptError(f"{path}: corrupt JSON state: {exc}")
 
 
@@ -60,6 +71,37 @@ def locked_read(path, default):
             os.close(fd)
 
 
+_TMP_RE = re.compile(r"^(?P<name>.+)\.tmp\.(?P<pid>\d+)\.(?P<tid>\d+)$")
+
+
+def _cleanup_orphan_tmps(path: Path) -> None:
+    """Remove temp files left by OUR OWN crashed writes of THIS path
+    only: siblings named "<path.name>.tmp.<pid>.<tid>" whose pid is
+    dead. Never touches any other file, never blocks the update."""
+    try:
+        for sibling in path.parent.iterdir():
+            m = _TMP_RE.match(sibling.name)
+            if not m or m.group("name") != path.name:
+                continue
+            pid = int(m.group("pid"))
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, 0)
+                continue  # writer still alive - not an orphan
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue  # cannot tell - leave it alone
+            try:
+                sibling.unlink()
+                _log.info("removed orphan temp state file %s", sibling)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def locked_update(path, default, fn):
     """Atomic read-modify-write: fn(data) -> (new_data, result)."""
     path = Path(path)
@@ -68,6 +110,7 @@ def locked_update(path, default, fn):
         fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            _cleanup_orphan_tmps(path)
             data = _read_unlocked(path, default)
             new_data, result = fn(data)
             tmp = path.parent / (
@@ -103,6 +146,7 @@ def locked_update_text(path, default: str, fn):
         fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            _cleanup_orphan_tmps(path)
             try:
                 data = path.read_text()
             except FileNotFoundError:

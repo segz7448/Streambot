@@ -136,6 +136,43 @@ def _journal_read(state_dir: Path) -> dict:
 SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries")
 
 
+JOURNAL_MAX_AGE_S = 7 * 86400
+JOURNAL_CAP = 500
+
+
+def _jkey(update_id: int) -> str:
+    """Typed journal key. Telegram update ids are one operation
+    namespace; future transports get their own prefix instead of
+    sharing a bare numeric id space."""
+    return f"tg:{int(update_id)}"
+
+
+def _journal_migrate(data: dict, now: float) -> dict:
+    """Convert legacy bare-numeric keys to typed keys in place."""
+    for k in [k for k in data if not k.startswith("tg:")]:
+        if k.isdigit():
+            entry = data.pop(k)
+            entry.setdefault("ts", now)
+            data[f"tg:{k}"] = entry
+    return data
+
+
+def _journal_trim(data: dict, now: float) -> None:
+    """Evict by AGE, not id magnitude. Unresolved records (status
+    uncertain, i.e. a send whose external effect may have happened)
+    are never evicted - they exist for reconciliation."""
+    resolved = [k for k, v in data.items()
+                if v.get("status") != "uncertain"]
+    for k in resolved:
+        if now - data[k].get("ts", now) > JOURNAL_MAX_AGE_S:
+            del data[k]
+    resolved = [k for k in data if data[k].get("status") != "uncertain"]
+    if len(resolved) > JOURNAL_CAP:
+        resolved.sort(key=lambda k: data[k].get("ts", 0))
+        for k in resolved[: len(resolved) - JOURNAL_CAP]:
+            del data[k]
+
+
 def journal_result(state_dir: Path, update_id: int, command: str):
     """Stored result of an already-executed side-effecting command, or
     None. Gives replayed commands operation-level idempotency: a drain
@@ -143,7 +180,9 @@ def journal_result(state_dir: Path, update_id: int, command: str):
     effect (a second Twitch clip, a second restream)."""
     if not update_id:
         return None
-    entry = _journal_read(state_dir).get(str(update_id))
+    data = _journal_read(state_dir)
+    entry = (data.get(_jkey(update_id))
+             or data.get(str(update_id)))  # legacy key fallback
     if entry and entry.get("command") == command:
         return entry.get("result")
     return None
@@ -156,15 +195,20 @@ def journal_mark_uncertain(state_dir: Path, update_id: int,
     success-before-journal-commit ambiguity). Blind retry can duplicate
     the effect, so the operation is preserved for reconciliation and
     reported, not re-executed."""
-    import json
-    import os as _os
     if not update_id:
         return
+
     def apply(data):
-        data[str(update_id)] = {"command": command, "status": "uncertain",
-                                "text": text}
+        import time as _t
+        now = _t.time()
+        _journal_migrate(data, now)
+        data[_jkey(update_id)] = {"command": command,
+                                  "status": "uncertain",
+                                  "text": text, "ts": now}
         return data, None
+
     locked_update(state_dir / JOURNAL, {}, apply)
+
 
 
 def inbox_quarantine(state_dir: Path, update_id: int, text: str) -> None:
@@ -182,9 +226,14 @@ def inbox_quarantine(state_dir: Path, update_id: int, text: str) -> None:
 
 
 def journal_uncertain(state_dir: Path) -> list[dict]:
-    return [{"update_id": int(k), **v} for k, v in
-            _journal_read(state_dir).items()
-            if v.get("status") == "uncertain"]
+    out = []
+    for k, v in _journal_read(state_dir).items():
+        if v.get("status") != "uncertain":
+            continue
+        raw = k[3:] if k.startswith("tg:") else k
+        if raw.isdigit():
+            out.append({"update_id": int(raw), **v})
+    return out
 
 
 def journal_record(state_dir: Path, update_id: int, command: str,
@@ -193,9 +242,12 @@ def journal_record(state_dir: Path, update_id: int, command: str,
         return
 
     def apply(data):
-        data[str(update_id)] = {"command": command, "result": result}
-        while len(data) > 200:
-            data.pop(min(data, key=lambda k: int(k)))
+        import time as _t
+        now = _t.time()
+        _journal_migrate(data, now)
+        data[_jkey(update_id)] = {"command": command, "result": result,
+                                  "ts": now}
+        _journal_trim(data, now)
         return data, None
 
     locked_update(state_dir / JOURNAL, {}, apply)
