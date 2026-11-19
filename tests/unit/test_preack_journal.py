@@ -58,6 +58,7 @@ class JournalTests(unittest.TestCase):
         self.assertIsNone(ops.journal_result(self.dir, 0, "clipnow"))
 
     def test_relay_replay_returns_recorded_result(self):
+        (self.dir / "relay_enabled").write_text("1")
         from app.distribution import relay as relay_mod
         orig = ops.Relayer.restream
         ops.Relayer.restream = lambda self, f, d, ffmpeg_bin="ffmpeg": [

@@ -9,6 +9,7 @@ from app.bot import ops
 class OpsTests(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp())
+        (self.state / "relay_enabled").write_text("1")  # gate: reviewed
 
     def test_clipnow_unconfigured_fails_loudly(self):
         reply = ops.clipnow_reply(self.state, "somechannel")

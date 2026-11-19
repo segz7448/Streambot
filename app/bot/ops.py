@@ -36,6 +36,9 @@ def relay_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
     cached = journal_result(state_dir, update_id, "relay")
     if cached is not None:
         return "Already processed (replay guard): " + cached
+    if not (state_dir / "relay_enabled").exists():
+        return ("Restream is disabled pending security review of the "
+                "destination filter. No processes were started.")
     parts = args.split()
     if len(parts) < 3 or parts[0] != "start":
         return USAGE_RELAY
@@ -84,10 +87,14 @@ def make_pre_ack_wrapper(inbox, watermark, orig_put, admin_id_fn):
     persisted either."""
     async def put(update):
         try:
-            text = (update.message.text
-                    if getattr(update, "message", None) else "") or ""
-            if text.startswith("/"):
-                command = text[1:].split()[0].lower().lstrip("/")
+            message = getattr(update, "message", None)
+            text = (message.text if message else "") or ""
+            is_media = bool(message is not None and (
+                getattr(message, "video", None)
+                or getattr(message, "document", None)))
+            if text.startswith("/") or is_media:
+                command = (text[1:].split()[0].lower().lstrip("/")
+                           if text.startswith("/") else "ingest")
                 user = getattr(update, "effective_user", None)
                 sender = int(user.id) if user else 0
                 admin = admin_id_fn()
@@ -95,7 +102,9 @@ def make_pre_ack_wrapper(inbox, watermark, orig_put, admin_id_fn):
                         and sender == admin):
                     uid = int(update.update_id)
                     if not watermark.already_handled(uid):
-                        inbox.add(uid, sender, text)
+                        inbox.add(uid, sender,
+                                  text if text.startswith("/")
+                                  else "/ingest")
         except Exception:
             import logging
             logging.getLogger("bot.ops").exception(
@@ -115,7 +124,7 @@ def _journal_read(state_dir: Path) -> dict:
         return {}
 
 
-SIDE_EFFECTING = ("clipnow", "relay")
+SIDE_EFFECTING = ("clipnow", "relay", "ingest")
 
 
 def journal_result(state_dir: Path, update_id: int, command: str):
@@ -149,6 +158,24 @@ def journal_mark_uncertain(state_dir: Path, update_id: int,
     fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
     with _os.fdopen(fd, "w") as fh:
         json.dump(data, fh)
+
+
+def inbox_quarantine(state_dir: Path, update_id: int, text: str) -> None:
+    """Preserve a repeatedly failing command for operator
+    reconciliation. Command NAME only, 0600, bounded - same discipline
+    as the overflow file."""
+    import json as _json
+    import os as _os
+    path = state_dir / "quarantine.json"
+    try:
+        rows = _json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        rows = []
+    command = (text.lstrip("/").split() or [""])[0][:32]
+    rows.append({"update_id": int(update_id), "command": command})
+    fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    with _os.fdopen(fd, "w") as fh:
+        _json.dump(rows[-100:], fh)
 
 
 def journal_uncertain(state_dir: Path) -> list[dict]:
@@ -204,6 +231,25 @@ def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
             dropped += 1
             continue
         command = (entry["text"].lstrip("/").split() or [""])[0].lower()
+        if command == "ingest":
+            # media uploads cannot be re-driven from the drain (the
+            # Telegram download needs the live update): a journaled
+            # result means the pipeline completed - drop; otherwise
+            # preserve for reconciliation and ask the admin to re-send
+            if journal_result(state_dir, uid, "ingest") is not None:
+                inbox.remove(uid)
+                watermark.mark_handled(uid)
+                dropped += 1
+            else:
+                journal_mark_uncertain(state_dir, uid, "ingest",
+                                       entry["text"])
+                watermark.mark_handled(uid)
+                inbox.remove(uid)
+                reply(admin_id,
+                      "Your video upload was interrupted by a restart "
+                      "and was NOT processed. Please re-send the video.")
+                uncertain += 1
+            continue
         if (command in SIDE_EFFECTING
                 and journal_result(state_dir, uid, command) is None):
             # crash window: the side effect may already have executed
@@ -232,11 +278,64 @@ def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
         except Exception:
             log.exception("inbox drain failed for update %s", uid)
             failed += 1
+            attempts = int(entry.get("attempts", 0)) + 1
+            if attempts >= 3:
+                # quarantine: a repeatedly failing entry must not stall
+                # the inbox forever; preserve it for reconciliation
+                log.error("quarantining update %s after %d attempts",
+                          uid, attempts)
+                inbox.remove(uid)
+                watermark.mark_handled(uid)
+                inbox_quarantine(state_dir, uid, entry["text"])
+            else:
+                inbox.set_attempts(uid, attempts)
     if replayed or dropped or failed or uncertain:
         log.info("inbox drain: %d replayed, %d already-handled, %d failed,"
                  " %d uncertain", replayed, dropped, failed, uncertain)
     return {"replayed": replayed, "dropped": dropped, "failed": failed,
             "uncertain": uncertain}
+
+
+def deliveries_reply(state_dir: Path, args: str,
+                     deliver_fn=None) -> str:
+    """List HELD clips; '/deliveries flush' sends them to the admin on
+    explicit request. Mode C never delivers media by itself."""
+    import os as _os
+    import time as _time
+    from ..core.database import connect
+    conn = connect(str(state_dir / "nova.db"))
+    rows = conn.execute(
+        "SELECT id, file_path, duration_seconds FROM clips"
+        " WHERE status='HELD' ORDER BY id").fetchall()
+    if args.strip() != "flush":
+        conn.close()
+        if not rows:
+            return "No held clips. Send a video to make one."
+        lines = [f"#{r[0]} ({r[2]:.0f}s)" for r in rows]
+        return ("Held clips: " + ", ".join(lines) +
+                ". /deliveries flush sends them to you.")
+    if not rows:
+        conn.close()
+        return "Nothing held."
+    if deliver_fn is None:
+        from ..distribution.telegram_delivery import deliver_clip_sync
+        token_path = _os.environ["NOVA_TOKEN_FILE"]
+        deliver_fn = lambda path, caption: deliver_clip_sync(
+            token_path, str(state_dir), path, caption)
+    sent = failed = 0
+    for cid, path, dur in rows:
+        try:
+            deliver_fn(path, f"NOVA clip #{cid} ({dur:.0f}s)")
+            conn.execute(
+                "UPDATE clips SET status='DELIVERED', delivered_at=?"
+                " WHERE id=?", (_time.time(), cid))
+            sent += 1
+        except Exception:
+            failed += 1
+    conn.commit()
+    conn.close()
+    return (f"Delivered {sent} clip(s)"
+            + (f"; {failed} failed and stay held." if failed else "."))
 
 
 def clipnow_reply(state_dir: Path, channel: str, update_id: int = 0) -> str:

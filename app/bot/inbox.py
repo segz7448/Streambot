@@ -87,6 +87,14 @@ class PreAckInbox:
             self._write([e for e in self._read()
                          if e.get("update_id") != update_id])
 
+    def set_attempts(self, update_id: int, attempts: int) -> None:
+        with self._lock:
+            entries = self._read()
+            for e in entries:
+                if e.get("update_id") == update_id:
+                    e["attempts"] = int(attempts)
+            self._write(entries)
+
     def pending(self) -> list[dict]:
         with self._lock:
             return self._read()

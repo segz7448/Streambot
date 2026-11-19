@@ -20,29 +20,25 @@ log = get_logger("distribution.relay")
 
 
 def secret_in_rtmp_url(url: str) -> bool:
-    """True when a destination URL could carry a credential anywhere -
-    userinfo, path, query or fragment - or uses anything but a plain
-    keyless rtmp(s) endpoint. Stream keys must not enter process
-    arguments on a shared host. Fail closed: unparseable URLs and
-    non-rtmp schemes (srt, rtmpe, ...) count as secret-bearing so the
-    /relay boundary refuses them."""
+    """True when a destination is anything but a canonical keyless
+    rtmp(s) endpoint or a plain local file path. Stream keys must not
+    enter process arguments on a shared host. Fail closed: userinfo,
+    non-trivial path, query or fragment refuse; every scheme-like
+    prefix other than rtmp(s) refuses (srt, pipe, tcp, udp, concat and
+    friends are ffmpeg protocols, not files), including slash-less and
+    single-slash forms (rtmp:host, rtmp:/host) which ffmpeg parses as
+    network protocols even though they lack '//'; unparseable input
+    refuses. Local paths carry no credential channel and return False -
+    confining them to the state dir is the caller's job (relay_reply)."""
+    import re
     stripped = url.strip()
-    if "://" not in stripped:
-        return False  # local file output: no credential channel
-    from urllib.parse import urlparse
-    try:
-        parsed = urlparse(stripped.lower())
-    except ValueError:
+    if re.match(r"^rtmps?://[^/?#@\s]+/?$", stripped, re.IGNORECASE):
+        return False  # canonical keyless endpoint: scheme://host[/]
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*:", stripped):
+        return True  # any other scheme-like prefix, any form
+    if "://" in stripped or "@" in stripped:
         return True
-    if parsed.scheme not in ("rtmp", "rtmps"):
-        return True
-    if not parsed.hostname:
-        return True
-    if parsed.username or parsed.password:
-        return True
-    if parsed.query or parsed.fragment:
-        return True
-    return bool(parsed.path.strip("/"))
+    return False  # local file output
 
 
 class DestinationStore:

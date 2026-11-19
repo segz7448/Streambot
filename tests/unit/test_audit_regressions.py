@@ -101,7 +101,10 @@ class SecretDetectionTests(unittest.TestCase):
         for u in ["rtmp://user:pw@h/", "RTMP://h/live/KEY",
                   "srt://h:1?passphrase=x", "rtmp://h/live/KEY",
                   "rtmp://h/?streamkey=abc", "rtmps://h:443/app/key",
-                  "rtmp://h/app#frag", "not a url at all://x"]:
+                  "rtmp://h/app#frag", "not a url at all://x",
+                  "rtmp:host/live/key", "rtmp:/h/key", "rtmps:h",
+                  "pipe:1", "tcp://h:1", "udp://h:1",
+                  "concat:/a|/b", "subfile:,,start,0,:x"]:
             self.assertTrue(secret_in_rtmp_url(u), u)
 
     def test_keyless_destinations_still_accepted(self):

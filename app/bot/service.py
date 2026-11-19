@@ -227,7 +227,17 @@ class BotService:
             return  # fail closed: no reply, no oracle
         try:
             self.router.admin_ids = {admin}
-            self.inbox.add(update.update_id, user.id, message.text or "")
+            if not self.inbox.add(update.update_id, user.id,
+                                  message.text or ""):
+                # inbox full: fail CLOSED - never execute an unpersisted
+                # command. The refusal is recorded in the overflow file
+                # for reconciliation; the admin is told it did not run.
+                self.watermark.mark_handled(update.update_id)
+                await message.reply_text(
+                    "The command inbox is full, so your command was NOT "
+                    "executed (it was recorded for reconciliation). "
+                    "Please try again later.")
+                return
             reply = self.router.dispatch(message.text or "", user_id=user.id,
                                      update_id=update.update_id)
             if reply:
