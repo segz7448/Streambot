@@ -97,3 +97,25 @@ class DetectorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SceneChangeParserTests(unittest.TestCase):
+    def test_parse_metadata_output(self):
+        from app.detection import visual
+        stderr_sample = (
+            "[Parsed_metadata_1 @ 0x0] frame:0   pts:0       pts_time:0\n"
+            "[Parsed_metadata_1 @ 0x0] lavfi.scene_score=0.000000\n"
+            "[Parsed_metadata_1 @ 0x0] frame:25  pts:25000   pts_time:1.0\n"
+            "[Parsed_metadata_1 @ 0x0] lavfi.scene_score=0.521865\n")
+        import re
+        last_t = None
+        out = []
+        for line in stderr_sample.splitlines():
+            f = visual._FRAME.search(line)
+            if f:
+                last_t = float(f.group(1))
+                continue
+            s = visual._SCORE.search(line)
+            if s and last_t is not None and float(s.group(1)) >= 0.4:
+                out.append((last_t, float(s.group(1))))
+        self.assertEqual(out, [(1.0, 0.521865)])
