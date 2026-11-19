@@ -43,21 +43,36 @@ class RollingBuffer:
     def dir(self) -> Path:
         return self.root / f"session-{self.session_id}"
 
-    def segment_args(self, input_url: str) -> list[str]:
+    def next_seq(self) -> int:
+        """Next segment sequence number. A restarted ffmpeg must not
+        restart at seg-000000 and overwrite or rewind content time:
+        numbering continues after the newest on-disk segment."""
+        seqs = [int(p.stem.split("-")[1])
+                for p in self.dir.glob("seg-*.ts")]
+        return max(seqs) + 1 if seqs else 0
+
+    def segment_args(self, input_url: str,
+                     start_number: int = 0) -> list[str]:
         """FFmpeg args producing numbered segments for this session.
         Protocol access is whitelisted per feed kind: a local recording
         may open files only; a registered http(s) feed may speak only
         the protocols that carry it (redirects to file:// or other
-        schemes are refused by ffmpeg)."""
+        schemes are refused by ffmpeg). start_number continues segment
+        numbering after a reconnect so sequence-derived content time
+        stays monotonic."""
         pattern = str(self.dir / "seg-%06d.ts")
         whitelist = ("http,https,tcp,tls"
                      if input_url.startswith(("http://", "https://"))
                      else "file")
-        return ["-hide_banner", "-loglevel", "warning",
+        args = ["-hide_banner", "-loglevel", "warning",
                 "-protocol_whitelist", whitelist,
                 "-i", input_url, "-c", "copy",
-                "-f", "segment", "-segment_time", str(self.segment_seconds),
-                "-reset_timestamps", "1", pattern]
+                "-f", "segment", "-segment_time",
+                str(self.segment_seconds),
+                "-reset_timestamps", "1"]
+        if start_number:
+            args += ["-start_number", str(start_number)]
+        return args + [pattern]
 
     def segments(self) -> list[Segment]:
         paths = sorted(self.dir.glob("seg-*.ts"))
