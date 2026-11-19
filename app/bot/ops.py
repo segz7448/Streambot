@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..distribution.relay import DestinationStore
+from ..distribution.relay import DestinationStore, Relayer, RestreamManager
 from ..ingestion.twitch_clips import ClipFailed, TwitchClipsClient
 
 UNCONFIGURED_CLIP = (
@@ -18,6 +18,35 @@ UNCONFIGURED_CLIP = (
 
 USAGE_DESTINATIONS = ("Usage: /destinations "
                       "[add <chat_id> <label> | remove <chat_id>]")
+
+USAGE_RELAY = ("Usage: /relay start <feed_url> <rtmp_dest> [rtmp_dest...] - "
+               "feed must be one you own or are authorized to restream")
+
+
+def relay_reply(state_dir: Path, args: str) -> str:
+    """Start an RTMP restream of an explicitly owner-provided feed.
+    Refuses without both a feed and at least one destination."""
+    parts = args.split()
+    if len(parts) < 3 or parts[0] != "start":
+        return USAGE_RELAY
+    feed, dests = parts[1], parts[2:]
+    relayer = Relayer(DestinationStore(str(state_dir / "destinations.json")),
+                      lambda c, p, t: 0)
+    cmds = relayer.restream(feed, dests,
+                            ffmpeg_bin=str(
+                                Path.home() / "instinct-clip/prefix/bin/ffmpeg"))
+    manager = RestreamManager(str(state_dir / "restream.pids"))
+    if manager.active():
+        return "A restream is already running. Use /stoprelay first."
+    pids = manager.start(cmds)
+    return f"Restreaming your feed to {len(pids)} destination(s). /stoprelay stops it."
+
+
+def stoprelay_reply(state_dir: Path) -> str:
+    stopped = RestreamManager(str(state_dir / "restream.pids")).stop()
+    if stopped:
+        return f"Restream stopped ({stopped} process(es))."
+    return "No restream is running."
 
 
 def clipnow_reply(state_dir: Path, channel: str) -> str:

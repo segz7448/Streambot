@@ -43,6 +43,34 @@ class OpsTests(unittest.TestCase):
         self.assertTrue(ops.destinations_reply(self.state, "bogus")
                         .startswith("Usage:"))
 
+    def test_relay_usage_and_stop_idle(self):
+        self.assertTrue(ops.relay_reply(self.state, "").startswith("Usage:"))
+        self.assertTrue(ops.relay_reply(self.state, "start http://feed")
+                        .startswith("Usage:"))
+        self.assertIn("No restream", ops.stoprelay_reply(self.state))
+
+    def test_relay_start_and_stop_real_process(self):
+        # uses sleep as a stand-in for ffmpeg: real subprocess lifecycle
+        from unittest import mock as m
+        from app.distribution import relay as relay_mod
+        orig = ops.Relayer.restream
+        ops.Relayer.restream = lambda self, f, d, ffmpeg_bin="ffmpeg": [
+            ["sleep", "30"] for _ in d]
+        try:
+            reply = ops.relay_reply(self.state,
+                                    "start http://feed rtmp://a rtmp://b")
+            self.assertIn("2 destination", reply)
+            from app.distribution.relay import RestreamManager
+            mgr = RestreamManager(str(self.state / "restream.pids"))
+            self.assertEqual(len(mgr.active()), 2)
+            self.assertIn("already running",
+                          ops.relay_reply(self.state,
+                                          "start http://feed rtmp://a"))
+            self.assertIn("stopped", ops.stoprelay_reply(self.state))
+            self.assertEqual(mgr.active(), [])
+        finally:
+            ops.Relayer.restream = orig
+
 
 if __name__ == "__main__":
     unittest.main()

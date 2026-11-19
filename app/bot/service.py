@@ -57,6 +57,19 @@ class BotService:
         self.router.register("destinations", self._destinations,
                              "list/add/remove clip delivery destinations: "
                              "/destinations [add <chat_id> <label>|remove <chat_id>]")
+        self.router.register("relay", self._relay,
+                             "restream a feed you own to RTMP destinations: "
+                             "/relay start <feed_url> <rtmp_dest>...")
+        self.router.register("stoprelay", self._stoprelay,
+                             "stop the running restream")
+
+    def _relay(self, cmd) -> str:
+        from . import ops
+        return ops.relay_reply(self._state_dir(), cmd.args)
+
+    def _stoprelay(self, cmd) -> str:
+        from . import ops
+        return ops.stoprelay_reply(self._state_dir())
 
     def _state_dir(self) -> Path:
         return Path(os.environ.get("NOVA_STATE_DIR",

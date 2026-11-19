@@ -53,6 +53,63 @@ class DestinationStore:
         return self._read()
 
 
+class RestreamManager:
+    """Owns restream process lifecycle so /stoprelay can stop what
+    /relay started. PIDs are tracked in a 0600 state file so a restart
+    can still find and stop orphan processes."""
+
+    def __init__(self, state_file: str):
+        self.state_file = Path(state_file)
+
+    def _pids(self) -> list[int]:
+        try:
+            return [int(x) for x in self.state_file.read_text().split()]
+        except (FileNotFoundError, ValueError):
+            return []
+
+    def _save(self, pids: list[int]) -> None:
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.state_file,
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(str(p) for p in pids))
+
+    def active(self) -> list[int]:
+        alive = []
+        for pid in self._pids():
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except OSError:
+                pass
+        self._save(alive)
+        return alive
+
+    def start(self, cmds: list[list[str]]) -> list[int]:
+        import subprocess
+        pids = self.active()
+        for cmd in cmds:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pids.append(proc.pid)
+        self._save(pids)
+        log.info("restream started: %d process(es)", len(cmds))
+        return pids
+
+    def stop(self) -> int:
+        import signal
+        stopped = 0
+        for pid in self.active():
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stopped += 1
+            except OSError:
+                pass
+        self._save([])
+        log.info("restream stopped: %d process(es)", stopped)
+        return stopped
+
+
 class Relayer:
     def __init__(self, store: DestinationStore, send_video):
         """send_video(chat_id, path, caption) -> message_id; injected so
