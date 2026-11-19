@@ -5,6 +5,7 @@ explicit /deliveries flush delivers. Real ffmpeg, real detection,
 real editor, real QC - nothing injected except the delivery transport.
 """
 import functools
+import threading
 import shutil
 import sqlite3
 import subprocess
@@ -136,3 +137,58 @@ class ModeACommandPathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SameSourceRestartGuardTests(unittest.TestCase):
+    """A second /startclip on the same source must be refused while the
+    previous session is still finalizing (shared workdir/output
+    collision otherwise)."""
+
+    def test_restart_refused_while_finalizing(self):
+        import tempfile
+        import time as _time
+        from pathlib import Path as P
+        from app.bot import sessions
+        from app.core.database import connect, migrate
+
+        class FakeSession:
+            def __init__(self, *a, **k):
+                self._stopping = threading.Event()
+                self.error = None
+                self.clips_finished = 0
+                self._alive = True
+            def start(self):
+                pass
+            def stop(self):
+                self._stopping.set()
+            def alive(self):
+                return self._alive
+            def join(self, timeout=30.0):
+                pass
+
+        d = P(tempfile.mkdtemp())
+        conn = connect(str(d / "nova.db")); migrate(conn)
+        now = _time.time()
+        conn.execute("INSERT INTO twitch_sources (username, created_at,"
+                     " updated_at) VALUES ('guard', ?, ?)", (now, now))
+        conn.commit(); conn.close()
+        (d / "feeds").mkdir()
+        (d / "feeds" / "guard.mp4").write_bytes(b"x")
+        import unittest.mock as mock
+        with mock.patch("app.clipping.retrospective.validate_recording",
+                        lambda *a, **k: {}):
+            first = sessions.startclip_reply(d, "guard", "ffmpeg",
+                                             "ffprobe",
+                                             session_factory=FakeSession)
+            self.assertIn("started", first.lower(), first)
+            sessions._sessions["guard"].stop()  # stopping but alive
+            second = sessions.startclip_reply(d, "guard", "ffmpeg",
+                                              "ffprobe",
+                                              session_factory=FakeSession)
+            self.assertIn("finalizing", second.lower(), second)
+            sessions._sessions["guard"]._alive = False
+            third = sessions.startclip_reply(d, "guard", "ffmpeg",
+                                             "ffprobe",
+                                             session_factory=FakeSession)
+            self.assertIn("started", third.lower(), third)
+        sessions._sessions.pop("guard", None)

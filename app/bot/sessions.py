@@ -71,8 +71,15 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
                     "Session NOT started.")
     with _lock:
         existing = _sessions.get(username)
-        if existing is not None and not existing._stopping.is_set():
-            return f"A session for {username} is already running."
+        if existing is not None:
+            if not existing._stopping.is_set():
+                return f"A session for {username} is already running."
+            if existing.alive():
+                # still finalizing: the shared workdir and output paths
+                # would collide and clips/handles could be lost
+                return (f"The previous session for {username} is still "
+                        "finalizing its clips. Try again in a moment - "
+                        "nothing was started.")
         session = session_factory(ffmpeg, ffprobe, feed, username,
                                   state_dir)
         session.start()

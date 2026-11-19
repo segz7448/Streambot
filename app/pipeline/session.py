@@ -52,6 +52,9 @@ class ClipSession:
     def stop(self) -> None:
         self._stopping.set()
 
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
     def join(self, timeout: float = 30.0) -> None:
         if self._thread:
             self._thread.join(timeout)
