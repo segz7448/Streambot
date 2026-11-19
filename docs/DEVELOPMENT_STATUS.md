@@ -56,7 +56,7 @@ Caveat: still-frame proof of rendering, not subtitle sync.
 ## Candidate dedupe/merge defect fix + device retest (2026-11-19)
 
 Open product defect from the loopback run (one burst -> 3 overlapping
-clips) fixed across main@d58ae7f + e55203d + 916d43c, then retested
+clips) fixed across main@d58ae7f + e55203d + 916d43c + 1c8903f, then retested
 on-device:
 
 - Episode merging in audio.loudness_spikes: one sustained loud episode
@@ -81,11 +81,13 @@ candidates (A once, B once, 16s apart), episode flag closed, 2 clips
 extracted (CLIPPED x2, no MERGED/EXPIRED), both ffprobe-verified
 h264+AAC with original audio (19.9s / 15.9s).
 
-Explicit remaining limitations (not claimed solved): episode_active
-carries over a reconnect gap and could suppress a genuinely new burst
-right after a restart (needs a recovery reset); the cross-kind merge
-covers only the pending batch, not an event clipped in a prior pass;
-fixture is synthetic tone + static video, not real gameplay.
+Explicit remaining limitations (not claimed solved): the cross-kind
+merge covers only the pending batch, not an event clipped in a prior
+pass; fixture is synthetic tone + static video, not real gameplay.
+The reconnect-gap limitation (carried episode suppressing a genuinely
+new post-restart burst) is closed in 1c8903f: a real wall-time gap
+between segment files resets the episode, detected within a pass and
+across passes via persisted last_seg_mtime.
 
 ## Synthetic loopback reconnect + downstream clip evidence (2026-11-19)
 
