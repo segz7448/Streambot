@@ -171,18 +171,14 @@ def inbox_quarantine(state_dir: Path, update_id: int, text: str) -> None:
     """Preserve a repeatedly failing command for operator
     reconciliation. Command NAME only, 0600, bounded - same discipline
     as the overflow file."""
-    import json as _json
-    import os as _os
-    path = state_dir / "quarantine.json"
-    try:
-        rows = _json.loads(path.read_text())
-    except (FileNotFoundError, ValueError):
-        rows = []
     command = (text.lstrip("/").split() or [""])[0][:32]
-    rows.append({"update_id": int(update_id), "command": command})
-    fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-    with _os.fdopen(fd, "w") as fh:
-        _json.dump(rows[-100:], fh)
+
+    def apply(rows):
+        rows.append({"update_id": int(update_id), "command": command})
+        return rows[-100:], None
+
+    locked_update(state_dir / "quarantine.json", [], apply)
+
 
 
 def journal_uncertain(state_dir: Path) -> list[dict]:
@@ -193,18 +189,17 @@ def journal_uncertain(state_dir: Path) -> list[dict]:
 
 def journal_record(state_dir: Path, update_id: int, command: str,
                    result: str) -> None:
-    import json
-    import os as _os
     if not update_id:
         return
-    data = _journal_read(state_dir)
-    data[str(update_id)] = {"command": command, "result": result}
-    while len(data) > 200:
-        data.pop(min(data, key=lambda k: int(k)))
-    path = state_dir / JOURNAL
-    fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-    with _os.fdopen(fd, "w") as fh:
-        json.dump(data, fh)
+
+    def apply(data):
+        data[str(update_id)] = {"command": command, "result": result}
+        while len(data) > 200:
+            data.pop(min(data, key=lambda k: int(k)))
+        return data, None
+
+    locked_update(state_dir / JOURNAL, {}, apply)
+
 
 
 def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,

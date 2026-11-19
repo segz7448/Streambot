@@ -79,3 +79,36 @@ class StateIntegrityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JournalIntegrityTests(unittest.TestCase):
+
+    def test_journal_120_concurrent_records_not_lost(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+
+        def w(k):
+            for i in range(30):
+                ops.journal_record(d, k * 100 + i + 1, "ingest", "ok")
+
+        ts = [threading.Thread(target=w, args=(k,)) for k in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        data = json.loads((d / ops.JOURNAL).read_text())
+        self.assertEqual(len(data), 120)
+
+    def test_journal_survives_crash_mid_write(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+        ops.journal_record(d, 7, "ingest", "seed")
+        before = (d / ops.JOURNAL).read_text()
+        code = textwrap.dedent(f"""
+            import json, os
+            from app.bot import ops
+            json.dump = lambda r, fh, *a, **k: (fh.write('{{'), fh.flush(),
+                                               os._exit(9))
+            ops.journal_record({str(d)!r} and __import__('pathlib').Path({str(d)!r}), 8, "ingest", "x")
+        """)
+        subprocess.run([sys.executable, "-c", code], cwd=os.getcwd(),
+                       capture_output=True)
+        self.assertEqual((d / ops.JOURNAL).read_text(), before)

@@ -242,16 +242,19 @@ RESTART_REPLY = ("Restart is host-controlled on AGT: workers cannot "
 
 
 def record_error(state_dir: Path, text: str) -> None:
-    """Append one line to the 0600 error ring that /logs reads."""
-    path = state_dir / "errors.log"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a") as fh:
-        fh.write(f"{time.strftime('%m-%d %H:%M:%S')} {text[:300]}\n")
-    # keep the ring small
+    """Append one line to the 0600 error ring that /logs reads.
+    Atomic + locked like every other state file: the append and the
+    ring trim happen inside one locked replace."""
+    from ..core.state import locked_update_text
+    line = f"{time.strftime('%m-%d %H:%M:%S')} {text[:300]}"
+
+    def apply(content):
+        lines = (content.splitlines() + [line])[-200:]
+        return "\n".join(lines) + "\n", None
+
     try:
-        lines = path.read_text().splitlines()[-200:]
-        fd = os.open(path, os.O_WRONLY | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write("\n".join(lines) + "\n")
+        locked_update_text(state_dir / "errors.log", "", apply)
     except OSError:
         pass
+
+
