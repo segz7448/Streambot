@@ -5,7 +5,7 @@ isolated prefix, but its compiled-in fontconfig paths still point at the
 original Termux location. fontconfig then finds no config and no fonts,
 libass falls back to broken metrics (missing spaces, wrong scale), and
 burned subtitles render unreadably. Device-verified failure and fix on
-agt-3f177cf6 (ffmpeg 9.0.2): supplying a minimal fonts.conf that points
+the owner's AGT phone (ffmpeg 9.0.2): supplying a minimal fonts.conf that points
 at the prefix's real font directory restores correct rendering.
 
 ensure_fontconfig_env() writes that minimal config next to a caller-

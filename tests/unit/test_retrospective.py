@@ -105,7 +105,7 @@ class ProcessRecordingTests(unittest.TestCase):
         self.assertEqual(rows[0], 0)
 
     def test_watermark_from_memory_passed_to_editor(self):
-        self.mem.remember("preference", "watermark", "@zenas", "owner",
+        self.mem.remember("preference", "watermark", "@streamer", "owner",
                           confidence="stated")
         seen = {}
 
@@ -114,8 +114,8 @@ class ProcessRecordingTests(unittest.TestCase):
             Path(o).write_bytes(b"y" * 20000)
             return Path(o)
         result = self._run(edit_fn=edit)
-        self.assertEqual(seen["watermark"], "@zenas")
-        self.assertEqual(result["plan"]["watermark"], "@zenas")
+        self.assertEqual(seen["watermark"], "@streamer")
+        self.assertEqual(result["plan"]["watermark"], "@streamer")
 
 
 if __name__ == "__main__":

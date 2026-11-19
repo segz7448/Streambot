@@ -87,7 +87,7 @@ def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
     if subtitle_path or watermark:
         # drawtext and libass both resolve fonts through fontconfig;
         # relocated prefixes ship a fontconfig that points at paths
-        # which no longer exist (device-verified on agt-3f177cf6)
+        # which no longer exist (device-verified on the owner's AGT phone)
         env.update(ensure_fontconfig_env(ffmpeg, runtime_dir))
     proc = subprocess.run(
         edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x,

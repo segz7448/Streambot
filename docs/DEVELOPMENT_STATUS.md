@@ -8,19 +8,19 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 001 | AGT environment audit | COMPLETE (verified live) |
 | 002 | Project foundation | COMPLETE (tests pass locally) |
 | 003 | FFmpeg engine | DEVICE-VERIFIED 2026-11-19 (evidence below); module integration continues |
-| 004 | Media buffer | DEVICE-VERIFIED on agt-3f177cf6 (rolling capture: 8 realtime segments over 40s; storage 4,028,840 B under 4 MiB cap with total recorded content exceeding the cap, proving rotation; 6-segment event window retention; idempotent reconcile; clean supervised stop; harness commit 4496743). Live-source acceptance still pending Phase 006 |
+| 004 | Media buffer | DEVICE-VERIFIED on the owner's AGT phone (rolling capture: 8 realtime segments over 40s; storage 4,028,840 B under 4 MiB cap with total recorded content exceeding the cap, proving rotation; 6-segment event window retention; idempotent reconcile; clean supervised stop; harness commit 4496743). Live-source acceptance still pending Phase 006 |
 | 005 | Twitch discovery | CODE READY (Helix client, tests 22/22); live acceptance needs user-approved Twitch app credentials |
 | 006 | Authorized ingestion | NOT STARTED |
 | 007 | Telegram bot | LIVE but UNPAIRED: deployment nova-clip-bot running since 01:36 PST (PTB 22.8 vendored, sha256-verified wheels; token on-device via age-encrypted transfer, getMe OK both sides; $HOME-path crash loop found and fixed, first crashed deployment removed in owner's view). Pairing challenge expired unpaired 01:53 PST; awaiting owner action. Committed-not-rolled-out pending safe stop/start: log condenser, drop_pending_updates=False + watermark (acknowledged crash-gap limit: confirm-to-handle window open until a persistent pre-ack inbox exists), failed-set refinement + no-evict (overflow alerts, never silent suppression), AutoClipper + providers |
-| 008 | Event detection | DEVICE-VERIFIED heuristics on agt-3f177cf6 (audio spikes at exact loudness transition, scene change t=10.0 score 0.806 with continuous-encode fixture; real-content threshold tuning pending; NOT AI understanding) |
+| 008 | Event detection | DEVICE-VERIFIED heuristics on the owner's AGT phone (audio spikes at exact loudness transition, scene change t=10.0 score 0.806 with continuous-encode fixture; real-content threshold tuning pending; NOT AI understanding) |
 | 009 | AI intelligence | CODE READY: provider interface with $0 heuristic default (never labeled AI) and explicit-config-only OpenAI-compatible adapter that refuses to default anything (a92f1d4); Groq recommended to owner with official-source retention/limits/ZDR facts and explicit signup consent pending. Quota exhaustion queues jobs and reports AI OFFLINE - no silent heuristic substitution |
 | 010 | Automatic clipping | CODE READY + crash-hardened: AutoClipper consumes pending/queued events, scores via configured provider, extracts via real extractor, exactly-once clips rows (unique index + INSERT OR IGNORE; crash-window test proves retry cannot duplicate; 4fae05f). Live-source acceptance still pending Phase 006 |
-| 011 | Video editing | DEVICE-VERIFIED on agt-3f177cf6 for the vertical preset (1080x1920 output probed from 320x240 source, loudnorm applied; subtitle burn pixel-proven 2026-11-19 after font-rendering fix, commit 7a87fe7); square/horizontal share the same graph construction, not separately device-run |
-| 012 | Quality control | DEVICE-VERIFIED on agt-3f177cf6 (media verification passed on real edited output; duplicate detection confirmed both directions: derived file flagged, unrelated file not) |
+| 011 | Video editing | DEVICE-VERIFIED on the owner's AGT phone for the vertical preset (1080x1920 output probed from 320x240 source, loudnorm applied; subtitle burn pixel-proven 2026-11-19 after font-rendering fix, commit 7a87fe7); square/horizontal share the same graph construction, not separately device-run |
+| 012 | Quality control | DEVICE-VERIFIED on the owner's AGT phone (media verification passed on real edited output; duplicate detection confirmed both directions: derived file flagged, unrelated file not) |
 | 013 | Telegram delivery | LIVE-ACCEPTED 2026-11-19: synthetic clip delivered to paired owner (Telegram message_id 15) after upload-timeout hardening (b0b0e96); owner-scoped by construction (paired admin only) |
 | 014 | Live distribution (relay) | NOT STARTED (no code) |
 | 015 | Monitoring & recovery | PARTIAL (supervisor + health + job recovery in foundation; bot recovery rollout live: restart-safe updates + watermark, no-evict failed set, condensed recoverable logs; confirm-to-handle crash gap documented, persistent pre-ack inbox not built) |
-| 016 | Acceptance test | AUTOMATIC FIXTURE CHAIN VERIFIED 2026-11-19 02:43 on agt-3f177cf6: a real detected candidate (audio_spike, confidence 0.855, at the fixture's loud burst) drove extraction with no timestamp injection; record->detect->extract->edit(vertical)->QC->deliver completed in one supervised run (512,722-byte clip, QC pass, Telegram message_id 17 to the paired owner, clean stop). Fixture: h264/aac testsrc2 with a verified silence->burst transition (an earlier mpeg4 fixture exposed a real concat-decode incompatibility, fixed by using a representative h264 source). REAL-SOURCE acceptance still not run: awaits a verified authorized Twitch ingestion route. Fixture evidence never substitutes for it. |
+| 016 | Acceptance test | AUTOMATIC FIXTURE CHAIN VERIFIED 2026-11-19 02:43 on the owner's AGT phone: a real detected candidate (audio_spike, confidence 0.855, at the fixture's loud burst) drove extraction with no timestamp injection; record->detect->extract->edit(vertical)->QC->deliver completed in one supervised run (512,722-byte clip, QC pass, Telegram message_id 17 to the paired owner, clean stop). Fixture: h264/aac testsrc2 with a verified silence->burst transition (an earlier mpeg4 fixture exposed a real concat-decode incompatibility, fixed by using a representative h264 source). REAL-SOURCE acceptance still not run: awaits a verified authorized Twitch ingestion route. Fixture evidence never substitutes for it. |
 | 017 | Documentation & release | README + this file started |
 
 Added scope (owner, 2026-11-18): YouTube publishing module (OAuth 2.0,
@@ -53,9 +53,12 @@ output frame (caption wraps in three readable lines, spaces intact,
 bottom safe area) rendered through the real edit_clip module on-device.
 Caveat: still-frame proof of rendering, not subtitle sync.
 
-## Sustained automatic-pipeline acceptance (2026-11-19)
+## Synthetic loopback reconnect + downstream clip evidence (2026-11-19)
 
-On agt-3f177cf6 against deployment f38f2ecb (= main@f234a81), a 168s
+Scope: a 168s synthetic-feed mechanism test, NOT sustained-service
+acceptance, NOT real gameplay footage, NOT Telegram inbound command
+acceptance, NOT a delivery flush. On the owner's AGT phone against the
+then-current deployment (= main@f234a81), a 168s
 session over a ~64KB/s loopback HTTP feed (90s fixture: testsrc + AAC
 tone with a deliberate loud burst at content t=45-49s), harness driving
 the same startclip/stopclip path as bot commands, loopback admitted by a
@@ -66,6 +69,9 @@ HEAD, still refuses non-public feeds):
   backoff (5s then 10s), second reconnect succeeded after server
   restart. 28 segments seg-000000..seg-000027, contiguous numbering
   across the reconnect (no overwrite, no rewind).
+
+(The original heading overstated this as "sustained acceptance"; it is
+mechanism evidence over a finite synthetic loopback feed only.)
 - Detector resumed past the boundary: 3 audio_spike candidates, all in
   post-reconnect segment 19 (the burst, unserved before the kill), all
   CLIPPED; detection_state last_analyzed_sequence=26, baseline_lufs
@@ -79,16 +85,18 @@ HEAD, still refuses non-public feeds):
 - Known artifacts, labeled: finite-feed re-GET repeats content from t=0
   (documented; live feeds resume at the edge). One 4s burst produced 3
   overlapping clips (spikes at 0.4/2.4/4.5s) — the clipper does not
-  dedupe nearby candidates; queued as an improvement, not a reconnect
-  defect.
+  dedupe nearby candidates. OPEN PRODUCT DEFECT (dedupe/merge of nearby
+  candidates), being fixed with tests; not a reconnect defect.
 
 ## Google OAuth client provisioning (2026-11-19)
 
-User-authorized on identity ayiijumo@gmail.com: GCP project Streambot
-(streambot-515214, no billing, no trial), YouTube Data API v3 enabled,
-consent screen External/Testing (app Streambot, test user
-ayiijumo@gmail.com, scope youtube.upload only), Desktop OAuth client
-"Streambot phone". Client id/secret moved with no plaintext in jobs,
+Authorized by the repository owner via chat approval (2026-11-19) for a
+free YouTube connection on their Google identity (no Gmail access, no
+billing, private uploads only): a dedicated GCP project (no billing, no
+trial), YouTube Data API v3 enabled, consent screen External/Testing
+(app name Streambot, the same identity added as test user, scope
+youtube.upload only), Desktop OAuth client "Streambot phone".
+Client id/secret moved with no plaintext in jobs,
 logs, args, chat or git: in-page WebCrypto hybrid encryption
 (AES-256-GCM, key wrapped RSA-OAEP-256 to an ephemeral sandbox keypair),
 sandbox decrypt, age v1.3.2 to the owner-verified phone key,
@@ -96,8 +104,12 @@ ciphertext-only signed job, on-device decrypt to
 state/youtube_client_id + state/youtube_client_secret (0600),
 ciphertexts and local plaintext removed. OAuth consent NOT run:
 Testing-mode 7-day refresh-token expiry and the unverified-app warning
-must reach the user first. Google API Services User Data Policy
+must reach the owner first. Google API Services User Data Policy
 agreement checkbox was required to create the client config.
+
+(An earlier revision of this entry named the identity and project;
+removed because this public repo is not a permission record and setup
+permission does not authorize publishing identifiers.)
 
 ## Secure bot-token transport (2026-11-19)
 
@@ -111,15 +123,15 @@ distinct (@Zenasrobot). The token never transits chat or the repo.
 
 ## Phase 001 — AGT audit (2026-11-19 07:28-07:31 UTC)
 
-Live signed command jobs against host agt-3f177cf6 (AGT 1.6.17). Full report:
+Live signed command jobs against host the owner's AGT phone (AGT 1.6.17). Full report:
 [AGT_COMPATIBILITY.md](AGT_COMPATIBILITY.md). Headline: Python 3.12.10 IS
 present (guide was written for 1.6.14); bionic environment, so glibc binaries
 do not run; ffmpeg absent (Phase 003's key task); 3.6 GB RAM / 18.3 GB free
-storage; ZAO BOT and other workloads untouched.
+storage; pre-existing owner workloads untouched.
 
 ## Phase 003 — FFmpeg engine (2026-11-19)
 
-On-device on host agt-3f177cf6: downloaded the pinned termux aarch64 ffmpeg
+On-device on host the owner's AGT phone: downloaded the pinned termux aarch64 ffmpeg
 9.0.2 package set (103 packages, sha256-verified, zero failures) and extracted
 it into the isolated prefix $HOME/instinct-clip/prefix (AGT runtime libs
 untouched; nothing committed to git, install script fetches at deploy time).
@@ -152,7 +164,7 @@ Remaining work: Phases 003-017 per the brief.
 ## Phase 006/014 additions — ingestion route + distribution (2026-11-19, ~02:55 PST)
 
 PUSHED (main@98e11d5, 123/123 unit tests) — code-complete tiers only, NOT
-deployed to agt-3f177cf6 (live deployment e7a6c026 still runs b0b0e96).
+deployed to the owner's AGT phone (the live deployment still runs b0b0e96).
 
 - app/ingestion/twitch_clips.py: official Twitch Clips route. Create Clip
   (clips:edit, any live channel, authenticating user owns the clip),
@@ -211,8 +223,8 @@ the exact access (youtube.upload only).
 
 ## Deployment + hardening (2026-11-19, 03:04-03:47 PST)
 
-Deployed build: e8387be on agt-3f177cf6, deployment id
-f6dcf994-885e-4903-86e5-28c9b5501f19 (RUNNING). Deploy pulls main HEAD
+Deployed build: e8387be on the owner's AGT phone (deployment RUNNING).
+Deploy pulls main HEAD
 at deploy time - the payload has no pin field (reproducibility gap,
 noted). Earlier deployments stopped/removed; pairing + watermark state
 survived both redeploys.
@@ -240,7 +252,7 @@ survived both redeploys.
 ## Brief audit + hardening round 2 (2026-11-19, ~03:50 PST)
 
 CODE: main@pending, 149/149. Deployed on phone: e8387be code (running
-deployment f6dcf994); this round's changes are PUSHED-NOT-DEPLOYED.
+deployment); this round's changes are PUSHED-NOT-DEPLOYED.
 
 BRIEF COMMAND AUDIT (section 4 of the brief): the full specified
 surface is now registered - /start /help /addsource /sources

@@ -66,9 +66,9 @@ class PlannerTests(unittest.TestCase):
         plan = plan_clip("audio_spike", "chan", self.mem,
                          content_seconds=12)
         self.assertEqual(plan.target_seconds, 45)  # owner wins over content
-        self.mem.remember("preference", "watermark", "@zenas", "owner")
+        self.mem.remember("preference", "watermark", "@streamer", "owner")
         plan = plan_clip("audio_spike", "chan", self.mem)
-        self.assertEqual(plan.watermark, "@zenas")
+        self.assertEqual(plan.watermark, "@streamer")
 
     def test_horizontal_flagged_not_short(self):
         self.mem.remember("preference", "quality", "horizontal", "owner")
