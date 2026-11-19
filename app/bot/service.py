@@ -54,7 +54,8 @@ class BotService:
         from . import ops as _ops
         queue = self.app.update_queue
         queue.put = _ops.make_pre_ack_wrapper(self.inbox, self.watermark,
-                                              queue.put)
+                                              queue.put,
+                                              self.store.admin_id)
         self.router.register("status", self._status,
                              "application health")
         self.router.register("storage", self._storage,
@@ -218,6 +219,10 @@ class BotService:
         admin = self._admin(user.id)
         if admin is None:
             log.warning("unauthorized command attempt user_id=%s", user.id)
+            # defense in depth: the wrapper never persists non-admin
+            # commands, but remove any stale entry from older builds so
+            # a later drain can never touch it
+            self.inbox.remove(update.update_id)
             self.watermark.mark_handled(update.update_id)
             return  # fail closed: no reply, no oracle
         try:
@@ -243,7 +248,8 @@ class BotService:
         if reply is None:
             reply = lambda _uid, _text: None
         return ops.drain_inbox(self._state_dir(), self.router,
-                               self.watermark, self.inbox, reply)
+                               self.watermark, self.inbox, reply,
+                               admin_id=self.store.admin_id())
 
     def run(self) -> None:
         log.info("telegram service starting (long polling)")

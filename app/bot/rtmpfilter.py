@@ -3,11 +3,13 @@
 RTMP destinations embed private stream keys (rtmp://host/app/<key>).
 Those keys must never reach logs, public files, or any output surface.
 This module redacts rtmp(s) URLs down to scheme + host in any log
-record. Note the residual boundary: the key still appears in the ffmpeg
-process argv, which on Android is visible only to same-UID processes
-(app sandbox isolation); the engine's own logs and state files stay
-clean. State files holding destinations are 0600 in the state dir and
-never committed to the repository.
+record. Defense in depth: secret-bearing destinations are REFUSED at
+the /relay boundary (secret_in_rtmp_url fails closed on userinfo, path,
+query, fragment and non-rtmp schemes), so no key should ever reach
+process arguments in the first place; redaction keeps logs clean for
+any destination format that slips a future code path. State files
+holding destinations are 0600 in the state dir and never committed to
+the repository.
 """
 from __future__ import annotations
 

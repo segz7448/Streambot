@@ -46,7 +46,8 @@ class InboxTests(unittest.TestCase):
         watermark.mark_handled(11)
         sent = []
         result = drain_inbox(self.dir, router, watermark, self.inbox,
-                             reply=lambda uid, text: sent.append((uid, text)))
+                             reply=lambda uid, text: sent.append((uid, text)),
+                             admin_id=42)
         self.assertEqual(result, {"replayed": 1, "dropped": 1,
                                   "failed": 0, "uncertain": 0})
         self.assertEqual(self.inbox.pending(), [])
@@ -65,7 +66,8 @@ class InboxTests(unittest.TestCase):
         watermark.mark_failed(30)
         sent = []
         result = drain_inbox(self.dir, router, watermark, self.inbox,
-                             reply=lambda uid, text: sent.append(text))
+                             reply=lambda uid, text: sent.append(text),
+                             admin_id=42)
         self.assertEqual(result["uncertain"], 1)
         self.assertEqual(result["replayed"], 0)
         self.assertEqual(self.inbox.pending(), [])
@@ -78,13 +80,15 @@ class InboxTests(unittest.TestCase):
         watermark = UpdateWatermark(str(self.dir / "updates.json"))
         router = self._router([])
         self.inbox.add(20, 42, "/boom")
-        result = drain_inbox(self.dir, router, watermark, self.inbox)
+        result = drain_inbox(self.dir, router, watermark, self.inbox,
+                             admin_id=42)
         self.assertEqual(result["failed"], 1)
         self.assertEqual(len(self.inbox.pending()), 1)
         # next boot: same entry retried again, now succeeding path free
         router2 = CommandRouter(admin_ids=[])
         router2.register("boom", lambda c: "recovered", "fixed")
-        result2 = drain_inbox(self.dir, router2, watermark, self.inbox)
+        result2 = drain_inbox(self.dir, router2, watermark, self.inbox,
+                              admin_id=42)
         self.assertEqual(result2["replayed"], 1)
         self.assertEqual(self.inbox.pending(), [])
 

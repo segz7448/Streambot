@@ -20,14 +20,29 @@ log = get_logger("distribution.relay")
 
 
 def secret_in_rtmp_url(url: str) -> bool:
-    """True when an rtmp(s) URL carries a path beyond '/' - that path
-    is the stream key, and it must not enter process arguments on a
-    shared host. Defense in depth alongside the /relay refusal."""
-    if not url.startswith(("rtmp://", "rtmps://")):
-        return False
-    rest = url.split("://", 1)[1]
-    path = rest.partition("/")[2]
-    return bool(path.strip("/"))
+    """True when a destination URL could carry a credential anywhere -
+    userinfo, path, query or fragment - or uses anything but a plain
+    keyless rtmp(s) endpoint. Stream keys must not enter process
+    arguments on a shared host. Fail closed: unparseable URLs and
+    non-rtmp schemes (srt, rtmpe, ...) count as secret-bearing so the
+    /relay boundary refuses them."""
+    stripped = url.strip()
+    if "://" not in stripped:
+        return False  # local file output: no credential channel
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(stripped.lower())
+    except ValueError:
+        return True
+    if parsed.scheme not in ("rtmp", "rtmps"):
+        return True
+    if not parsed.hostname:
+        return True
+    if parsed.username or parsed.password:
+        return True
+    if parsed.query or parsed.fragment:
+        return True
+    return bool(parsed.path.strip("/"))
 
 
 class DestinationStore:
@@ -66,12 +81,29 @@ class DestinationStore:
 
 class RestreamManager:
     """Owns restream process lifecycle so /stoprelay can stop what
-    /relay started. PIDs are tracked in a 0600 state file so a restart
-    can still find and stop orphan processes."""
+    /relay started. Processes are tracked in a 0600 state file WITH
+    THEIR IDENTITY (pid + /proc start time + cmdline): a bare pid is
+    never enough to signal, because pid reuse after a reboot could
+    make /stoprelay hit an unrelated same-UID workload on this shared
+    host. A record whose identity cannot be verified is reported stale
+    and left alone - never signaled."""
 
     def __init__(self, state_file: str):
         self.state_file = Path(state_file)
         self._procs: dict[int, object] = {}  # pid -> Popen, this session
+
+    @staticmethod
+    def _identity(pid: int) -> dict | None:
+        """Current /proc identity of a pid: start time + cmdline."""
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                start = fh.read().rsplit(")", 1)[1].split()[19]
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ").decode(
+                    errors="replace").strip()
+            return {"start": start, "cmd": cmd[:200]}
+        except (OSError, IndexError):
+            return None
 
     def _alive(self, pid: int) -> bool:
         proc = self._procs.get(pid)
@@ -91,46 +123,86 @@ class RestreamManager:
         except OSError:
             return False
 
-    def _pids(self) -> list[int]:
+    def _records(self) -> list[dict]:
         try:
-            return [int(x) for x in self.state_file.read_text().split()]
-        except (FileNotFoundError, ValueError):
+            lines = self.state_file.read_text().splitlines()
+        except FileNotFoundError:
             return []
+        records = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                records.append({"pid": int(rec["pid"]),
+                                "start": rec.get("start"),
+                                "cmd": rec.get("cmd", "")})
+            except (ValueError, KeyError, TypeError):
+                try:  # legacy format: bare pid, identity unknown
+                    records.append({"pid": int(line), "start": None,
+                                    "cmd": ""})
+                except ValueError:
+                    continue
+        return records
 
-    def _save(self, pids: list[int]) -> None:
+    def _save(self, records: list[dict]) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.state_file,
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
-            fh.write("\n".join(str(p) for p in pids))
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
 
     def active(self) -> list[int]:
-        alive = [pid for pid in self._pids() if self._alive(pid)]
+        alive = [rec for rec in self._records() if self._alive(rec["pid"])]
         self._save(alive)
-        return alive
+        return [rec["pid"] for rec in alive]
 
     def start(self, cmds: list[list[str]]) -> list[int]:
         import subprocess
-        pids = self.active()
+        records = [rec for rec in self._records()
+                   if self._alive(rec["pid"])]
         for cmd in cmds:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._procs[proc.pid] = proc
-            pids.append(proc.pid)
-        self._save(pids)
+            ident = self._identity(proc.pid) or {"start": None, "cmd": ""}
+            records.append({"pid": proc.pid, "start": ident["start"],
+                            "cmd": ident["cmd"]})
+        self._save(records)
         log.info("restream started: %d process(es)", len(cmds))
-        return pids
+        return [rec["pid"] for rec in records]
 
     def stop(self) -> int:
+        """SIGTERM only processes whose identity verifies: our own live
+        children, or a state-file record whose /proc start time still
+        matches AND whose cmdline is still ffmpeg. Anything else is a
+        possible pid-reuse victim - reported stale, never signaled."""
         import signal
         import time
-        stopped = 0
-        for pid in self.active():
-            try:
-                os.kill(pid, signal.SIGTERM)
-                stopped += 1
-            except OSError:
-                pass
+        stopped = stale = 0
+        for rec in self._records():
+            pid = rec["pid"]
+            if not self._alive(pid):
+                continue
+            proc = self._procs.get(pid)
+            ours = proc is not None and proc.poll() is None
+            verified = False
+            if not ours and rec.get("start"):
+                cur = self._identity(pid)
+                verified = bool(cur and cur["start"] == rec["start"]
+                                and cur["cmd"] == rec["cmd"])
+            if ours or verified:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    stopped += 1
+                except OSError:
+                    pass
+            else:
+                stale += 1
+                log.warning("restream pid %s identity unverifiable - "
+                            "NOT signaled (possible pid reuse)", pid)
         deadline = time.time() + 5
         for pid, proc in list(self._procs.items()):
             remaining = max(0.0, deadline - time.time())
@@ -140,7 +212,8 @@ class RestreamManager:
                 pass
         self._procs.clear()
         self._save([])
-        log.info("restream stopped: %d process(es)", stopped)
+        log.info("restream stopped: %d signaled, %d stale-unverified",
+                 stopped, stale)
         return stopped
 
 

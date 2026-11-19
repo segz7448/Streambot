@@ -1,20 +1,17 @@
 """Persistent pre-ack inbox: closes the confirm-to-handle gap.
 
 Telegram confirms an update when the long-poll offset advances past it.
-If the handler crashes after that confirmation, the watermark records
-the failure but Telegram never redelivers - the update would sit in the
-failed set forever. This inbox persists each command BEFORE dispatch
-(0600 file in the state dir), removes it only after successful
-BOUNDARY (honest): the entry is written when the handler is entered.
-Telegram's server-side confirmation happens when the framework's NEXT
-getUpdates call carries the advanced offset. A crash between that ack
-and handler entry (framework queue window) is still uncovered; a crash
-before the ack is covered by Telegram redelivery, and a crash after
-handler entry is covered by this inbox + startup drain. Replay
-idempotence beyond the watermark is per-command: a command that crashed
-AFTER an external side effect (clip creation, restream start) can
-repeat that side effect on drain - side-effecting commands need
-operation-level idempotency, which is NOT yet implemented."""
+Each admin command is persisted BEFORE it enters the framework queue
+(the update_queue.put wrapper), so a crash at any later point - queue,
+dispatch, or the side effect itself - leaves a durable entry the
+startup drain reconciles. Entries are removed only after successful
+handling; the watermark makes replays idempotent, and the op journal
+gives side-effecting commands operation-level idempotency.
+
+Only the paired administrator's commands are ever written here; the
+inbox is bounded with backpressure (refusal is recorded to an overflow
+file, never silent eviction). All files are 0600 in the state dir.
+"""
 from __future__ import annotations
 
 import json
@@ -44,18 +41,42 @@ class PreAckInbox:
         with os.fdopen(fd, "w") as fh:
             json.dump(entries, fh)
 
-    def add(self, update_id: int, user_id: int, text: str) -> None:
+    def add(self, update_id: int, user_id: int, text: str) -> bool:
+        """Persist a pending command. Bounded with BACKPRESSURE, never
+        silent eviction: when the inbox is full the new entry is
+        REFUSED (returns False) and the refusal is recorded durably in
+        an overflow file, so a rejected command is reconcilable instead
+        of acknowledged-and-lost. Unprocessed entries are never dropped
+        to make room."""
         with self._lock:
             entries = [e for e in self._read()
                        if e.get("update_id") != update_id]
-            entries.append({"update_id": int(update_id),
-                            "user_id": int(user_id), "text": text})
-            if len(entries) > MAX_PENDING:
+            if len(entries) >= MAX_PENDING:
                 import logging
                 logging.getLogger("bot.inbox").critical(
-                    "pre-ack inbox exceeds %d entries; operator attention "
-                    "required", MAX_PENDING)
+                    "pre-ack inbox full (%d); refusing update %s - "
+                    "recorded to overflow for reconciliation",
+                    MAX_PENDING, update_id)
+                self._record_overflow(update_id, user_id, text)
+                return False
+            entries.append({"update_id": int(update_id),
+                            "user_id": int(user_id), "text": text})
             self._write(entries)
+            return True
+
+    def _record_overflow(self, update_id: int, user_id: int,
+                         text: str) -> None:
+        import json as _json
+        path = self.path.with_suffix(".overflow.json")
+        try:
+            rows = _json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            rows = []
+        rows.append({"update_id": int(update_id), "user_id": int(user_id),
+                     "text": text[:200]})
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            _json.dump(rows[-100:], fh)
 
     def remove(self, update_id: int) -> None:
         with self._lock:

@@ -26,7 +26,8 @@ class PreAckWrapperTests(unittest.TestCase):
         seen = []
         async def orig(u):
             seen.append(u)
-        wrapped = ops.make_pre_ack_wrapper(self.inbox, self.wm, orig)
+        wrapped = ops.make_pre_ack_wrapper(self.inbox, self.wm, orig,
+                                     lambda: 42)
         asyncio.run(wrapped(update))
         return seen
 

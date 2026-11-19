@@ -69,23 +69,33 @@ def stoprelay_reply(state_dir: Path) -> str:
     return "No restream is running."
 
 
-def make_pre_ack_wrapper(inbox, watermark, orig_put):
+def make_pre_ack_wrapper(inbox, watermark, orig_put, admin_id_fn):
     """TRUE pre-ack durability: wraps the framework update queue's put,
     persisting each command update BEFORE it is queued. The framework
     advances its offset only after queueing, and Telegram's server-side
     ack happens on the NEXT getUpdates call - so a persisted update can
     never be acked past without an inbox entry, and the startup drain
-    replays anything not marked handled. The framework queue window is
-    closed by construction."""
+    replays anything not marked handled.
+
+    AUTHORIZATION AT INGEST: only the paired administrator's commands
+    are persisted. A stranger's command is never written to the inbox,
+    so the drain can never replay it. /pair carries a secret code and
+    is handled by its own handler with the watermark; its text is never
+    persisted either."""
     async def put(update):
         try:
             text = (update.message.text
                     if getattr(update, "message", None) else "") or ""
             if text.startswith("/"):
-                uid = int(update.update_id)
-                if not watermark.already_handled(uid):
-                    user = getattr(update, "effective_user", None)
-                    inbox.add(uid, int(user.id) if user else 0, text)
+                command = text[1:].split()[0].lower().lstrip("/")
+                user = getattr(update, "effective_user", None)
+                sender = int(user.id) if user else 0
+                admin = admin_id_fn()
+                if (command != "pair" and admin is not None
+                        and sender == admin):
+                    uid = int(update.update_id)
+                    if not watermark.already_handled(uid):
+                        inbox.add(uid, sender, text)
         except Exception:
             import logging
             logging.getLogger("bot.ops").exception(
@@ -164,10 +174,17 @@ def journal_record(state_dir: Path, update_id: int, command: str,
 
 
 def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
-                inbox: PreAckInbox, reply=lambda _uid, _text: None) -> dict:
+                inbox: PreAckInbox, reply=lambda _uid, _text: None,
+                admin_id: int | None = None) -> dict:
     """Retry updates stranded by a crash between confirmation and
     handling. Idempotent via the watermark: entries already handled are
-    just dropped. Entries that fail again STAY for the next drain."""
+    just dropped. Entries that fail again STAY for the next drain.
+
+    AUTHORIZATION IS NEVER TAKEN FROM THE ENTRY: a stored sender id is
+    untrusted input. Only entries whose sender matches the paired
+    administrator (PairingStore) are dispatched, and the router is
+    authorized with that paired id - anything else is dropped and
+    marked handled so it can never execute."""
     import logging
     log = logging.getLogger("bot.ops")
     replayed = dropped = failed = uncertain = 0
@@ -175,6 +192,15 @@ def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
         uid = int(entry["update_id"])
         if watermark.already_handled(uid):
             inbox.remove(uid)
+            dropped += 1
+            continue
+        if admin_id is None or int(entry.get("user_id", 0)) != admin_id:
+            # not from the paired admin (or pairing not complete):
+            # never dispatch; drop so it can never execute later
+            log.warning("inbox drain dropping non-admin entry update=%s",
+                        uid)
+            inbox.remove(uid)
+            watermark.mark_handled(uid)
             dropped += 1
             continue
         command = (entry["text"].lstrip("/").split() or [""])[0].lower()
@@ -187,19 +213,19 @@ def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
                                    entry["text"])
             watermark.mark_handled(uid)
             inbox.remove(uid)
-            reply(int(entry["user_id"]),
+            reply(admin_id,
                   f"Command {entry['text']} was interrupted by a restart "
                   "and may already have run. It was NOT repeated. "
                   "Re-send it if you want it executed again.")
             uncertain += 1
             continue
         try:
-            router.admin_ids = {int(entry["user_id"])}
+            router.admin_ids = {admin_id}
             reply_text = router.dispatch(entry["text"],
-                                         user_id=int(entry["user_id"]),
+                                         user_id=admin_id,
                                          update_id=uid)
             if reply_text:
-                reply(int(entry["user_id"]), reply_text)
+                reply(admin_id, reply_text)
             watermark.mark_handled(uid)
             inbox.remove(uid)
             replayed += 1
