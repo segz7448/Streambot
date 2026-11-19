@@ -189,6 +189,62 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(ep, 0)  # episode closed by the quiet tail
 
+    def test_reconnect_gap_resets_carried_episode(self):
+        # a burst right after a recording interruption is a NEW moment,
+        # not a continuation of the pre-gap episode: the real wall-time
+        # gap between segment files resets episode_active.
+        now = time.time()
+        mtimes = [now - 200, now - 194, now - 60, now - 54]  # gap before seg2
+        for i, mt in enumerate(mtimes):
+            p = os.path.join(str(self.buf.dir), f"seg-{i:06d}.ts")
+            with open(p, "wb") as fh:
+                fh.write(b"\0" * 1024)
+            os.utime(p, (mt, mt))
+
+        def audio_fn(ff, p):
+            if "seg-000000" in str(p):
+                return ([audio.LoudnessSample(t * 0.5, -30.0) for t in range(8)]
+                        + [audio.LoudnessSample(4.0 + i * 0.5, -15.0)
+                           for i in range(4)])  # loud tail, episode open
+            return [audio.LoudnessSample(i * 0.5, -15.0) for i in range(8)]
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=audio_fn, scene_fn=lambda ff, p: [])
+        det.process_new_segments()
+        conn = connect(self.db)
+        n = conn.execute("SELECT count(*) FROM candidate_events"
+                         " WHERE kind='audio_spike'").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2)  # pre-gap episode + post-gap new burst
+
+    def test_gap_between_passes_resets_carried_episode(self):
+        # the gap may fall BETWEEN analysis passes: the persisted
+        # last-segment mtime must still reset a carried episode.
+        now = time.time()
+        for i, mt in enumerate([now - 200, now - 100]):
+            p = os.path.join(str(self.buf.dir), f"seg-{i:06d}.ts")
+            with open(p, "wb") as fh:
+                fh.write(b"\0" * 1024)
+            os.utime(p, (mt, mt))
+        loud_tail = ([audio.LoudnessSample(t * 0.5, -30.0) for t in range(8)]
+                     + [audio.LoudnessSample(4.0 + i * 0.5, -15.0)
+                        for i in range(4)])
+        det = CandidateDetector(
+            "ffmpeg", self.buf, self.db,
+            audio_fn=lambda ff, p: loud_tail if "seg-000000" in str(p)
+            else [audio.LoudnessSample(i * 0.5, -15.0) for i in range(8)],
+            scene_fn=lambda ff, p: [])
+        det.process_new_segments()  # analyzes seg0, episode left open
+        p2 = os.path.join(str(self.buf.dir), "seg-000002.ts")
+        with open(p2, "wb") as fh:
+            fh.write(b"\0" * 1024)
+        os.utime(p2, (now - 94, now - 94))
+        det.process_new_segments()  # analyzes seg1 across the gap
+        conn = connect(self.db)
+        n = conn.execute("SELECT count(*) FROM candidate_events"
+                         " WHERE kind='audio_spike'").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 2)  # post-gap loud start is a NEW moment
+
     def test_two_bursts_across_boundary_stay_separate(self):
         self._make_segments(3)
 

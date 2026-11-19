@@ -39,6 +39,12 @@ def ensure_state_table(db_path: str) -> None:
                      " ADD COLUMN episode_active INTEGER NOT NULL DEFAULT 0")
     except Exception:
         pass
+    # older databases predate the last-segment-mtime column
+    try:
+        conn.execute("ALTER TABLE detection_state"
+                     " ADD COLUMN last_seg_mtime REAL")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -90,16 +96,30 @@ class CandidateDetector:
         ensure_state_table(self.db_path)
         conn = connect(self.db_path)
         row = conn.execute(
-            "SELECT last_analyzed_sequence, baseline_lufs, episode_active FROM"
-            " detection_state WHERE session_id=?",
+            "SELECT last_analyzed_sequence, baseline_lufs, episode_active,"
+            " last_seg_mtime FROM detection_state WHERE session_id=?",
             (self.buffer.session_id,)).fetchone()
         last = row[0] if row else -1
         baseline = row[1] if row else None
         episode_active = bool(row[2]) if row else False
+        prev_mtime: float | None = row[3] if row else None
         segs = [s for s in self.buffer.segments() if s.sequence > last]
         finalized = segs[:-1] if segs else []
         written = 0
         for seg in finalized:
+            # A recording interruption (reconnect gap) produces a real
+            # wall-time gap between segment files that sequence-derived
+            # content time hides. A burst right after such a gap is a NEW
+            # moment, not a continuation: reset the carried episode.
+            try:
+                mt = seg.path.stat().st_mtime
+            except OSError:
+                mt = None
+            if (mt is not None and prev_mtime is not None
+                    and mt - prev_mtime > 2 * self.buffer.segment_seconds):
+                episode_active = False
+            if mt is not None:
+                prev_mtime = mt
             cands, seg_median, episode_active = self.analyze_segment(
                 str(seg.path), baseline, episode_active)
             for cand in cands:
@@ -121,16 +141,20 @@ class CandidateDetector:
                     baseline + 0.2 * (seg_median - baseline))
         conn.execute(
             "INSERT INTO detection_state"
-            " (session_id, last_analyzed_sequence, baseline_lufs, episode_active)"
-            " VALUES (?,?,?,?) ON CONFLICT(session_id)"
+            " (session_id, last_analyzed_sequence, baseline_lufs,"
+            " episode_active, last_seg_mtime)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(session_id)"
             " DO UPDATE SET last_analyzed_sequence"
             "=excluded.last_analyzed_sequence,"
             " baseline_lufs=excluded.baseline_lufs,"
-            " episode_active=excluded.episode_active",
+            " episode_active=excluded.episode_active,"
+            " last_seg_mtime=excluded.last_seg_mtime",
             (self.buffer.session_id,
              last if finalized else (row[0] if row else -1),
              baseline,
-             1 if episode_active else 0))
+             1 if episode_active else 0,
+             prev_mtime if prev_mtime is not None else (
+                 row[3] if row else None)))
         conn.commit()
         conn.close()
         return written
