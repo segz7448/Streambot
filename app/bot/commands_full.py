@@ -261,15 +261,27 @@ def record_error(state_dir: Path, text: str) -> None:
 
 USAGE_PUBLISH = "Usage: /publish <clip-id> [title]"
 
+PUBLISHABLE_STATUSES = ("HELD", "DELIVERED")
+
 
 def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
-    """Upload one clip to YouTube as PRIVATE via the Data API.
-    Side-effecting and journaled: a replayed command returns the
-    recorded result instead of uploading twice. Fails closed with a
-    consent-pending message until the owner completes OAuth (the
-    youtube_* credential files do not exist before then). A network
-    failure mid-upload is ambiguous (the PUT may have completed), so
-    it is preserved for reconciliation, never blind-retried."""
+    """Upload one QC-passed clip to YouTube as PRIVATE via the Data API.
+
+    Gates, in order:
+    - replay guard: a replayed Telegram update returns the recorded
+      result instead of uploading twice (tg:<update_id> journal)
+    - QC gate: only HELD or DELIVERED clips publish; PENDING, raw,
+      QC_FAILED or FAILED material is refused
+    - path gate: the clip file must resolve under the session clip
+      root; anything outside is refused before it is opened
+    - per-clip dedup: a clip already confirmed uploaded (publish:
+      <clip_id> journal) is never re-uploaded by a new command
+    - consent gate: without OAuth credentials nothing is attempted
+    Failure honesty: pre-upload failures (auth token, resumable-session
+    init) are definitive and journaled failed; once the upload PUT is
+    in flight the outcome is ambiguous and is preserved for
+    reconciliation, never blind-retried. privacy is hardcoded private.
+    """
     from . import ops
     cached = ops.journal_result(state_dir, update_id, "publish")
     if cached is not None:
@@ -279,17 +291,38 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
         clip_id = int(parts[0])
     except (ValueError, IndexError):
         return USAGE_PUBLISH
-    title = parts[1].strip() if len(parts) == 2 and parts[1].strip() \
-        else f"Clip #{clip_id}"
+    title_arg = parts[1].strip() if len(parts) == 2 else ""
     with _db(state_dir) as conn:
         row = conn.execute(
-            "SELECT file_path, status FROM clips WHERE id=?",
-            (clip_id,)).fetchone()
+            "SELECT c.file_path, c.status, c.session_id, t.username"
+            " FROM clips c"
+            " LEFT JOIN stream_sessions s ON c.session_id = s.id"
+            " LEFT JOIN twitch_sources t ON s.source_id = t.id"
+            " WHERE c.id=?", (clip_id,)).fetchone()
     if row is None:
         return f"No clip #{clip_id}."
-    path, _status = row
-    if not path or not os.path.exists(path):
+    path, status, session_id, source = row
+    if status not in PUBLISHABLE_STATUSES:
+        return (f"Clip #{clip_id} is {status or 'unknown'} - only "
+                "QC-passed clips (HELD or DELIVERED) can be published. "
+                "Nothing was uploaded.")
+    if not path:
         return f"Clip #{clip_id} has no file on disk."
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except OSError:
+        return f"Clip #{clip_id} has no file on disk."
+    clip_root = (state_dir / "sessions").resolve()
+    if clip_root not in resolved.parents:
+        record_error(state_dir,
+                     f"publish refused path escape clip #{clip_id}")
+        return (f"Refused: clip #{clip_id}'s file is outside the clip "
+                "storage root. Nothing was uploaded.")
+    prior = ops.journal_result_ns(state_dir, "publish", clip_id,
+                                  "publish")
+    if prior is not None:
+        return (f"Clip #{clip_id} was already uploaded ({prior}). "
+                "Not re-uploading.")
     from ..distribution.youtube import (YouTubeNotConfigured,
                                         YouTubeUploadFailed,
                                         publisher_from_state)
@@ -298,24 +331,46 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
     except YouTubeNotConfigured:
         return ("YouTube upload is not configured: OAuth consent is "
                 "still pending. Nothing was uploaded.")
+    from ..intelligence.memory import Memory
+    from ..intelligence.planner import TITLE_MAX_CHARS, plan_clip
+    plan = plan_clip("manual", source or "clip",
+                     Memory(str(state_dir / "memory.json")))
+    title = (title_arg or plan.title)[:TITLE_MAX_CHARS]
+    description = (f"Clipped from {source or 'a registered source'} by "
+                   f"NOVA Clip Engine (clip #{clip_id}, session "
+                   f"{session_id or '?'}).")
     try:
-        vid = pub.publish(path, title, privacy="private")
+        vid = pub.publish(str(resolved), title,
+                          description=description, privacy="private",
+                          tags=plan.tags)
     except YouTubeUploadFailed as exc:
-        # a definitive API error response - safe to record as failed
-        result = f"YouTube upload of clip #{clip_id} failed: {exc}"
+        if exc.uncertain:
+            ops.journal_mark_uncertain(state_dir, update_id, "publish",
+                                       f"/publish {args}")
+            record_error(
+                state_dir,
+                f"publish clip #{clip_id} uncertain ({exc.stage}): {exc}")
+            return ("Upload outcome uncertain: the request was already "
+                    "in flight. Preserved for reconciliation and NOT "
+                    "retried - check YouTube Studio before re-sending "
+                    "/publish.")
+        result = (f"YouTube upload of clip #{clip_id} failed before "
+                  f"any video data was sent ({exc.stage}): {exc}")
         ops.journal_record(state_dir, update_id, "publish", result)
         record_error(state_dir, result)
         return result
     except Exception as exc:
-        # network failure with the request possibly in flight: the
-        # upload may have completed server-side. Preserve, do not retry.
         ops.journal_mark_uncertain(state_dir, update_id, "publish",
                                    f"/publish {args}")
         record_error(state_dir,
                      f"publish clip #{clip_id} outcome uncertain: {exc}")
-        return ("Upload outcome uncertain (network failure mid-request). "
-                "Preserved for reconciliation and NOT retried - check "
-                "YouTube Studio before re-sending /publish.")
+        return ("Upload outcome uncertain (unexpected error). Preserved "
+                "for reconciliation and NOT retried - check YouTube "
+                "Studio before re-sending /publish.")
+    # dedup record FIRST: a crash after the upload but before the replay
+    # guard is written still blocks a second upload of this clip.
+    ops.journal_record_ns(state_dir, "publish", clip_id, "publish",
+                          f"yt:{vid}")
     result = (f"Clip #{clip_id} uploaded PRIVATE to YouTube "
               f"(video id {vid}). It stays private until you change it "
               "in YouTube Studio.")

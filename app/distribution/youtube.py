@@ -49,7 +49,17 @@ class YouTubeNotConfigured(Exception):
 
 
 class YouTubeUploadFailed(Exception):
-    pass
+    """stage: auth | session | upload. uncertain=True means bytes may
+    have reached YouTube (the upload PUT was in flight), so the video
+    may exist server-side - the caller must reconcile, never blind-
+    retry. Pre-upload stages (auth token, resumable-session init) are
+    definitive: no video can exist, so a retry is safe."""
+
+    def __init__(self, message: str, stage: str = "",
+                 uncertain: bool = False):
+        super().__init__(message)
+        self.stage = stage
+        self.uncertain = uncertain
 
 
 def _post_form(url: str, fields: dict) -> dict:
@@ -146,12 +156,16 @@ class YouTubePublisher:
         self.refresh_token = refresh_token
 
     def _access_token(self) -> str:
-        data = _post_form(TOKEN_URL, {
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "refresh_token": self.refresh_token,
-            "grant_type": "refresh_token"})
-        return str(data["access_token"])
+        try:
+            data = _post_form(TOKEN_URL, {
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "refresh_token": self.refresh_token,
+                "grant_type": "refresh_token"})
+            return str(data["access_token"])
+        except Exception as exc:
+            raise YouTubeUploadFailed(
+                f"token refresh failed: {exc}", stage="auth") from None
 
     def publish(self, video_path: str, title: str, description: str = "",
                 privacy: str = "private", tags: list[str] | None = None
@@ -177,21 +191,26 @@ class YouTubePublisher:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 session = resp.headers["Location"]
-        except urllib.error.HTTPError as exc:
+        except Exception as exc:
+            # no bytes of the video sent: nothing can exist server-side
             raise YouTubeUploadFailed(
-                f"resumable session -> HTTP {exc.code}") from None
+                f"resumable session failed: {exc}",
+                stage="session") from None
+        # Bounded streaming: the file object is sent in 8KiB blocks
+        # (http.client streams file-like data), never whole-file in RAM.
         with open(video_path, "rb") as fh:
-            payload = fh.read()
-        req = urllib.request.Request(
-            session, data=payload, method="PUT",
-            headers={"Content-Type": "video/mp4",
-                     "Content-Length": str(size)})
-        try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                result = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            raise YouTubeUploadFailed(
-                f"upload -> HTTP {exc.code}: {exc.read()[:200]!r}") from None
+            req = urllib.request.Request(
+                session, data=fh, method="PUT",
+                headers={"Content-Type": "video/mp4",
+                         "Content-Length": str(size)})
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    result = json.loads(resp.read().decode())
+            except Exception as exc:
+                # the PUT was in flight: bytes may have arrived
+                raise YouTubeUploadFailed(
+                    f"upload interrupted: {exc}", stage="upload",
+                    uncertain=True) from None
         video_id = result.get("id")
         if not video_id:
             raise YouTubeUploadFailed(f"no video id in response: {result!r}")

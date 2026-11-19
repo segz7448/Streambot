@@ -191,6 +191,34 @@ def _journal_trim(data: dict, now: float) -> None:
             del data[k]
 
 
+def journal_record_ns(state_dir: Path, namespace: str, ident: int,
+                      command: str, result: str) -> None:
+    """Record under an explicit namespace (e.g. publish:<clip_id> for
+    per-clip publication dedup) - a different id space than the
+    Telegram-update command journal."""
+
+    def apply(data):
+        import time as _t
+        now = _t.time()
+        _journal_migrate(data, now)
+        data[f"{namespace}:{int(ident)}"] = {
+            "command": command, "result": result, "ts": now}
+        _journal_trim(data, now)
+        return data, None
+
+    locked_update(state_dir / JOURNAL, {}, apply)
+
+
+def journal_result_ns(state_dir: Path, namespace: str, ident: int,
+                      command: str):
+    """Exact-key lookup in an explicit namespace. No legacy fallback:
+    a same-numbered key from another namespace must never resolve."""
+    entry = _journal_read(state_dir).get(f"{namespace}:{int(ident)}")
+    if entry and entry.get("command") == command:
+        return entry.get("result")
+    return None
+
+
 def journal_result(state_dir: Path, update_id: int, command: str):
     """Stored result of an already-executed side-effecting command, or
     None. Gives replayed commands operation-level idempotency: a drain

@@ -72,17 +72,24 @@ if __name__ == "__main__":
 
 class PublishCommandTests(unittest.TestCase):
 
-    def _clip(self, d, clip_id=1):
+    def _clip(self, d, clip_id=1, status="HELD", outside=False):
         import time
-        conn = sqlite3.connect(str(d / "nova.db"))
-        migrate(conn)
-        conn.close()
-        clip = d / "clip1.mp4"
+        if not (d / "nova.db").exists():
+            conn = sqlite3.connect(str(d / "nova.db"))
+            migrate(conn)
+            conn.close()
+        if outside:
+            clip = d.parent / f"escape-{clip_id}.mp4"
+        else:
+            sess = d / "sessions" / "src"
+            sess.mkdir(parents=True, exist_ok=True)
+            clip = sess / f"clip-{clip_id}.mp4"
         clip.write_bytes(b"mp4data")
         with sqlite3.connect(str(d / "nova.db")) as conn:
             conn.execute(
                 "INSERT INTO clips(id, file_path, status, created_at)"
-                " VALUES(?,?,?,?)", (clip_id, str(clip), "HELD", time.time()))
+                " VALUES(?,?,?,?)",
+                (clip_id, str(clip), status, time.time()))
         return clip
 
     def test_usage_and_missing_clip(self):
@@ -94,15 +101,32 @@ class PublishCommandTests(unittest.TestCase):
         conn.close()
         self.assertIn("No clip #9", cf.publish_reply(d, "9"))
 
+    def test_non_qc_passed_statuses_refused(self):
+        from app.bot import ops
+        for status in ("PENDING", "QC_FAILED", "FAILED", "RAW"):
+            d = Path(tempfile.mkdtemp())
+            self._clip(d, status=status)
+            r = cf.publish_reply(d, "1", 600)
+            self.assertIn("only QC-passed", r, status)
+            self.assertIsNone(ops.journal_result(d, 600, "publish"))
+
+    def test_path_escape_refused(self):
+        d = Path(tempfile.mkdtemp())
+        self._clip(d, outside=True)
+        r = cf.publish_reply(d, "1", 601)
+        self.assertIn("outside the clip storage root", r)
+
     def test_unconfigured_fails_closed_no_journal(self):
-        d = self._clip(Path(tempfile.mkdtemp())).parent
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
         r = cf.publish_reply(d, "1", 555)
         self.assertIn("not configured", r)
         from app.bot import ops
         self.assertIsNone(ops.journal_result(d, 555, "publish"))
 
-    def test_success_journaled_and_replay_guarded(self):
-        d = self._clip(Path(tempfile.mkdtemp())).parent
+    def test_success_journaled_replay_guarded_and_deduped(self):
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
         fake = mock.Mock()
         fake.publish.return_value = "vid9"
         with mock.patch("app.distribution.youtube.publisher_from_state",
@@ -110,34 +134,62 @@ class PublishCommandTests(unittest.TestCase):
             r = cf.publish_reply(d, "1 My title", 556)
         self.assertIn("PRIVATE", r)
         self.assertIn("vid9", r)
-        fake.publish.assert_called_once()
         args, kwargs = fake.publish.call_args
         self.assertEqual(kwargs.get("privacy"), "private")
         self.assertEqual(args[1], "My title")
-        # replay: same update id returns the recorded result, no 2nd upload
+        self.assertTrue(kwargs.get("tags"))
+        self.assertIn("clip #1", kwargs.get("description", ""))
+        # replay of the SAME update: recorded result, no second upload
         with mock.patch("app.distribution.youtube.publisher_from_state",
                         return_value=fake):
             r2 = cf.publish_reply(d, "1 My title", 556)
         self.assertIn("replay guard", r2)
+        # a NEW command for the SAME clip: dedup, no second upload
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r3 = cf.publish_reply(d, "1", 777)
+        self.assertIn("already uploaded", r3)
         fake.publish.assert_called_once()
 
-    def test_api_error_journaled_failed(self):
-        from app.distribution.youtube import YouTubeUploadFailed
-        d = self._clip(Path(tempfile.mkdtemp())).parent
+    def test_planner_title_used_and_capped(self):
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
         fake = mock.Mock()
-        fake.publish.side_effect = YouTubeUploadFailed("upload -> HTTP 403")
+        fake.publish.return_value = "vid10"
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            cf.publish_reply(d, "1", 556)
+        title = fake.publish.call_args[0][1]
+        self.assertTrue(title)
+        self.assertLessEqual(len(title), 100)
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            self._clip(d, clip_id=2)
+            cf.publish_reply(d, "2 " + "x" * 300, 557)
+        self.assertEqual(len(fake.publish.call_args[0][1]), 100)
+
+    def test_definitive_preupload_failure_journaled_failed(self):
+        from app.distribution.youtube import YouTubeUploadFailed
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        fake = mock.Mock()
+        fake.publish.side_effect = YouTubeUploadFailed(
+            "token refresh failed: HTTP 400", stage="auth")
         with mock.patch("app.distribution.youtube.publisher_from_state",
                         return_value=fake):
             r = cf.publish_reply(d, "1", 557)
-        self.assertIn("failed", r)
+        self.assertIn("failed before any video data was sent", r)
         from app.bot import ops
         self.assertIn("failed", ops.journal_result(d, 557, "publish"))
+        self.assertEqual(ops.journal_uncertain(d), [])
 
-    def test_network_failure_marked_uncertain_not_retried(self):
-        import urllib.error
-        d = self._clip(Path(tempfile.mkdtemp())).parent
+    def test_inflight_failure_marked_uncertain_not_retried(self):
+        from app.distribution.youtube import YouTubeUploadFailed
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
         fake = mock.Mock()
-        fake.publish.side_effect = urllib.error.URLError("reset")
+        fake.publish.side_effect = YouTubeUploadFailed(
+            "upload interrupted: reset", stage="upload", uncertain=True)
         with mock.patch("app.distribution.youtube.publisher_from_state",
                         return_value=fake):
             r = cf.publish_reply(d, "1", 558)

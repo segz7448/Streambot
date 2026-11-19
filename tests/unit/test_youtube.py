@@ -2,7 +2,8 @@ import unittest
 from unittest import mock
 
 from app.distribution.youtube import (YouTubeNotConfigured,
-                                      YouTubePublisher)
+                                      YouTubePublisher,
+                                      YouTubeUploadFailed)
 
 
 def _resp(payload, headers=None, status=200):
@@ -91,3 +92,56 @@ class YouTubePublisherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UploadStageTests(unittest.TestCase):
+    def test_auth_failure_is_definitive(self):
+        import urllib.error
+        pub = YouTubePublisher("cid", "rt")
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("down")):
+            with self.assertRaises(YouTubeUploadFailed) as cm:
+                pub._access_token()
+        self.assertEqual(cm.exception.stage, "auth")
+        self.assertFalse(cm.exception.uncertain)
+
+    def test_put_streams_file_and_is_uncertain_on_failure(self):
+        import io
+        pub = YouTubePublisher("cid", "rt")
+        sent = []
+
+        class R:
+            def __init__(self, payload=b"", headers=None):
+                self._p = payload
+                self.headers = headers or {}
+            def read(self):
+                return self._p
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            if "token" in req.full_url:
+                return R(b'{"access_token": "at"}')
+            if "upload/youtube" in req.full_url:
+                return R(headers={"Location": "https://up/s/1"})
+            sent.append(req)
+            raise OSError("connection reset")
+
+        data = io.BytesIO(b"x" * 10000)
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=fake_urlopen):
+            with mock.patch("os.path.getsize", return_value=10000):
+                with mock.patch("builtins.open",
+                                mock.mock_open(read_data=b"")) as m:
+                    m.return_value = data
+                    with self.assertRaises(YouTubeUploadFailed) as cm:
+                        pub.publish("/tmp/v.mp4", "t")
+        exc = cm.exception
+        self.assertEqual(exc.stage, "upload")
+        self.assertTrue(exc.uncertain)
+        put = sent[0]
+        # streamed: the file object itself, not a bytes copy in RAM
+        self.assertTrue(hasattr(put.data, "read"))
+        self.assertEqual(put.headers.get("Content-length"), "10000")
