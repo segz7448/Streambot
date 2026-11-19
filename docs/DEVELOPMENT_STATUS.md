@@ -8,7 +8,7 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 001 | AGT environment audit | COMPLETE (verified live) |
 | 002 | Project foundation | COMPLETE (tests pass locally) |
 | 003 | FFmpeg engine | DEVICE-VERIFIED 2026-11-19 (evidence below); module integration continues |
-| 004 | Media buffer | IN PROGRESS (buffer code + segmentation device-tested; live-source acceptance pending Phase 006) |
+| 004 | Media buffer | DEVICE-VERIFIED on agt-3f177cf6 (rolling capture: 8 realtime segments over 40s; storage 4,028,840 B under 4 MiB cap with total recorded content exceeding the cap, proving rotation; 6-segment event window retention; idempotent reconcile; clean supervised stop; harness commit 4496743). Live-source acceptance still pending Phase 006 |
 | 005 | Twitch discovery | CODE READY (Helix client, tests 22/22); live acceptance needs user-approved Twitch app credentials |
 | 006 | Authorized ingestion | NOT STARTED |
 | 007 | Telegram bot | NOT STARTED (needs bot token via secure transfer) |
