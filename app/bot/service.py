@@ -15,6 +15,9 @@ Security posture:
 from __future__ import annotations
 
 import os
+import sqlite3
+import time
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (Application, CommandHandler, ContextTypes,
@@ -37,10 +40,50 @@ class BotService:
         self.watermark = watermark or UpdateWatermark(
             str(store.path.parent / "updates.json"))
         self.router = CommandRouter(admin_ids=[])
+        self.started_at = time.time()
         self.app = Application.builder().token(token).build()
         self.app.add_handler(CommandHandler("pair", self._pair))
         self.app.add_handler(
             MessageHandler(filters.TEXT & filters.COMMAND, self._command))
+        self.router.register("status", self._status,
+                             "application health")
+        self.router.register("storage", self._storage,
+                             "storage consumption")
+        self.router.register("sources", self._sources,
+                             "list registered channels")
+
+    # --- real handler implementations (registered => advertised) ---
+
+    def _status(self, _cmd) -> str:
+        uptime = int(time.time() - self.started_at)
+        handled, failed = self.watermark.snapshot()
+        admin = "paired" if self.store.admin_id() is not None else "unpaired"
+        return (f"NOVA Clip Engine status\n"
+                f"bot: running ({uptime}s uptime, {admin})\n"
+                f"updates handled: {handled}, failed pending: {len(failed)}\n"
+                f"pipeline: capture idle - no Twitch source authorized yet")
+
+    def _storage(self, _cmd) -> str:
+        state = Path(os.environ.get("NOVA_STATE_DIR",
+                                    os.path.expanduser("~/.nova-clip")))
+        total = sum(f.stat().st_size for f in state.rglob("*")
+                    if f.is_file()) if state.exists() else 0
+        return f"State directory usage: {total / 1024:.1f} KiB ({state})"
+
+    def _sources(self, _cmd) -> str:
+        db = Path(os.environ.get("NOVA_STATE_DIR",
+                                 os.path.expanduser("~/.nova-clip"))) / "nova.db"
+        try:
+            conn = sqlite3.connect(str(db))
+            rows = conn.execute(
+                "SELECT username FROM twitch_sources ORDER BY username"
+            ).fetchall()
+            conn.close()
+        except sqlite3.Error:
+            rows = []
+        if not rows:
+            return "No channels registered yet."
+        return "Registered channels:\n" + "\n".join(r[0] for r in rows)
 
     def _admin(self, user_id: int | None) -> int | None:
         admin = self.store.admin_id()

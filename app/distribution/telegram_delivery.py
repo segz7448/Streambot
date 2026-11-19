@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 
 from telegram import Bot
+from telegram.error import NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 
 from ..bot.pairing import PairingStore
 
@@ -19,19 +21,30 @@ class NoAdminError(Exception):
 
 
 async def deliver_clip(token: str, store: PairingStore, video_path: str,
-                       caption: str = "") -> int:
-    """Send one clip to the paired owner. Returns the Telegram message_id."""
+                       caption: str = "", attempts: int = 3) -> int:
+    """Send one clip to the paired owner. Returns the Telegram message_id.
+    Mobile uplinks cut long uploads: generous timeouts and a few retries
+    on transient network errors."""
     admin = store.admin_id()
     if admin is None:
         raise NoAdminError("no paired admin; run /pair first")
-    bot = Bot(token=token)
-    async with bot:
-        with open(video_path, "rb") as fh:
-            message = await bot.send_video(
-                chat_id=admin, video=fh,
-                caption=caption or None,
-                supports_streaming=True)
-    return message.message_id
+    request = HTTPXRequest(connect_timeout=30, read_timeout=120,
+                           write_timeout=180, pool_timeout=30)
+    bot = Bot(token=token, request=request)
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            async with bot:
+                with open(video_path, "rb") as fh:
+                    message = await bot.send_video(
+                        chat_id=admin, video=fh,
+                        caption=caption or None,
+                        supports_streaming=True)
+            return message.message_id
+        except (TimedOut, NetworkError) as exc:
+            last = exc
+            await asyncio.sleep(2 * (attempt + 1))
+    raise last  # type: ignore[misc]
 
 
 def deliver_clip_sync(token_path: str, state_dir: str, video_path: str,

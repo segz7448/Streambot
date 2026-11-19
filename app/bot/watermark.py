@@ -44,6 +44,11 @@ class UpdateWatermark:
         with os.fdopen(fd, "w") as fh:
             json.dump({"handled": handled, "failed": failed}, fh)
 
+    def snapshot(self) -> tuple[int, list[int]]:
+        """(handled high-watermark, failed ids) for status reporting."""
+        with self._lock:
+            return self._read()
+
     def already_handled(self, update_id: int) -> bool:
         with self._lock:
             handled, failed = self._read()

@@ -26,7 +26,15 @@ class RouterTests(unittest.TestCase):
     def test_start_and_help(self):
         router = CommandRouter(admin_ids=[111])
         self.assertIn("WELCOME", router.dispatch("/start", user_id=111))
-        self.assertIn("/youtubeconnect", router.dispatch("/help", user_id=111))
+        # help is generated from registered handlers: every advertised
+        # command must dispatch, and nothing unregistered is advertised
+        help_text = router.dispatch("/help", user_id=111)
+        advertised = [ln.split(" - ")[0][1:] for ln in help_text.splitlines()
+                      if ln.startswith("/")]
+        self.assertEqual(sorted(advertised), sorted(router.handlers))
+        for name in advertised:
+            self.assertNotIn("Unknown command",
+                             router.dispatch("/" + name, user_id=111))
 
     def test_unknown_command(self):
         router = CommandRouter(admin_ids=[111])

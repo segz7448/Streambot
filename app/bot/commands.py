@@ -38,49 +38,33 @@ def parse_command(text: str) -> Optional[Command]:
 
 WELCOME = (
     "WELCOME TO NOVA CLIP ENGINE\n\n"
-    "Choose an operation:\n"
-    "/addsource <twitch username> - register a channel\n"
-    "/sources - list registered channels\n"
-    "/removesource <username> - remove a channel\n"
-    "/checklive <username> - live status\n"
-    "/startclip - start an authorized clipping session\n"
-    "/stopclip - stop a session safely\n"
-    "/sessions - active and previous sessions\n"
-    "/clips - browse generated clips\n"
-    "/clipdetails <id> - clip information\n"
-    "/settings - clipping configuration\n"
-    "/quality - output quality presets\n"
-    "/subtitles - subtitles on/off\n"
-    "/relay - configure authorized destinations\n"
-    "/destinations - list destinations\n"
-    "/stoprelay - stop live distribution\n"
-    "/status - application health\n"
-    "/storage - storage consumption\n"
-    "/logs - recent application errors\n"
-    "/restart - restart workers safely\n"
-    "/youtube - YouTube publishing configuration\n"
-    "/youtubeconnect - begin YouTube OAuth\n"
-    "/youtubestatus - YouTube connection status\n"
-    "/autopublish - automatic publishing on/off\n"
-    "/publishqueue - pending uploads\n"
-    "/publishnow <id> - publish an approved clip\n"
-    "/publishhistory - upload history\n"
-    "/youtubeconfig - titles, descriptions, hashtags, privacy")
-
-HELP_TEXT = WELCOME
+    "Available commands are listed below - only commands that are\n"
+    "actually implemented are advertised.")
 
 
 class CommandRouter:
-    """Dispatches authorized commands to registered handlers."""
+    """Dispatches authorized commands to registered handlers.
+
+    The help text is GENERATED from the registered handlers, so the bot
+    can never advertise a command it would reject.
+    """
 
     def __init__(self, admin_ids: list[int]):
         self.admin_ids = set(admin_ids)
-        self._handlers: dict[str, Callable[[Command], str]] = {}
-        self.register("start", lambda c: WELCOME)
-        self.register("help", lambda c: HELP_TEXT)
+        self.handlers: dict[str, tuple[Callable[[Command], str], str]] = {}
+        self.register("start", lambda c: WELCOME, "welcome message")
+        self.register("help", self._help,
+                      "list the commands this bot actually implements")
 
-    def register(self, name: str, handler: Callable[[Command], str]) -> None:
-        self._handlers[name] = handler
+    def _help(self, _cmd: Command) -> str:
+        lines = [WELCOME, ""]
+        for name in sorted(self.handlers):
+            lines.append(f"/{name} - {self.handlers[name][1]}")
+        return "\n".join(lines)
+
+    def register(self, name: str, handler: Callable[[Command], str],
+                 description: str = "no description") -> None:
+        self.handlers[name] = (handler, description)
 
     def authorize(self, user_id: int) -> None:
         if user_id not in self.admin_ids:
@@ -93,7 +77,7 @@ class CommandRouter:
             return "Send /help to see available commands."
         cmd.user_id = user_id
         self.authorize(user_id)
-        handler = self._handlers.get(cmd.name)
-        if handler is None:
+        entry = self.handlers.get(cmd.name)
+        if entry is None:
             return f"Unknown command /{cmd.name}. Send /help."
-        return handler(cmd)
+        return entry[0](cmd)
