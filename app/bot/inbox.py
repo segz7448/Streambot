@@ -66,14 +66,18 @@ class PreAckInbox:
 
     def _record_overflow(self, update_id: int, user_id: int,
                          text: str) -> None:
+        """Durable refusal record for reconciliation. Bounded to the
+        last 100 refusals; stores ONLY the command name, never raw
+        arguments, so the overflow file cannot accumulate secrets."""
         import json as _json
         path = self.path.with_suffix(".overflow.json")
         try:
             rows = _json.loads(path.read_text())
         except (FileNotFoundError, ValueError):
             rows = []
+        command = (text.lstrip("/").split() or [""])[0][:32]
         rows.append({"update_id": int(update_id), "user_id": int(user_id),
-                     "text": text[:200]})
+                     "command": command})
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
             _json.dump(rows[-100:], fh)
