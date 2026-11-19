@@ -133,27 +133,45 @@ def _journal_read(state_dir: Path) -> dict:
     return locked_read(state_dir / JOURNAL, {})
 
 
-SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries")
+SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries", "publish")
 
 
 JOURNAL_MAX_AGE_S = 7 * 86400
 JOURNAL_CAP = 500
 
 
-def _jkey(update_id: int) -> str:
-    """Typed journal key. Telegram update ids are one operation
-    namespace; future transports get their own prefix instead of
-    sharing a bare numeric id space."""
-    return f"tg:{int(update_id)}"
+def _jkey(command: str, ident: int) -> str:
+    """Typed journal key per OPERATION NAMESPACE: Telegram commands are
+    keyed by update id (tg:), per-clip deliveries by clip id
+    (deliver:). Without the split, clip 7 and Telegram update 7
+    collide on one key and overwrite each other's replay evidence."""
+    if command == "deliver":
+        return f"deliver:{int(ident)}"
+    return f"tg:{int(ident)}"
 
 
 def _journal_migrate(data: dict, now: float) -> dict:
-    """Convert legacy bare-numeric keys to typed keys in place."""
-    for k in [k for k in data if not k.startswith("tg:")]:
+    """Re-key legacy records by their ACTUAL command, never by
+    guessing from the key: bare-numeric keys and the brief tg:<id>
+    format (which wrongly namespaced per-clip deliveries under tg:)
+    both become deliver:<id> when the entry's command is deliver,
+    tg:<id> otherwise."""
+    for k in list(data):
+        if k.startswith("deliver:"):
+            continue
+        entry = data[k]
+        if k.startswith("tg:"):
+            if entry.get("command") == "deliver":
+                entry.setdefault("ts", now)
+                data[f"deliver:{k[3:]}"] = entry
+                del data[k]
+            continue
         if k.isdigit():
             entry = data.pop(k)
             entry.setdefault("ts", now)
-            data[f"tg:{k}"] = entry
+            prefix = ("deliver" if entry.get("command") == "deliver"
+                      else "tg")
+            data[f"{prefix}:{k}"] = entry
     return data
 
 
@@ -181,8 +199,11 @@ def journal_result(state_dir: Path, update_id: int, command: str):
     if not update_id:
         return None
     data = _journal_read(state_dir)
-    entry = (data.get(_jkey(update_id))
-             or data.get(str(update_id)))  # legacy key fallback
+    entry = (data.get(_jkey(command, update_id))
+             or data.get(f"tg:{int(update_id)}")  # brief typed format
+             or data.get(str(update_id)))  # legacy bare-numeric
+    # Fallback hits are still guarded by the command equality check
+    # below, so a cross-namespace hit can never resolve.
     if entry and entry.get("command") == command:
         return entry.get("result")
     return None
@@ -202,9 +223,9 @@ def journal_mark_uncertain(state_dir: Path, update_id: int,
         import time as _t
         now = _t.time()
         _journal_migrate(data, now)
-        data[_jkey(update_id)] = {"command": command,
-                                  "status": "uncertain",
-                                  "text": text, "ts": now}
+        data[_jkey(command, update_id)] = {
+            "command": command, "status": "uncertain",
+            "text": text, "ts": now}
         return data, None
 
     locked_update(state_dir / JOURNAL, {}, apply)
@@ -230,7 +251,7 @@ def journal_uncertain(state_dir: Path) -> list[dict]:
     for k, v in _journal_read(state_dir).items():
         if v.get("status") != "uncertain":
             continue
-        raw = k[3:] if k.startswith("tg:") else k
+        raw = k.split(":", 1)[1] if ":" in k else k
         if raw.isdigit():
             out.append({"update_id": int(raw), **v})
     return out
@@ -245,8 +266,8 @@ def journal_record(state_dir: Path, update_id: int, command: str,
         import time as _t
         now = _t.time()
         _journal_migrate(data, now)
-        data[_jkey(update_id)] = {"command": command, "result": result,
-                                  "ts": now}
+        data[_jkey(command, update_id)] = {
+            "command": command, "result": result, "ts": now}
         _journal_trim(data, now)
         return data, None
 

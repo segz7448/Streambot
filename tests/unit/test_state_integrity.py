@@ -186,3 +186,57 @@ class OrphanTempTests(unittest.TestCase):
                 st.locked_read(path, {})
         self.assertEqual(path.read_text(), "{not json")
         self.assertIn("operator reconciliation required", cm.output[0])
+
+
+class JournalNamespaceTests(unittest.TestCase):
+
+    def test_deliver_and_tg_namespaces_do_not_collide(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+        ops.journal_record(d, 7, "ingest", "pipeline done")
+        ops.journal_record(d, 7, "deliver", "message 55")
+        ops.journal_mark_uncertain(d, 7, "deliver", "/held/7.mp4")
+        data = json.loads((d / ops.JOURNAL).read_text())
+        self.assertIn("tg:7", data)
+        self.assertIn("deliver:7", data)
+        # the later uncertain mark overwrote ONLY the deliver entry
+        self.assertEqual(data["tg:7"]["result"], "pipeline done")
+        self.assertEqual(data["deliver:7"]["status"], "uncertain")
+        self.assertEqual(ops.journal_result(d, 7, "ingest"),
+                         "pipeline done")
+        unc = ops.journal_uncertain(d)
+        self.assertEqual(len(unc), 1)
+        self.assertEqual(unc[0]["command"], "deliver")
+        self.assertEqual(unc[0]["update_id"], 7)
+
+    def test_migration_routes_by_actual_command(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+        (d / ops.JOURNAL).write_text(json.dumps({
+            "7": {"command": "deliver", "result": "message 1"},
+            "8": {"command": "ingest", "result": "ok"},
+            "tg:9": {"command": "deliver", "result": "message 2",
+                     "ts": time.time()}}))
+        ops.journal_record(d, 10, "ingest", "new")
+        data = json.loads((d / ops.JOURNAL).read_text())
+        self.assertIn("deliver:7", data)
+        self.assertIn("tg:8", data)
+        self.assertIn("deliver:9", data)
+        self.assertNotIn("tg:9", data)
+        self.assertNotIn("7", data)
+        self.assertEqual(ops.journal_result(d, 7, "deliver"),
+                         "message 1")
+        self.assertEqual(ops.journal_result(d, 9, "deliver"),
+                         "message 2")
+        self.assertEqual(ops.journal_result(d, 8, "ingest"), "ok")
+        # cross-namespace lookups must NOT resolve
+        self.assertIsNone(ops.journal_result(d, 7, "ingest"))
+
+    def test_deliver_uncertain_survives_trim_with_tg_flood(self):
+        from app.bot import ops
+        d = pathlib.Path(tempfile.mkdtemp())
+        ops.journal_mark_uncertain(d, 3, "deliver", "/held/3.mp4")
+        for i in range(ops.JOURNAL_CAP + 10):
+            ops.journal_record(d, 1000 + i, "ingest", "ok")
+        data = json.loads((d / ops.JOURNAL).read_text())
+        self.assertIn("deliver:3", data)
