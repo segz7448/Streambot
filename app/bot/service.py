@@ -22,9 +22,11 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 
 from ..core.logging import get_logger
 from .commands import CommandRouter
+from .logfilter import install as install_log_filter
 from .pairing import PairingStore
 
 log = get_logger("bot.service")
+install_log_filter()
 
 
 class BotService:
