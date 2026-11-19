@@ -28,6 +28,20 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(sent, [1, 2])
         self.assertEqual(results, {1: 10, 2: 20})
 
+    def test_zombie_child_is_reaped(self):
+        # SIGKILLed child becomes a zombie until reaped; the manager
+        # must not count it as alive (found by on-device probe)
+        import os
+        import signal
+        import time
+        from app.distribution.relay import RestreamManager
+        mgr = RestreamManager(os.path.join(self.tmp, "rt.pids"))
+        pids = mgr.start([["sleep", "30"]])
+        os.kill(pids[0], signal.SIGKILL)
+        time.sleep(0.3)
+        self.assertEqual(mgr.active(), [])
+        self.assertEqual(mgr.stop(), 0)
+
     def test_partial_failure_is_visible(self):
         self.store.add(1, "a"); self.store.add(2, "b")
         def sender(cid, p, c):

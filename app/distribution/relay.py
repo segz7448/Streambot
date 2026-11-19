@@ -60,6 +60,25 @@ class RestreamManager:
 
     def __init__(self, state_file: str):
         self.state_file = Path(state_file)
+        self._procs: dict[int, object] = {}  # pid -> Popen, this session
+
+    def _alive(self, pid: int) -> bool:
+        proc = self._procs.get(pid)
+        if proc is not None:
+            return proc.poll() is None  # reaps zombies of our children
+        # not our child (e.g. after a service restart): reap if we are
+        # the parent, otherwise fall back to existence
+        try:
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped == pid:
+                return False
+        except ChildProcessError:
+            pass
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
 
     def _pids(self) -> list[int]:
         try:
@@ -75,13 +94,7 @@ class RestreamManager:
             fh.write("\n".join(str(p) for p in pids))
 
     def active(self) -> list[int]:
-        alive = []
-        for pid in self._pids():
-            try:
-                os.kill(pid, 0)
-                alive.append(pid)
-            except OSError:
-                pass
+        alive = [pid for pid in self._pids() if self._alive(pid)]
         self._save(alive)
         return alive
 
@@ -91,6 +104,7 @@ class RestreamManager:
         for cmd in cmds:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._procs[proc.pid] = proc
             pids.append(proc.pid)
         self._save(pids)
         log.info("restream started: %d process(es)", len(cmds))
@@ -98,6 +112,7 @@ class RestreamManager:
 
     def stop(self) -> int:
         import signal
+        import time
         stopped = 0
         for pid in self.active():
             try:
@@ -105,6 +120,14 @@ class RestreamManager:
                 stopped += 1
             except OSError:
                 pass
+        deadline = time.time() + 5
+        for pid, proc in list(self._procs.items()):
+            remaining = max(0.0, deadline - time.time())
+            try:
+                proc.wait(timeout=remaining)  # reaps; ffmpeg finalizes
+            except Exception:
+                pass
+        self._procs.clear()
         self._save([])
         log.info("restream stopped: %d process(es)", stopped)
         return stopped
