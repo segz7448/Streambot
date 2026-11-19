@@ -60,7 +60,15 @@ class BotService:
                 await update.message.reply_text("Pairing is already complete.")
             else:
                 code = context.args[0] if context.args else ""
-                if code and self.store.try_pair(code, user.id):
+                if not code:
+                    # Missing argument is not an invalid code: say what
+                    # is actually required so the owner can complete the
+                    # one copy action.
+                    await update.message.reply_text(
+                        "Pairing needs the full command with its code: "
+                        "/pair <code>. Get the current code from the "
+                        "chat where you received it.")
+                elif self.store.try_pair(code, user.id):
                     log.info("owner pairing completed for user_id=%s", user.id)
                     await update.message.reply_text(
                         "Pairing complete. This account is now the NOVA Clip "
