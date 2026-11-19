@@ -31,6 +31,8 @@ from .watermark import UpdateWatermark
 
 log = get_logger("bot.service")
 install_log_filter()
+from .rtmpfilter import install as install_rtmp_filter
+install_rtmp_filter()
 
 
 class BotService:
