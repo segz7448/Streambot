@@ -64,7 +64,14 @@ def _stub_telegram():
     sys.modules["telegram.ext"] = tgext
 
 
-_stub_telegram()
+try:
+    import telegram  # noqa: F401
+    import telegram.ext  # noqa: F401
+except ImportError:
+    # PTB is vendored on-device only; where it is not installed, stub
+    # it. Where it IS installed, never clobber sys.modules: other test
+    # modules in the same process use the real framework.
+    _stub_telegram()
 
 from app.bot.pairing import PairingStore  # noqa: E402
 from app.bot.service import BotService  # noqa: E402

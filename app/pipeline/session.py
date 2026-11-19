@@ -87,6 +87,7 @@ class ClipSession:
             "SELECT id, file_path, duration_seconds FROM clips"
             " WHERE session_id=? AND status='PENDING'",
             (session_id,)).fetchall()
+        held_ids = []
         for clip_id, path, dur in rows:
             try:
                 plan = plan_clip("auto", self.source_label, mem,
@@ -112,6 +113,7 @@ class ClipSession:
                         f"{self.source_label}", "mode A session",
                         confidence="observed")
                     self.clips_finished += 1
+                    held_ids.append(clip_id)
                 else:
                     conn.execute(
                         "UPDATE clips SET status='QC_FAILED',"
@@ -123,6 +125,23 @@ class ClipSession:
                     "UPDATE clips SET status='FAILED' WHERE id=?",
                     (clip_id,))
         conn.commit()
+        if held_ids:
+            # automatic delivery ergonomics: when the owner preference
+            # is on (default), QC-passed clips go to the paired admin
+            # right away instead of waiting for /deliveries flush.
+            # Per-clip journaled in ops.deliver_one_clip; a delivery
+            # failure leaves the clip HELD, never fails the finish.
+            try:
+                from ..bot import ops
+                outcome = ops.auto_deliver_clips(self.state_dir,
+                                                 held_ids)
+                if outcome["enabled"]:
+                    log.info("auto-delivery for session %s: %d sent, "
+                             "%d uncertain", session_id,
+                             outcome["delivered"], outcome["uncertain"])
+            except Exception as exc:
+                log.warning("auto-delivery skipped for session %s: %s",
+                            session_id, exc)
 
     async def _run(self) -> None:
         from ..clipping.auto import AutoClipper

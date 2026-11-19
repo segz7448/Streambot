@@ -5,7 +5,10 @@ phone; app.bot.service handlers delegate here.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+log = logging.getLogger("bot.ops")
 
 from ..core.state import locked_read, locked_update
 from ..distribution.relay import (DestinationStore, Relayer,
@@ -399,74 +402,168 @@ def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
             "uncertain": uncertain}
 
 
+AUTO_DELIVER_DEFAULT = True
+
+
+def auto_deliver_enabled(state_dir: Path) -> bool:
+    """Whether session clips are sent to the paired admin as soon as
+    they pass QC. The owner's stated preference wins; the default
+    matches the product's automatic-delivery goal and can be paused
+    with '/deliveries hold'."""
+    from ..intelligence.memory import Memory
+    row = Memory(str(state_dir / "memory.json")).get(
+        "preference", "auto_deliver")
+    if row is None:
+        return AUTO_DELIVER_DEFAULT
+    return str(row.get("value", "")).lower() not in ("off", "hold",
+                                                     "false", "0")
+
+
+def set_auto_deliver(state_dir: Path, enabled: bool) -> None:
+    from ..intelligence.memory import Memory
+    Memory(str(state_dir / "memory.json")).remember(
+        "preference", "auto_deliver", "on" if enabled else "off",
+        "owner /deliveries toggle", confidence="stated")
+
+
+def deliver_one_clip(state_dir: Path, clip_id: int,
+                     deliver_fn=None) -> str:
+    """Deliver one HELD clip to the paired admin with per-clip
+    durability. Returns one of: delivered, reconciled, uncertain,
+    skipped_uncertain, not_held, missing.
+
+    The send is journaled and committed INDIVIDUALLY: a crash right
+    after keeps the clip delivered. A clip whose send raised is marked
+    UNCERTAIN (it may already have reached Telegram) and is never
+    blind-resent; it stays visible for reconciliation. A clip journaled
+    delivered but still HELD in the DB (crash between send and update)
+    is reconciled to DELIVERED without resending. No exactly-once
+    claim: the uncertain state is the honest answer for a send
+    interrupted mid-flight."""
+    import os as _os
+    import time as _time
+    from ..core.database import connect
+    conn = connect(str(state_dir / "nova.db"))
+    row = conn.execute(
+        "SELECT file_path, duration_seconds, status FROM clips"
+        " WHERE id=?", (clip_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return "missing"
+    path, dur, status = row
+    if status != "HELD":
+        conn.close()
+        return "not_held"
+    if journal_result(state_dir, clip_id, "deliver") is not None:
+        # sent earlier, crash before DB update: reconcile, no resend
+        conn.execute(
+            "UPDATE clips SET status='DELIVERED', delivered_at=?"
+            " WHERE id=?", (_time.time(), clip_id))
+        conn.commit()
+        conn.close()
+        return "reconciled"
+    prior = [e for e in journal_uncertain(state_dir)
+             if e["update_id"] == clip_id
+             and e.get("command") == "deliver"]
+    if prior:
+        conn.close()
+        return "skipped_uncertain"  # may already be sent; never resend
+    if deliver_fn is None:
+        from ..distribution.telegram_delivery import deliver_clip_sync
+        token_path = _os.environ["NOVA_TOKEN_FILE"]
+        deliver_fn = lambda p, caption: deliver_clip_sync(
+            token_path, str(state_dir), p, caption)
+    try:
+        mid = deliver_fn(path, f"NOVA clip #{clip_id} ({dur:.0f}s)")
+        journal_record(state_dir, clip_id, "deliver", f"message {mid}")
+        conn.execute(
+            "UPDATE clips SET status='DELIVERED', delivered_at=?"
+            " WHERE id=?", (_time.time(), clip_id))
+        conn.commit()
+        conn.close()
+        return "delivered"
+    except Exception:
+        journal_mark_uncertain(state_dir, clip_id, "deliver", str(path))
+        conn.close()
+        return "uncertain"
+
+
+def auto_deliver_clips(state_dir: Path, clip_ids,
+                       deliver_fn=None) -> dict:
+    """Auto-deliver freshly finished session clips when the preference
+    is on. Never raises: a delivery problem marks the clip uncertain
+    and leaves it HELD for /deliveries, it must not fail the clip."""
+    if not auto_deliver_enabled(state_dir):
+        return {"enabled": False, "delivered": 0, "uncertain": 0}
+    delivered = uncertain = 0
+    for cid in clip_ids:
+        try:
+            result = deliver_one_clip(state_dir, cid,
+                                      deliver_fn=deliver_fn)
+        except Exception as exc:
+            # setup errors (e.g. token file missing) happen BEFORE any
+            # send: not an uncertain clip, just an undelivered one
+            log.warning("auto-delivery of clip %s failed before send:"
+                        " %s", cid, exc)
+            continue
+        if result in ("delivered", "reconciled"):
+            delivered += 1
+        elif result in ("uncertain", "skipped_uncertain"):
+            uncertain += 1
+    return {"enabled": True, "delivered": delivered,
+            "uncertain": uncertain}
+
+
 def deliveries_reply(state_dir: Path, args: str,
                      deliver_fn=None) -> str:
     """List HELD clips; '/deliveries flush' sends them to the admin on
-    explicit request. Mode C never delivers media by itself.
+    explicit request; '/deliveries auto' and '/deliveries hold' toggle
+    automatic delivery of session clips as they pass QC. Mode C
+    (one-off owner upload) never delivers media by itself.
 
-    Per-clip durability: each clip's send is journaled and committed
-    INDIVIDUALLY - a crash mid-flush keeps clips 1..N delivered. A
-    clip whose send raised is marked UNCERTAIN (it may already have
-    reached Telegram) and is never blind-resent; it stays visible for
-    reconciliation. A clip journaled delivered but still HELD in the
-    DB (crash between send and update) is reconciled to DELIVERED
-    without resending. No exactly-once claim: the uncertain state is
-    the honest answer for a send interrupted mid-flight."""
-    import os as _os
-    import time as _time
+    Per-clip durability lives in deliver_one_clip: journaled per clip,
+    never blind-resent when uncertain."""
+    arg = args.strip().lower()
+    if arg == "auto":
+        set_auto_deliver(state_dir, True)
+        return ("Auto-delivery ON: new session clips are sent to you "
+                "as soon as they pass quality checks.")
+    if arg == "hold":
+        set_auto_deliver(state_dir, False)
+        return ("Auto-delivery OFF: new clips are held until "
+                "'/deliveries flush'.")
     from ..core.database import connect
     conn = connect(str(state_dir / "nova.db"))
     rows = conn.execute(
         "SELECT id, file_path, duration_seconds FROM clips"
         " WHERE status='HELD' ORDER BY id").fetchall()
-    if args.strip() != "flush":
+    conn.close()
+    if arg != "flush":
         uncertain = {e["update_id"] for e in journal_uncertain(state_dir)
                      if e.get("command") == "deliver"}
-        conn.close()
+        state = "on" if auto_deliver_enabled(state_dir) else "off"
         if not rows:
-            return "No held clips. Send a video to make one."
+            return (f"No held clips (auto-delivery {state}). "
+                    "Send a video to make one.")
         lines = []
         for cid, _path, dur in rows:
             note = " (send uncertain - may already be sent)" \
                 if cid in uncertain else ""
             lines.append(f"#{cid} ({dur:.0f}s){note}")
         return ("Held clips: " + ", ".join(lines) +
-                ". /deliveries flush sends them to you.")
+                ". /deliveries flush sends them to you. "
+                f"Auto-delivery: {state}.")
     if not rows:
-        conn.close()
         return "Nothing held."
-    if deliver_fn is None:
-        from ..distribution.telegram_delivery import deliver_clip_sync
-        token_path = _os.environ["NOVA_TOKEN_FILE"]
-        deliver_fn = lambda path, caption: deliver_clip_sync(
-            token_path, str(state_dir), path, caption)
     sent = failed = uncertain = 0
-    for cid, path, dur in rows:
-        if journal_result(state_dir, cid, "deliver") is not None:
-            # sent earlier, crash before DB update: reconcile, no resend
-            conn.execute(
-                "UPDATE clips SET status='DELIVERED', delivered_at=?"
-                " WHERE id=?", (_time.time(), cid))
-            conn.commit()
+    for cid, _path, _dur in rows:
+        result = deliver_one_clip(state_dir, cid, deliver_fn=deliver_fn)
+        if result in ("delivered", "reconciled"):
             sent += 1
-            continue
-        prior = [e for e in journal_uncertain(state_dir)
-                 if e["update_id"] == cid and e.get("command") == "deliver"]
-        if prior:
-            uncertain += 1
-            continue  # may already have been sent; never blind-resend
-        try:
-            mid = deliver_fn(path, f"NOVA clip #{cid} ({dur:.0f}s)")
-            journal_record(state_dir, cid, "deliver", f"message {mid}")
-            conn.execute(
-                "UPDATE clips SET status='DELIVERED', delivered_at=?"
-                " WHERE id=?", (_time.time(), cid))
-            conn.commit()  # per-clip: survives a crash on the next one
-            sent += 1
-        except Exception:
-            journal_mark_uncertain(state_dir, cid, "deliver", str(path))
+        elif result == "uncertain":
             failed += 1
-    conn.close()
+        elif result == "skipped_uncertain":
+            uncertain += 1
     parts = [f"Delivered {sent} clip(s)"]
     if failed:
         parts.append(f"{failed} uncertain (may already be sent; held "

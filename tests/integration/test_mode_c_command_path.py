@@ -70,7 +70,8 @@ class ModeCCommandPathTests(unittest.TestCase):
         self.assertEqual(status, "DELIVERED")
         self.assertIsNotNone(delivered_at)
         self.assertEqual(ops.deliveries_reply(self.dir, ""),
-                         "No held clips. Send a video to make one.")
+                         "No held clips (auto-delivery on). "
+                         "Send a video to make one.")
 
     def test_ingest_journal_replay_guard(self):
         from app.bot import ops

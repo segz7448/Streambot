@@ -383,3 +383,29 @@ FEASIBLE INTELLIGENCE ASSESSMENT at $0 on authorized resources:
   supported authorized execution route exists for that; not promised.
 Capability gap for semantic selection stands and is reported, not
 papered over.
+
+INTAKE WIRING QUALIFICATION (tests/unit/test_media_wiring.py): the
+Telegram-facing path is exercised with the real python-telegram-bot
+framework: a real-shaped video update JSON deserializes through
+telegram.Update, exactly one registered handler (the media handler)
+claims it while commands still route to the command handler, and the
+media path itself runs through production code - admin gate fail-closed
+for strangers, pre-ack inbox drained on success, watermark advancing so
+a replayed update_id never downloads twice, busy flag rejecting
+overlap, pipeline errors marked failed (not handled) so the inbox can
+retry. Only the network boundary (get_file/download) and the media
+pipeline are faked. Remaining unverified without a real owner upload:
+Telegram's servers actually delivering updates to the poller with this
+token and real file bytes through getFile - no local test can prove
+that; the owner's first real video is the qualification.
+
+AUTOMATIC DELIVERY ERGONOMICS: QC-passed session clips are delivered to
+the paired admin as they finish when the auto_deliver preference is on
+(default on, the brief's automatic goal); '/deliveries hold' pauses it,
+'/deliveries auto' resumes, plain '/deliveries' reports the state.
+Delivery reuses the per-clip journaled path (deliver_one_clip): send
+journaled and committed individually, mid-send failure marked UNCERTAIN
+and never blind-resent, journaled-but-HELD reconciled without resend,
+pre-send setup errors leave the clip plainly HELD. Mode C (one-off
+owner upload) still never delivers media by itself. /deliveries flush
+remains for anything held.
