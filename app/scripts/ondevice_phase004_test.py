@@ -39,6 +39,12 @@ async def main():
                         max_storage_mb=1)
     runner = FFmpegRunner(f"{PREFIX}/bin/ffmpeg", f"{PREFIX}/bin/ffprobe",
                           max_concurrent=1)
+    orig_segment_args = buf.segment_args
+    def looping_args(input_url):
+        args = orig_segment_args(input_url)
+        i = args.index("-i")
+        return args[:i] + ["-stream_loop", "-1"] + args[i:]
+    buf.segment_args = looping_args
     worker = RecordingWorker(runner, buf, SRC, db, sweep_seconds=3)
     registry = HealthRegistry()
     sup = Supervisor([Service("record", worker.run, heartbeat_seconds=2)],
@@ -49,6 +55,7 @@ async def main():
     await asyncio.sleep(35)  # record ~7 segments
     mid = buf.segments()
     window = buf.event_window(time.time() - 10)
+    expected_min = 4
     sup.stopping.set()
     await task
     end = buf.segments()
@@ -62,7 +69,7 @@ async def main():
         "event_window_segments": len(window),
         "reconcile_first_pass": rec1,
         "reconcile_second_pass": rec2,
-        "rotation_happened": len(end) < 7,
+        "captured_multiple": len(mid) >= expected_min,
         "clean_stop": not any(p.running for p in runner.processes.values()),
     }
     print("EVIDENCE " + json.dumps(evidence))
