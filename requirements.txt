@@ -1,0 +1,4 @@
+# Core runtime is stdlib-only by design (AGT ships Python 3.12 on bionic with
+# no pip; native wheels do not install there). Optional extras live in
+# pyproject.toml and are vendored/bootstrapped only after on-device
+# verification (see docs/AGT_COMPATIBILITY.md).
