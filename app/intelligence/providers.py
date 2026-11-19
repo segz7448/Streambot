@@ -19,8 +19,16 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+
+
+class QuotaExhausted(Exception):
+    """Provider rejected the request because its quota/rate limit is spent.
+    Never swallowed: pending jobs are queued and the pipeline reports
+    DEGRADED/OFFLINE until quota recovers; there is no silent substitution
+    of another provider."""
 
 
 @dataclass(frozen=True)
@@ -88,8 +96,15 @@ class OpenAICompatibleProvider(IntelligenceProvider):
             self.base_url + "/chat/completions", data=body,
             headers={"Authorization": "Bearer " + key,
                      "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            payload = json.loads(resp.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                payload = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                raise QuotaExhausted(
+                    f"remote provider quota exhausted (HTTP 429, model "
+                    f"{self.model})") from None
+            raise
         return payload["choices"][0]["message"]["content"]
 
     def score_moments(self, duration_seconds, audio_spikes,
