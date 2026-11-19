@@ -24,8 +24,10 @@ class FakeBuffer:
 
 def _seed_event(db, detected_at, kind, conf):
     conn = connect(db)
+    conn.execute("INSERT INTO twitch_sources (id, username, created_at,"
+                 " updated_at) VALUES (1, 'chan', 0, 0)")
     conn.execute("INSERT INTO stream_sessions (id, source_id, started_at,"
-                 " status) VALUES (1, NULL, 0, 'RECORDING')")
+                 " state) VALUES (1, 1, 0, 'RECORDING')")
     conn.execute("INSERT INTO candidate_events"
                  " (session_id, detected_at, kind, confidence)"
                  " VALUES (1,?,?,?)", (detected_at, kind, conf))
@@ -37,7 +39,9 @@ class AutoClipTests(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()
         self.db = str(Path(self.td.name) / "t.db")
-        migrate(self.db)
+        conn = connect(self.db)
+        migrate(conn)
+        conn.close()
         _seed_event(self.db, 100.0, "audio_spike", 0.9)
 
     def tearDown(self):

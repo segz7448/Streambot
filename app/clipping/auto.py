@@ -51,7 +51,12 @@ class AutoClipper:
         if not events:
             conn.close()
             return 0
-        spikes = [(e["at"], e["conf"]) for e in events
+        # Unit bridge: candidate_events.confidence is normalized 0..1;
+        # HeuristicProvider expects audio loudness in LUFS (its mapping
+        # (lufs + 60) / 60 recovers the normalized value). Convert here
+        # so a 0.1-confidence event scores 0.1, not ~1.0. Scene
+        # confidences pass through unchanged (provider uses 0.5 * score).
+        spikes = [(e["at"], e["conf"] * 60 - 60) for e in events
                   if e["kind"] == "audio_spike"]
         scenes = [(e["at"], e["conf"]) for e in events
                   if e["kind"] == "scene_change"]
