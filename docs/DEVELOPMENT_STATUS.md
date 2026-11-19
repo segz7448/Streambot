@@ -412,8 +412,12 @@ leave the clip plainly HELD. Mode C delivery runs off the event loop
 (the sender is synchronous). The mode C reply reports the outcome:
 sent automatically, send uncertain (stays held), or held for manual
 flush. /deliveries flush remains for anything held.
-Anti-fixture-leak posture: auto-delivery fires only for clips recorded
-in the live state dir; verification fixtures run in isolated state
-dirs, and the service's single-instance lock prevents any fixture
-runner from sharing the live one. Generated fixture output can never
-reach the owner's Telegram through this path.
+Anti-fixture-leak posture: auto-delivery fires only for clips that
+finished in that run (session finish hook, mode C ingest of the clip
+just created); there is no startup sweep, so a default-ON preference
+never flushes pre-existing HELD clips. Verification fixtures run in
+isolated state dirs with fake senders; that isolation is the guard,
+NOT the service's single-instance lock - a direct-module harness
+bypasses the flock and must never be pointed at the live state dir
+with a real sender. The sender is owner-scoped by construction (only
+the paired admin chat).
