@@ -53,6 +53,40 @@ output frame (caption wraps in three readable lines, spaces intact,
 bottom safe area) rendered through the real edit_clip module on-device.
 Caveat: still-frame proof of rendering, not subtitle sync.
 
+## Candidate dedupe/merge defect fix + device retest (2026-11-19)
+
+Open product defect from the loopback run (one burst -> 3 overlapping
+clips) fixed across main@d58ae7f + e55203d + 916d43c, then retested
+on-device:
+
+- Episode merging in audio.loudness_spikes: one sustained loud episode
+  yields ONE spike (hysteresis return-to-baseline; timestamp at first
+  rising edge, confidence tracks episode peak).
+- Persistent cross-segment continuity: detection_state.episode_active
+  carries the open episode across segment files.
+- ebur128 per-segment cold-start (below-floor momentary for the first
+  ~0.3s of each new segment file) no longer ends a carried episode:
+  only silence sustained >= 1.5s does. This failure mode was found by
+  the on-device retest itself; the unit fixture did not model it.
+- Cross-kind same-moment merge in AutoClipper (5s window, higher score
+  wins, loser marked MERGED - visible, never silently dropped).
+- Retrospective path assessed: selects the single best candidate per
+  request, so no duplicate-clip exposure; inherits episode merging.
+
+Device retest (isolated clone at 916d43c on the owner's AGT phone,
+production deployment untouched at f234a81): 6x 6s segments, static
+video + python-generated tone, burst A spanning the seg1->seg2 boundary
+plus separated burst B in seg4. Result PASS: exactly 2 audio_spike
+candidates (A once, B once, 16s apart), episode flag closed, 2 clips
+extracted (CLIPPED x2, no MERGED/EXPIRED), both ffprobe-verified
+h264+AAC with original audio (19.9s / 15.9s).
+
+Explicit remaining limitations (not claimed solved): episode_active
+carries over a reconnect gap and could suppress a genuinely new burst
+right after a restart (needs a recovery reset); the cross-kind merge
+covers only the pending batch, not an event clipped in a prior pass;
+fixture is synthetic tone + static video, not real gameplay.
+
 ## Synthetic loopback reconnect + downstream clip evidence (2026-11-19)
 
 Scope: a 168s synthetic-feed mechanism test, NOT sustained-service
@@ -85,8 +119,8 @@ mechanism evidence over a finite synthetic loopback feed only.)
 - Known artifacts, labeled: finite-feed re-GET repeats content from t=0
   (documented; live feeds resume at the edge). One 4s burst produced 3
   overlapping clips (spikes at 0.4/2.4/4.5s) — the clipper does not
-  dedupe nearby candidates. OPEN PRODUCT DEFECT (dedupe/merge of nearby
-  candidates), being fixed with tests; not a reconnect defect.
+  dedupe nearby candidates. OPEN PRODUCT DEFECT, since fixed (see the
+  dedupe/merge entry above); not a reconnect defect.
 
 ## Google OAuth client provisioning (2026-11-19)
 
