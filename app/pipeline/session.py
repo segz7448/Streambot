@@ -227,6 +227,9 @@ def recover_interrupted_sessions(state_dir: Path) -> int:
     if not db.exists():
         return 0
     conn = connect(str(db))
+    # boot recovery can run before anything else on an old state dir
+    # whose schema predates stream_sessions; migrate is idempotent
+    migrate(conn)
     cur = conn.execute(
         "UPDATE stream_sessions SET state='INTERRUPTED', ended_at=?"
         " WHERE state='RECORDING'", (time.time(),))
