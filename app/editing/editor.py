@@ -7,9 +7,11 @@ filters verified present in the on-device ffmpeg 9.0.2 build.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
+from ..subtitles.fonts import ensure_fontconfig_env
 from .presets import OutputPreset
 
 
@@ -59,10 +61,17 @@ def edit_args(ffmpeg: str, src: str, out: str, preset: OutputPreset,
 
 
 def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
-              subtitle_path: str | None = None, focus_x: float = 0.5) -> Path:
+              subtitle_path: str | None = None, focus_x: float = 0.5,
+              runtime_dir: str = ".nova-runtime") -> Path:
+    env = dict(os.environ)
+    if subtitle_path:
+        # relocated prefixes ship a fontconfig that points at paths which
+        # no longer exist; without a corrected config libass renders with
+        # broken metrics (device-verified on agt-3f177cf6)
+        env.update(ensure_fontconfig_env(ffmpeg, runtime_dir))
     proc = subprocess.run(
         edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x),
-        capture_output=True, text=True, timeout=600)
+        capture_output=True, text=True, timeout=600, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"edit failed rc={proc.returncode}: "
                            f"{proc.stderr[-300:]!r}")

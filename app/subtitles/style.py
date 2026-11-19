@@ -26,12 +26,17 @@ def _ts(seconds: float) -> str:
 
 
 def default_ass(preset: OutputPreset, cues: list[Cue],
-                font: str = "Sans") -> str:
+                font: str = "DejaVu Sans") -> str:
     """Render an ASS document sized for the actual output frame.
 
     Font ~3.3% of frame height, bottom margin ~6% (clear of platform UI
     safe areas), white text with a 2px outline for legibility on any
     background, bottom-centered, narrow side margins to force early wrap.
+
+    The default font names DejaVu Sans explicitly: it ships with the
+    Termux ffmpeg dependency tree on the device, and a bare "Sans" alias
+    fails to resolve when fontconfig is misconfigured (relocated prefix),
+    which made libass render with broken metrics on-device.
     """
     w, h = preset.width, preset.height
     fontsize = max(28, round(h * 0.033))
