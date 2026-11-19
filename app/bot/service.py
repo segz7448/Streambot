@@ -324,11 +324,13 @@ class BotService:
                 from . import media as bot_media
                 reply = await bot_media.ingest_media(
                     update, context.bot, self._state_dir())
+                if reply:
+                    await message.reply_text(reply)
+                self.inbox.remove(update.update_id)
             finally:
+                # covers ingest AND the reply send: an exception in
+                # either must never strand the busy flag
                 self._media_busy = False
-            if reply:
-                await message.reply_text(reply)
-            self.inbox.remove(update.update_id)
         except Exception:
             self.watermark.mark_failed(update.update_id)
             from . import commands_full as cf

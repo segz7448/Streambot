@@ -85,6 +85,8 @@ def _summarize(result: dict, delivery: dict | None = None) -> str:
                 and delivery.get("delivered"))
     uncertain = bool(delivery and delivery.get("enabled")
                      and delivery.get("uncertain"))
+    unavailable = bool(delivery and delivery.get("enabled")
+                       and delivery.get("unavailable"))
     status = result.get("status")
     if status == "no_candidates":
         return ("Processed your video: no gameplay moment detected "
@@ -117,6 +119,10 @@ def _summarize(result: dict, delivery: dict | None = None) -> str:
         lines.append("Automatic delivery may have failed (send "
                      "uncertain) - the clip stays held; /deliveries "
                      "shows it.")
+    elif unavailable:
+        lines.append("Delivery unavailable right now (nothing was "
+                     "sent) - the clip is held; /deliveries flush "
+                     "sends it later.")
     else:
         lines.append("/deliveries flush sends it to you.")
     return "\n".join(lines)
@@ -131,11 +137,21 @@ async def ingest_media(update, bot, state_dir: Path,
     delivered to the paired admin right away through the same per-clip
     journaled path as /deliveries flush; otherwise it stays HELD for
     manual flush."""
+    import re
     from . import ops
     state_dir = Path(state_dir)
     uid = int(update.update_id)
     cached = ops.journal_result(state_dir, uid, "ingest")
     if cached is not None:
+        # Replay of an update whose processing already committed. NEVER
+        # reprocess: a bound clip resumes only its own journaled
+        # delivery, which is idempotent per clip (deliver journal +
+        # HELD status), so a crash after delivery cannot resend and a
+        # crash before delivery delivers exactly once here.
+        m = re.search(r"\[clip:(\d+)\]", cached)
+        if m:
+            await asyncio.to_thread(ops.auto_deliver_clips, state_dir,
+                                    [int(m.group(1))], deliver_fn)
         return "Already processed (replay guard): " + cached
     message = update.message
     attachment = getattr(message, "video", None) or getattr(
@@ -200,8 +216,16 @@ async def ingest_media(update, bot, state_dir: Path,
         Memory(str(state_dir / "memory.json")),
         f"owner-upload:{uid}", audio_fn=_audio, scene_fn=_scene,
         runtime_dir=str(state_dir / "runtime"))
-    delivery = None
     clip_id = result.get("clip_id")
+    marker = f" [clip:{clip_id}]" if clip_id is not None else ""
+    # Persist the processing outcome AND the clip binding BEFORE any
+    # delivery attempt. This closes the crash window where a delivered
+    # clip had no ingest journal record: after any restart the replay
+    # path above recovers the clip id from this entry and reconciles
+    # through the per-clip deliver journal instead of reprocessing.
+    ops.journal_record(state_dir, uid, "ingest",
+                       _summarize(result) + marker)
+    delivery = None
     if result.get("status") == "held" and clip_id is not None:
         # automatic delivery ergonomics, same owner preference as
         # session clips. Off the event loop: the default sender is
@@ -209,7 +233,7 @@ async def ingest_media(update, bot, state_dir: Path,
         delivery = await asyncio.to_thread(
             ops.auto_deliver_clips, state_dir, [clip_id], deliver_fn)
     text = _summarize(result, delivery)
-    ops.journal_record(state_dir, uid, "ingest", text)
+    ops.journal_record(state_dir, uid, "ingest", text + marker)
     return text
 
 

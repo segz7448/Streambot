@@ -421,3 +421,20 @@ NOT the service's single-instance lock - a direct-module harness
 bypasses the flock and must never be pointed at the live state dir
 with a real sender. The sender is owner-scoped by construction (only
 the paired admin chat).
+
+REVIEW HARDENING (reviewer pass on the auto-delivery candidate):
+- Mode C ingest now journals the processing outcome AND the clip
+  binding ([clip:N] marker) BEFORE any delivery attempt, then rewrites
+  the entry with the delivery outcome after. A crash anywhere after
+  that first write replays into reconciliation, never reprocessing:
+  the replay guard recovers the clip id and resumes only the per-clip
+  journaled delivery (idempotent), so a crash after delivery cannot
+  resend and a crash before delivery delivers exactly once. Tests pin
+  the ordering (journal carries the binding at the moment of send) and
+  both post-crash states.
+- Pre-send failures are classified UNAVAILABLE (no token configured,
+  no paired admin): the clip stays plainly HELD, never marked
+  uncertain, because nothing can have reached Telegram. Manual flush
+  reports them in clean copy instead of crashing mid-flush.
+- _media busy flag cleanup now covers the reply send as well as the
+  ingest, so no exception ordering can strand the flag.

@@ -121,7 +121,7 @@ class AutoDeliverClipsTests(unittest.TestCase):
         out = ops.auto_deliver_clips(
             d, ids, deliver_fn=lambda p, c: sent.append(p) or len(sent))
         self.assertEqual(out, {"enabled": True, "delivered": 3,
-                               "uncertain": 0})
+                               "uncertain": 0, "unavailable": 0})
         self.assertEqual(len(sent), 3)
         for cid in ids:
             self.assertEqual(_status(d, cid), "DELIVERED")
@@ -160,25 +160,28 @@ class AutoDeliverClipsTests(unittest.TestCase):
     def test_setup_error_before_send_is_not_marked_uncertain(self):
         # no deliver_fn and no token env: the failure happens while
         # CONSTRUCTING the sender, before anything could have been
-        # sent, so the clip must stay plainly HELD, never uncertain
+        # sent: classified "unavailable", clip plainly HELD, never
+        # uncertain
         import os
         d = pathlib.Path(tempfile.mkdtemp())
         (cid,) = _db_with_held(d, 1)
         saved = os.environ.pop("NOVA_TOKEN_FILE", None)
         try:
-            # PTB installed: KeyError on the token env; not installed:
-            # ImportError constructing the sender - both pre-send
-            with self.assertRaises((KeyError, ImportError)):
-                ops.deliver_one_clip(d, cid)
+            self.assertEqual(ops.deliver_one_clip(d, cid),
+                             "unavailable")
             self.assertEqual(_status(d, cid), "HELD")
             self.assertEqual(
                 [e for e in ops.journal_uncertain(d)
                  if e.get("command") == "deliver"], [])
-            # and auto_deliver_clips absorbs the setup error per clip
+            # and auto_deliver_clips counts it separately
             out = ops.auto_deliver_clips(d, [cid])
             self.assertEqual(out, {"enabled": True, "delivered": 0,
-                                   "uncertain": 0})
+                                   "uncertain": 0, "unavailable": 1})
             self.assertEqual(_status(d, cid), "HELD")
+            # manual flush reports it cleanly instead of crashing
+            text = ops.deliveries_reply(d, "flush")
+            self.assertIn("delivery unavailable", text.lower())
+            self.assertIn("Delivered 0", text)
         finally:
             if saved is not None:
                 os.environ["NOVA_TOKEN_FILE"] = saved
@@ -297,3 +300,125 @@ class ModeCAutoDeliveryTests(unittest.TestCase):
         status = conn.execute("SELECT status FROM clips").fetchone()[0]
         conn.close()
         self.assertEqual(status, "HELD")
+
+
+class CrashWindowReconciliationTests(unittest.TestCase):
+    """The reviewer-flagged window: a crash between delivery and the
+    ingest journal must never reprocess or resend on replay. The ingest
+    journal (with the clip binding) is now written BEFORE delivery;
+    these tests pin the ordering and both post-crash states."""
+
+    def _update(self, uid):
+        import types
+        video = types.SimpleNamespace(file_id="f", mime_type="video/mp4",
+                                      file_size=16)
+        msg = types.SimpleNamespace(video=video, document=None)
+        return types.SimpleNamespace(update_id=uid, message=msg)
+
+    class _F:
+        async def download_to_drive(self, dest):
+            pathlib.Path(dest).write_bytes(b"fake-video-bytes")
+
+    class _B:
+        async def get_file(self, fid):
+            return CrashWindowReconciliationTests._F()
+
+    def setUp(self):
+        from app.clipping import retrospective
+        self.retro = retrospective
+        self._orig_validate = retrospective.validate_recording
+        self._orig_process = retrospective.process_recording
+        retrospective.validate_recording = lambda *a, **k: {
+            "duration": 5.0, "width": 640, "height": 360}
+        self.process_calls = []
+
+    def tearDown(self):
+        self.retro.validate_recording = self._orig_validate
+        self.retro.process_recording = self._orig_process
+
+    def _fake_process(self, d):
+        def process(ff, fp, src, work, db_path, memory, source_label,
+                    **kw):
+            self.process_calls.append(src)
+            ids = _db_with_held(d, 1)
+            return {"status": "held", "clip_id": ids[0],
+                    "event_kind": "audio_spike", "event_confidence": 0.9,
+                    "clip_duration_seconds": 5.0,
+                    "plan": {"preset": "vertical", "title": "T",
+                             "tags": [], "watermark": "",
+                             "reasons": ["spike"]}}
+        return process
+
+    def test_ingest_journal_committed_before_delivery(self):
+        import asyncio
+        from app.bot import media
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.retro.process_recording = self._fake_process(d)
+        seen = {}
+
+        def deliver(p, c):
+            # at the moment of send, the ingest journal must ALREADY
+            # carry the clip binding
+            seen["journal"] = ops.journal_result(d, 930001, "ingest")
+            return 77
+
+        asyncio.run(media.ingest_media(self._update(930001), self._B(),
+                                       d, deliver_fn=deliver))
+        self.assertIsNotNone(seen["journal"])
+        self.assertIn("[clip:1]", seen["journal"])
+
+    def test_crash_before_delivery_replay_delivers_once_no_reprocess(
+            self):
+        import asyncio
+        from app.bot import media
+        d = pathlib.Path(tempfile.mkdtemp())
+        (cid,) = _db_with_held(d, 1)
+        # state as if: processing committed, ingest journal written,
+        # crash before the delivery attempt
+        ops.journal_record(d, 930002, "ingest",
+                           "Clip ready (HELD - not delivered). [clip:1]")
+        self.retro.process_recording = self._fake_process(d)
+        sent = []
+        out = asyncio.run(media.ingest_media(
+            self._update(930002), self._B(), d,
+            deliver_fn=lambda p, c: sent.append(p) or 88))
+        self.assertEqual(self.process_calls, [])  # never reprocessed
+        self.assertEqual(sent, ["/x0.mp4"])       # delivered once
+        self.assertEqual(_status(d, cid), "DELIVERED")
+        self.assertIn("Already processed", out)
+
+    def test_crash_after_delivery_replay_never_resends(self):
+        import asyncio
+        from app.bot import media
+        d = pathlib.Path(tempfile.mkdtemp())
+        (cid,) = _db_with_held(d, 1)
+        # state as if: delivery succeeded and was journaled, crash
+        # before the DB flip: the classic ambiguous window
+        ops.journal_record(d, 930003, "ingest",
+                           "Clip ready and sent to you. [clip:1]")
+        ops.journal_record(d, cid, "deliver", "message 55")
+        self.retro.process_recording = self._fake_process(d)
+        sent = []
+        out = asyncio.run(media.ingest_media(
+            self._update(930003), self._B(), d,
+            deliver_fn=lambda p, c: sent.append(p) or 99))
+        self.assertEqual(self.process_calls, [])
+        self.assertEqual(sent, [])  # no resend
+        self.assertEqual(_status(d, cid), "DELIVERED")  # reconciled
+        self.assertIn("Already processed", out)
+
+    def test_replay_without_clip_marker_is_inert(self):
+        import asyncio
+        from app.bot import media
+        d = pathlib.Path(tempfile.mkdtemp())
+        ops.journal_record(d, 930004, "ingest",
+                           "Processed your video: no gameplay moment "
+                           "detected.")
+        self.retro.process_recording = self._fake_process(d)
+        sent = []
+        out = asyncio.run(media.ingest_media(
+            self._update(930004), self._B(), d,
+            deliver_fn=lambda p, c: sent.append(p) or 1))
+        self.assertEqual(self.process_calls, [])
+        self.assertEqual(sent, [])
+        self.assertIn("Already processed", out)

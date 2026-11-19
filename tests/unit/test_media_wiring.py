@@ -28,7 +28,7 @@ from app.bot.pairing import PairingStore
 if HAS_PTB:
     from app.bot.service import BotService
 
-ADMIN_ID = 7953796419
+ADMIN_ID = 111000111  # obviously fake; never a real user id
 STRANGER_ID = 12345
 
 # Shape of a real Bot API message carrying a video (fields as returned
@@ -39,9 +39,9 @@ VIDEO_UPDATE_JSON = {
         "message_id": 77,
         "date": 1763491200,
         "chat": {"id": ADMIN_ID, "type": "private",
-                 "first_name": "Z"},
+                 "first_name": "T"},
         "from": {"id": ADMIN_ID, "is_bot": False,
-                 "first_name": "Z"},
+                 "first_name": "T"},
         "video": {
             "file_id": "BAADBQAD_real_file_id",
             "file_unique_id": "AQAD_real",
@@ -109,7 +109,7 @@ class RegisteredFilterTests(unittest.TestCase):
                 "message_id": 78, "date": 1763491200,
                 "chat": {"id": ADMIN_ID, "type": "private"},
                 "from": {"id": ADMIN_ID, "is_bot": False,
-                         "first_name": "Z"},
+                         "first_name": "T"},
                 "text": "/status",
                 "entities": [{"type": "bot_command",
                               "offset": 0, "length": 7}],

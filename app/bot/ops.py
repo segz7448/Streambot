@@ -430,7 +430,11 @@ def deliver_one_clip(state_dir: Path, clip_id: int,
                      deliver_fn=None) -> str:
     """Deliver one HELD clip to the paired admin with per-clip
     durability. Returns one of: delivered, reconciled, uncertain,
-    skipped_uncertain, not_held, missing.
+    skipped_uncertain, unavailable, not_held, missing.
+
+    unavailable = the send could not even be attempted (no token
+    configured, no paired admin): the clip stays plainly HELD, NOT
+    marked uncertain, because nothing can have reached Telegram.
 
     The send is journaled and committed INDIVIDUALLY: a crash right
     after keeps the clip delivered. A clip whose send raised is marked
@@ -469,8 +473,15 @@ def deliver_one_clip(state_dir: Path, clip_id: int,
         conn.close()
         return "skipped_uncertain"  # may already be sent; never resend
     if deliver_fn is None:
-        from ..distribution.telegram_delivery import deliver_clip_sync
-        token_path = _os.environ["NOVA_TOKEN_FILE"]
+        try:
+            from ..distribution.telegram_delivery import (
+                deliver_clip_sync)
+            token_path = _os.environ["NOVA_TOKEN_FILE"]
+        except (KeyError, ImportError) as exc:
+            log.warning("delivery of clip %s unavailable before send:"
+                        " %s", clip_id, exc)
+            conn.close()
+            return "unavailable"
         deliver_fn = lambda p, caption: deliver_clip_sync(
             token_path, str(state_dir), p, caption)
     try:
@@ -482,7 +493,18 @@ def deliver_one_clip(state_dir: Path, clip_id: int,
         conn.commit()
         conn.close()
         return "delivered"
-    except Exception:
+    except Exception as exc:
+        try:
+            from ..distribution.telegram_delivery import NoAdminError
+            no_admin = isinstance(exc, NoAdminError)
+        except ImportError:
+            no_admin = False
+        if no_admin:
+            # raised before any send: nothing can have reached Telegram
+            log.warning("delivery of clip %s unavailable: %s",
+                        clip_id, exc)
+            conn.close()
+            return "unavailable"
         journal_mark_uncertain(state_dir, clip_id, "deliver", str(path))
         conn.close()
         return "uncertain"
@@ -494,24 +516,26 @@ def auto_deliver_clips(state_dir: Path, clip_ids,
     is on. Never raises: a delivery problem marks the clip uncertain
     and leaves it HELD for /deliveries, it must not fail the clip."""
     if not auto_deliver_enabled(state_dir):
-        return {"enabled": False, "delivered": 0, "uncertain": 0}
-    delivered = uncertain = 0
+        return {"enabled": False, "delivered": 0, "uncertain": 0,
+                "unavailable": 0}
+    delivered = uncertain = unavailable = 0
     for cid in clip_ids:
         try:
             result = deliver_one_clip(state_dir, cid,
                                       deliver_fn=deliver_fn)
         except Exception as exc:
-            # setup errors (e.g. token file missing) happen BEFORE any
-            # send: not an uncertain clip, just an undelivered one
             log.warning("auto-delivery of clip %s failed before send:"
                         " %s", cid, exc)
+            unavailable += 1
             continue
         if result in ("delivered", "reconciled"):
             delivered += 1
         elif result in ("uncertain", "skipped_uncertain"):
             uncertain += 1
+        elif result == "unavailable":
+            unavailable += 1
     return {"enabled": True, "delivered": delivered,
-            "uncertain": uncertain}
+            "uncertain": uncertain, "unavailable": unavailable}
 
 
 def deliveries_reply(state_dir: Path, args: str,
@@ -555,7 +579,7 @@ def deliveries_reply(state_dir: Path, args: str,
                 f"Auto-delivery: {state}.")
     if not rows:
         return "Nothing held."
-    sent = failed = uncertain = 0
+    sent = failed = uncertain = unavailable = 0
     for cid, _path, _dur in rows:
         result = deliver_one_clip(state_dir, cid, deliver_fn=deliver_fn)
         if result in ("delivered", "reconciled"):
@@ -564,12 +588,18 @@ def deliveries_reply(state_dir: Path, args: str,
             failed += 1
         elif result == "skipped_uncertain":
             uncertain += 1
+        elif result == "unavailable":
+            unavailable += 1
     parts = [f"Delivered {sent} clip(s)"]
     if failed:
         parts.append(f"{failed} uncertain (may already be sent; held "
                      "for reconciliation, NOT resent)")
     if uncertain:
         parts.append(f"{uncertain} previously uncertain, skipped")
+    if unavailable:
+        parts.append(f"{unavailable} not sent (delivery unavailable: "
+                     "bot token or pairing missing; nothing was sent, "
+                     "clips stay held)")
     return "; ".join(parts) + "."
 
 
