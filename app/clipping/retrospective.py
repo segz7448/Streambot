@@ -239,6 +239,7 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
         f"{duration:.0f}s {preset.name} clip from {source_label} "
         f"({best['kind']})", "mode C pipeline", confidence="observed")
     result["status"] = "held"
-    result["detail"] = ("clip passed QC and is recorded as HELD - no "
-                        "overnight delivery; /deliveries flush sends it")
+    result["detail"] = ("clip passed QC and is recorded as HELD; "
+                        "delivery follows the owner's auto_deliver "
+                        "preference (/deliveries)")
     return result

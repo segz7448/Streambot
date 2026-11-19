@@ -518,8 +518,8 @@ def deliveries_reply(state_dir: Path, args: str,
                      deliver_fn=None) -> str:
     """List HELD clips; '/deliveries flush' sends them to the admin on
     explicit request; '/deliveries auto' and '/deliveries hold' toggle
-    automatic delivery of session clips as they pass QC. Mode C
-    (one-off owner upload) never delivers media by itself.
+    automatic delivery (session clips as they pass QC, and mode C
+    owner uploads as they finish - the same owner preference).
 
     Per-clip durability lives in deliver_one_clip: journaled per clip,
     never blind-resent when uncertain."""

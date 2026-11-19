@@ -207,3 +207,93 @@ class FlushRefactorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModeCAutoDeliveryTests(unittest.TestCase):
+    """Owner-upload (mode C) ingest delivers the clip it just made when
+    the preference is on, through the same journaled path."""
+
+    def setUp(self):
+        from app.clipping import retrospective
+        self.retro = retrospective
+        self._orig_validate = retrospective.validate_recording
+        self._orig_process = retrospective.process_recording
+        retrospective.validate_recording = lambda *a, **k: {
+            "duration": 5.0, "width": 640, "height": 360}
+
+    def tearDown(self):
+        self.retro.validate_recording = self._orig_validate
+        self.retro.process_recording = self._orig_process
+
+    def _ingest(self, d, deliver_fn):
+        import asyncio
+        import types
+        from app.bot import media
+        video = types.SimpleNamespace(file_id="f", mime_type="video/mp4",
+                                      file_size=16)
+        msg = types.SimpleNamespace(video=video, document=None)
+        upd = types.SimpleNamespace(update_id=920001, message=msg)
+
+        class _F:
+            async def download_to_drive(self, dest):
+                pathlib.Path(dest).write_bytes(b"fake-video-bytes")
+
+        class _B:
+            async def get_file(self, fid):
+                return _F()
+
+        return asyncio.run(media.ingest_media(upd, _B(), d,
+                                              deliver_fn=deliver_fn))
+
+    def _fake_process(self, d):
+        def process(ff, fp, src, work, db_path, memory, source_label,
+                    **kw):
+            ids = _db_with_held(d, 1)
+            return {"status": "held", "clip_id": ids[0],
+                    "event_kind": "audio_spike", "event_confidence": 0.9,
+                    "clip_duration_seconds": 5.0,
+                    "plan": {"preset": "vertical", "title": "T",
+                             "tags": [], "watermark": "",
+                             "reasons": ["spike"]}}
+        return process
+
+    def test_upload_clip_delivered_when_preference_on(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.retro.process_recording = self._fake_process(d)
+        sent = []
+        out = self._ingest(d, lambda p, c: sent.append(p) or 11)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("sent to you", out.lower())
+        conn = connect(str(d / "nova.db"))
+        status = conn.execute("SELECT status FROM clips").fetchone()[0]
+        conn.close()
+        self.assertEqual(status, "DELIVERED")
+        # journaled per clip
+        self.assertEqual(ops.journal_result(d, 1, "deliver"),
+                         "message 11")
+
+    def test_upload_clip_held_when_preference_off(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        ops.set_auto_deliver(d, False)
+        self.retro.process_recording = self._fake_process(d)
+        sent = []
+        out = self._ingest(d, lambda p, c: sent.append(p) or 11)
+        self.assertEqual(sent, [])
+        self.assertIn("/deliveries flush", out)
+        conn = connect(str(d / "nova.db"))
+        status = conn.execute("SELECT status FROM clips").fetchone()[0]
+        conn.close()
+        self.assertEqual(status, "HELD")
+
+    def test_upload_delivery_failure_reported_uncertain(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.retro.process_recording = self._fake_process(d)
+
+        def boom(p, c):
+            raise RuntimeError("network died mid-send")
+        out = self._ingest(d, boom)
+        self.assertIn("uncertain", out.lower())
+        conn = connect(str(d / "nova.db"))
+        status = conn.execute("SELECT status FROM clips").fetchone()[0]
+        conn.close()
+        self.assertEqual(status, "HELD")

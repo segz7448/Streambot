@@ -80,7 +80,11 @@ def cleanup_uploads(uploads: Path, now: float | None = None) -> int:
     return removed
 
 
-def _summarize(result: dict) -> str:
+def _summarize(result: dict, delivery: dict | None = None) -> str:
+    sent = bool(delivery and delivery.get("enabled")
+                and delivery.get("delivered"))
+    uncertain = bool(delivery and delivery.get("enabled")
+                     and delivery.get("uncertain"))
     status = result.get("status")
     if status == "no_candidates":
         return ("Processed your video: no gameplay moment detected "
@@ -94,7 +98,8 @@ def _summarize(result: dict) -> str:
     plan = result.get("plan", {})
     reasons = plan.get("reasons", [])
     lines = [
-        "Clip ready (HELD - not delivered).",
+        "Clip ready and sent to you." if sent
+        else "Clip ready (HELD - not delivered).",
         f"moment: {result.get('event_kind')} "
         f"(confidence {result.get('event_confidence')})",
         f"duration: {result.get('clip_duration_seconds')}s "
@@ -106,15 +111,26 @@ def _summarize(result: dict) -> str:
         lines.append(f"watermark: {plan['watermark']}")
     if reasons:
         lines.append("why: " + reasons[0])
-    lines.append("/deliveries flush sends it to you.")
+    if sent:
+        lines.append("Delivered automatically.")
+    elif uncertain:
+        lines.append("Automatic delivery may have failed (send "
+                     "uncertain) - the clip stays held; /deliveries "
+                     "shows it.")
+    else:
+        lines.append("/deliveries flush sends it to you.")
     return "\n".join(lines)
 
 
-async def ingest_media(update, bot, state_dir: Path) -> str:
+async def ingest_media(update, bot, state_dir: Path,
+                       deliver_fn=None) -> str:
     """Validate, download and process the admin's video. Every bound is
     checked BEFORE the download; the payload is validated by ffprobe
-    BEFORE any analysis. Journaled against replay; never delivers media
-    by itself."""
+    BEFORE any analysis. Journaled against replay. When the owner's
+    auto_deliver preference is on (default), the finished clip is
+    delivered to the paired admin right away through the same per-clip
+    journaled path as /deliveries flush; otherwise it stays HELD for
+    manual flush."""
     from . import ops
     state_dir = Path(state_dir)
     uid = int(update.update_id)
@@ -184,7 +200,15 @@ async def ingest_media(update, bot, state_dir: Path) -> str:
         Memory(str(state_dir / "memory.json")),
         f"owner-upload:{uid}", audio_fn=_audio, scene_fn=_scene,
         runtime_dir=str(state_dir / "runtime"))
-    text = _summarize(result)
+    delivery = None
+    clip_id = result.get("clip_id")
+    if result.get("status") == "held" and clip_id is not None:
+        # automatic delivery ergonomics, same owner preference as
+        # session clips. Off the event loop: the default sender is
+        # synchronous (asyncio.run inside), so it must run in a thread.
+        delivery = await asyncio.to_thread(
+            ops.auto_deliver_clips, state_dir, [clip_id], deliver_fn)
+    text = _summarize(result, delivery)
     ops.journal_record(state_dir, uid, "ingest", text)
     return text
 

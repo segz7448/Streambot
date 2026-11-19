@@ -399,13 +399,21 @@ Telegram's servers actually delivering updates to the poller with this
 token and real file bytes through getFile - no local test can prove
 that; the owner's first real video is the qualification.
 
-AUTOMATIC DELIVERY ERGONOMICS: QC-passed session clips are delivered to
-the paired admin as they finish when the auto_deliver preference is on
-(default on, the brief's automatic goal); '/deliveries hold' pauses it,
-'/deliveries auto' resumes, plain '/deliveries' reports the state.
-Delivery reuses the per-clip journaled path (deliver_one_clip): send
-journaled and committed individually, mid-send failure marked UNCERTAIN
-and never blind-resent, journaled-but-HELD reconciled without resend,
-pre-send setup errors leave the clip plainly HELD. Mode C (one-off
-owner upload) still never delivers media by itself. /deliveries flush
-remains for anything held.
+AUTOMATIC DELIVERY ERGONOMICS: QC-passed clips are delivered to the
+paired admin as they finish when the auto_deliver preference is on
+(default on, the brief's automatic goal), for BOTH session clips and
+mode C owner uploads - one consistent owner experience under one
+preference. '/deliveries hold' pauses it, '/deliveries auto' resumes,
+plain '/deliveries' reports the state. Delivery reuses the per-clip
+journaled path (deliver_one_clip): send journaled and committed
+individually, mid-send failure marked UNCERTAIN and never blind-resent,
+journaled-but-HELD reconciled without resend, pre-send setup errors
+leave the clip plainly HELD. Mode C delivery runs off the event loop
+(the sender is synchronous). The mode C reply reports the outcome:
+sent automatically, send uncertain (stays held), or held for manual
+flush. /deliveries flush remains for anything held.
+Anti-fixture-leak posture: auto-delivery fires only for clips recorded
+in the live state dir; verification fixtures run in isolated state
+dirs, and the service's single-instance lock prevents any fixture
+runner from sharing the live one. Generated fixture output can never
+reach the owner's Telegram through this path.
