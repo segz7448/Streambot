@@ -16,7 +16,7 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 | 009 | AI intelligence | NOT STARTED |
 | 010 | Automatic clipping | EXTRACTION device-proven (645KB clip from rolling buffer via module chain); automatic event-driven boundary selection pending Phase 009 |
 | 011 | Video editing | DEVICE-VERIFIED on agt-3f177cf6 for the vertical preset (1080x1920 output probed from 320x240 source, libass subtitle burn produced 400KB output, loudnorm applied); square/horizontal share the same graph construction, not separately device-run |
-| 012 | Quality control | NOT STARTED |
+| 012 | Quality control | DEVICE-VERIFIED on agt-3f177cf6 (media verification passed on real edited output; duplicate detection confirmed both directions: derived file flagged, unrelated file not) |
 | 013 | Telegram delivery | NOT STARTED |
 | 014 | Live distribution | NOT STARTED |
 | 015 | Monitoring & recovery | PARTIAL (supervisor + health + job recovery in foundation) |
