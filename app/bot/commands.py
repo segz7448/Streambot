@@ -24,6 +24,7 @@ class Command:
     name: str
     args: str
     user_id: int
+    update_id: int = 0
 
 
 def parse_command(text: str) -> Optional[Command]:
@@ -71,11 +72,12 @@ class CommandRouter:
             log.warning("unauthorized command attempt user_id=%s", user_id)
             raise UnauthorizedError("not authorized")
 
-    def dispatch(self, text: str, user_id: int) -> str:
+    def dispatch(self, text: str, user_id: int, update_id: int = 0) -> str:
         cmd = parse_command(text)
         if cmd is None:
             return "Send /help to see available commands."
         cmd.user_id = user_id
+        cmd.update_id = update_id
         self.authorize(user_id)
         entry = self.handlers.get(cmd.name)
         if entry is None:

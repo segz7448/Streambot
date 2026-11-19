@@ -49,6 +49,11 @@ class BotService:
         self.app.add_handler(CommandHandler("pair", self._pair))
         self.app.add_handler(
             MessageHandler(filters.TEXT & filters.COMMAND, self._command))
+        # true pre-ack: persist command updates before the framework can
+        # advance the getUpdates offset past them
+        from . import ops as _ops
+        self.app.bot.get_updates = _ops.make_pre_ack_wrapper(
+            self.inbox, self.watermark, self.app.bot.get_updates)
         self.router.register("status", self._status,
                              "application health")
         self.router.register("storage", self._storage,
@@ -109,7 +114,7 @@ class BotService:
 
     def _relay(self, cmd) -> str:
         from . import ops
-        return ops.relay_reply(self._state_dir(), cmd.args)
+        return ops.relay_reply(self._state_dir(), cmd.args, cmd.update_id)
 
     def _stoprelay(self, cmd) -> str:
         from . import ops
@@ -121,7 +126,7 @@ class BotService:
 
     def _clipnow(self, cmd) -> str:
         from . import ops
-        return ops.clipnow_reply(self._state_dir(), cmd.args)
+        return ops.clipnow_reply(self._state_dir(), cmd.args, cmd.update_id)
 
     def _destinations(self, cmd) -> str:
         from . import ops
@@ -198,6 +203,7 @@ class BotService:
         except Exception:
             self.watermark.mark_failed(update.update_id)
             raise
+        self.inbox.remove(update.update_id)
         self.watermark.mark_handled(update.update_id)
 
     async def _command(self, update: Update,
@@ -216,7 +222,8 @@ class BotService:
         try:
             self.router.admin_ids = {admin}
             self.inbox.add(update.update_id, user.id, message.text or "")
-            reply = self.router.dispatch(message.text or "", user_id=user.id)
+            reply = self.router.dispatch(message.text or "", user_id=user.id,
+                                     update_id=update.update_id)
             if reply:
                 await message.reply_text(reply)
             self.inbox.remove(update.update_id)
