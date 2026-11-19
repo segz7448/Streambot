@@ -25,6 +25,7 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
 
 from ..core.logging import get_logger
 from .commands import CommandRouter
+from .inbox import PreAckInbox
 from .logfilter import install as install_log_filter
 from .pairing import PairingStore
 from .watermark import UpdateWatermark
@@ -41,6 +42,7 @@ class BotService:
         self.store = store
         self.watermark = watermark or UpdateWatermark(
             str(store.path.parent / "updates.json"))
+        self.inbox = PreAckInbox(str(store.path.parent / "inbox.json"))
         self.router = CommandRouter(admin_ids=[])
         self.started_at = time.time()
         self.app = Application.builder().token(token).build()
@@ -173,16 +175,28 @@ class BotService:
             return  # fail closed: no reply, no oracle
         try:
             self.router.admin_ids = {admin}
+            self.inbox.add(update.update_id, user.id, message.text or "")
             reply = self.router.dispatch(message.text or "", user_id=user.id)
             if reply:
                 await message.reply_text(reply)
+            self.inbox.remove(update.update_id)
         except Exception:
+            # entry STAYS in the inbox: redelivery is not guaranteed
+            # once the offset advanced, so the startup drain retries it
             self.watermark.mark_failed(update.update_id)
             raise
         self.watermark.mark_handled(update.update_id)
 
+    def drain_inbox(self, reply=None) -> dict:
+        from . import ops
+        if reply is None:
+            reply = lambda _uid, _text: None
+        return ops.drain_inbox(self._state_dir(), self.router,
+                               self.watermark, self.inbox, reply)
+
     def run(self) -> None:
         log.info("telegram service starting (long polling)")
+        self.drain_inbox()
         # keep the pending backlog: commands sent during a restart must be
         # processed, not discarded; the watermark makes replays idempotent
         self.app.run_polling(drop_pending_updates=False)

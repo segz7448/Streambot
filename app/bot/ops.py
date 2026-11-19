@@ -8,6 +8,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..distribution.relay import DestinationStore, Relayer, RestreamManager
+from .inbox import PreAckInbox
+from .watermark import UpdateWatermark
 from ..ingestion.twitch_clips import ClipFailed, TwitchClipsClient
 
 UNCONFIGURED_CLIP = (
@@ -47,6 +49,38 @@ def stoprelay_reply(state_dir: Path) -> str:
     if stopped:
         return f"Restream stopped ({stopped} process(es))."
     return "No restream is running."
+
+
+def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
+                inbox: PreAckInbox, reply=lambda _uid, _text: None) -> dict:
+    """Retry updates stranded by a crash between confirmation and
+    handling. Idempotent via the watermark: entries already handled are
+    just dropped. Entries that fail again STAY for the next drain."""
+    import logging
+    log = logging.getLogger("bot.ops")
+    replayed = dropped = failed = 0
+    for entry in inbox.pending():
+        uid = int(entry["update_id"])
+        if watermark.already_handled(uid):
+            inbox.remove(uid)
+            dropped += 1
+            continue
+        try:
+            router.admin_ids = {int(entry["user_id"])}
+            reply_text = router.dispatch(entry["text"],
+                                         user_id=int(entry["user_id"]))
+            if reply_text:
+                reply(int(entry["user_id"]), reply_text)
+            watermark.mark_handled(uid)
+            inbox.remove(uid)
+            replayed += 1
+        except Exception:
+            log.exception("inbox drain failed for update %s", uid)
+            failed += 1
+    if replayed or dropped or failed:
+        log.info("inbox drain: %d replayed, %d already-handled, %d failed",
+                 replayed, dropped, failed)
+    return {"replayed": replayed, "dropped": dropped, "failed": failed}
 
 
 def clipnow_reply(state_dir: Path, channel: str) -> str:
