@@ -63,7 +63,7 @@ class FFmpegProcess:
             pass  # drain must never kill the capture
 
     def stderr_tail(self) -> bytes:
-        return b"".join(getattr(self, "_stderr_tail", [])[-20:])
+        return b"".join(list(getattr(self, "_stderr_tail", ()))[-20:])
 
     async def stop(self, grace: float = 5.0) -> int:
         if not self._proc:
