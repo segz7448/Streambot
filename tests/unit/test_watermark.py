@@ -39,6 +39,22 @@ class WatermarkTests(unittest.TestCase):
         self.wm.mark_handled(1)
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
 
+    def test_failed_update_not_suppressed_by_later_success(self):
+        self.wm.mark_failed(100)
+        self.wm.mark_handled(101)
+        # the failed earlier update is still processed again on redelivery
+        self.assertFalse(self.wm.already_handled(100))
+        self.assertTrue(self.wm.already_handled(101))
+        # once it succeeds, it joins the handled set
+        self.wm.mark_handled(100)
+        self.assertTrue(self.wm.already_handled(100))
+
+    def test_failed_set_capped(self):
+        for i in range(1, 300):
+            self.wm.mark_failed(i)
+        _, failed = self.wm._read()
+        self.assertLessEqual(len(failed), 200)
+
     def test_corrupt_file_treated_as_fresh(self):
         Path(self.path).write_text("not json")
         self.assertFalse(self.wm.already_handled(5))

@@ -55,19 +55,23 @@ class BotService:
             return
         if self.watermark.already_handled(update.update_id):
             return
-        if self.store.admin_id() is not None:
-            await update.message.reply_text("Pairing is already complete.")
-        else:
-            code = context.args[0] if context.args else ""
-            if code and self.store.try_pair(code, user.id):
-                log.info("owner pairing completed for user_id=%s", user.id)
-                await update.message.reply_text(
-                    "Pairing complete. This account is now the NOVA Clip "
-                    "Engine administrator. Send /help to begin.")
+        try:
+            if self.store.admin_id() is not None:
+                await update.message.reply_text("Pairing is already complete.")
             else:
-                log.warning("failed pairing attempt user_id=%s", user.id)
-                await update.message.reply_text(
-                    "Invalid or expired pairing code.")
+                code = context.args[0] if context.args else ""
+                if code and self.store.try_pair(code, user.id):
+                    log.info("owner pairing completed for user_id=%s", user.id)
+                    await update.message.reply_text(
+                        "Pairing complete. This account is now the NOVA Clip "
+                        "Engine administrator. Send /help to begin.")
+                else:
+                    log.warning("failed pairing attempt user_id=%s", user.id)
+                    await update.message.reply_text(
+                        "Invalid or expired pairing code.")
+        except Exception:
+            self.watermark.mark_failed(update.update_id)
+            raise
         self.watermark.mark_handled(update.update_id)
 
     async def _command(self, update: Update,
@@ -83,10 +87,14 @@ class BotService:
             log.warning("unauthorized command attempt user_id=%s", user.id)
             self.watermark.mark_handled(update.update_id)
             return  # fail closed: no reply, no oracle
-        self.router.admin_ids = {admin}
-        reply = self.router.dispatch(message.text or "", user_id=user.id)
-        if reply:
-            await message.reply_text(reply)
+        try:
+            self.router.admin_ids = {admin}
+            reply = self.router.dispatch(message.text or "", user_id=user.id)
+            if reply:
+                await message.reply_text(reply)
+        except Exception:
+            self.watermark.mark_failed(update.update_id)
+            raise
         self.watermark.mark_handled(update.update_id)
 
     def run(self) -> None:
