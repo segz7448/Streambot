@@ -7,9 +7,9 @@ Every phase lists actual evidence. "Done" means tested and verified, not
 |-------|-------|--------|
 | 001 | AGT environment audit | COMPLETE (verified live) |
 | 002 | Project foundation | COMPLETE (tests pass locally) |
-| 003 | FFmpeg engine | NOT STARTED (blocked on bionic ffmpeg acquisition, highest technical risk) |
-| 004 | Media buffer | NOT STARTED |
-| 005 | Twitch discovery | NOT STARTED (needs user-approved Twitch app credentials) |
+| 003 | FFmpeg engine | DEVICE-VERIFIED 2026-11-19 (evidence below); module integration continues |
+| 004 | Media buffer | IN PROGRESS (buffer code + segmentation device-tested; live-source acceptance pending Phase 006) |
+| 005 | Twitch discovery | CODE READY (Helix client, tests 22/22); live acceptance needs user-approved Twitch app credentials |
 | 006 | Authorized ingestion | NOT STARTED |
 | 007 | Telegram bot | NOT STARTED (needs bot token via secure transfer) |
 | 008-012 | Detection, AI, clipping, editing, QC | NOT STARTED |
@@ -30,6 +30,20 @@ Live signed command jobs against host agt-3f177cf6 (AGT 1.6.17). Full report:
 present (guide was written for 1.6.14); bionic environment, so glibc binaries
 do not run; ffmpeg absent (Phase 003's key task); 3.6 GB RAM / 18.3 GB free
 storage; ZAO BOT and other workloads untouched.
+
+## Phase 003 — FFmpeg engine (2026-11-19)
+
+On-device on host agt-3f177cf6: downloaded the pinned termux aarch64 ffmpeg
+9.0.2 package set (103 packages, sha256-verified, zero failures) and extracted
+it into the isolated prefix $HOME/instinct-clip/prefix (AGT runtime libs
+untouched; nothing committed to git, install script fetches at deploy time).
+Evidence jobs: download2.sh + f3f9c0a3 (extract), 9370c6e3 (ffmpeg -version:
+9.0.2, libx264/aac/libass enabled), c0c3d525 (media battery: generate
+testsrc2+sine -> h264/aac 10s OK; ffprobe OK; 5s cut OK; 1080x1920 9:16
+crop/scale/pad OK; libass subtitle burn OK), dbe7523c (rolling segmentation:
+3 keyframe-aligned segments from 16s input; note: -c copy splits on
+keyframes, so buffer windows are approximate by design and finalized in
+Phase 004 acceptance).
 
 ## Phase 002 — Foundation (2026-11-19)
 
