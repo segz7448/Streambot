@@ -35,10 +35,11 @@ async def main():
                  " VALUES ('synthetic', 0, 0)")
     conn.execute("INSERT INTO stream_sessions (source_id, state)"
                  " VALUES (1, 'RECORDING')")
-    # 5s segments, keep ~15s pre/post, cap ~1.5MB to force rotation
+    # 5s segments, keep ~15s pre/post; cap ~4MB so most of the 40s run
+    # fits while still forcing rotation (source is ~105KB/s, 40s ~= 4.2MB)
     buf = RollingBuffer(WORK, session_id=1, segment_seconds=5,
                         pre_event_seconds=15, post_event_seconds=15,
-                        max_storage_mb=1)
+                        max_storage_mb=4)
     runner = FFmpegRunner(f"{PREFIX}/bin/ffmpeg", f"{PREFIX}/bin/ffprobe",
                           max_concurrent=1)
     orig_segment_args = buf.segment_args
