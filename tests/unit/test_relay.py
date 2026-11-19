@@ -97,5 +97,50 @@ class FeedHostGuardTests(unittest.TestCase):
         from app.distribution.relay import validate_feed
         self.assertEqual(
             validate_feed("https://cdn.example.com/broadcaster-feed",
-                          Path("/tmp/feeds")),
+                          Path("/tmp/feeds"),
+                          resolver=lambda name: {"8.8.8.8"}),
             "https://cdn.example.com/broadcaster-feed")
+
+
+class FeedHostCanonicalFormTests(unittest.TestCase):
+    """Alternate numeric notations must not bypass the public check."""
+
+    def test_alternate_loopback_forms_refused(self):
+        from app.distribution.relay import validate_feed
+        for url in ("http://2130706433/feed",        # integer 127.0.0.1
+                    "http://127.1/feed",             # short dotted
+                    "http://0x7f000001/feed",        # hex
+                    "http://0177.0.0.1/feed"):       # octal
+            with self.assertRaises(ValueError, msg=url):
+                validate_feed(url, Path("/tmp/feeds"))
+
+    def test_hostname_resolving_private_refused(self):
+        from app.distribution.relay import validate_feed
+        fake = lambda name: {"127.0.0.1"}
+        with self.assertRaises(ValueError):
+            validate_feed("https://evil.example/feed", Path("/tmp/feeds"),
+                          resolver=fake)
+
+    def test_hostname_mixed_resolution_refused(self):
+        from app.distribution.relay import validate_feed
+        fake = lambda name: {"8.8.8.8", "10.1.2.3"}
+        with self.assertRaises(ValueError):
+            validate_feed("https://mixed.example/feed", Path("/tmp/feeds"),
+                          resolver=fake)
+
+    def test_hostname_resolving_public_accepted(self):
+        from app.distribution.relay import validate_feed
+        fake = lambda name: {"8.8.8.8"}
+        self.assertEqual(
+            validate_feed("https://cdn.example.com/feed", Path("/tmp/feeds"),
+                          resolver=fake),
+            "https://cdn.example.com/feed")
+
+    def test_unresolvable_host_refused(self):
+        import socket
+        from app.distribution.relay import validate_feed
+        def boom(name):
+            raise socket.gaierror()
+        with self.assertRaises(ValueError):
+            validate_feed("https://gone.example/feed", Path("/tmp/feeds"),
+                          resolver=boom)

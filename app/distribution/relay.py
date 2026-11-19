@@ -21,28 +21,62 @@ _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 _CANONICAL_KEYLESS = re.compile(r"^rtmps?://[^/?#@\s]+/?$", re.IGNORECASE)
 
 
-def _public_host(host: str) -> bool:
-    """SSRF guard for owner-registered feed URLs: refuse loopback,
-    private, link-local, reserved, multicast and unspecified literal
-    IPs plus obvious local names. A public hostname is not resolved
-    here (a DNS check would be TOCTOU); the registration boundary is
-    that the owner placed this broadcaster-provided URL in feeds/.
-    """
+def _canonical_ip(host: str):
+    """Literal IP in ANY numeric notation. ipaddress alone misses the
+    alternate forms a URL host can carry (integer 2130706433, short
+    dotted 127.1, hex 0x7f000001, octal 0177.0.0.1); inet_aton
+    canonicalizes all of them, so they cannot bypass the public check
+    by falling through to the hostname branch."""
     import ipaddress
-    h = host.lower().rstrip(".")
-    if h == "localhost" or h.endswith(
-            (".localhost", ".local", ".internal", ".lan")):
-        return False
+    import socket
     try:
-        ip = ipaddress.ip_address(h)
+        return ipaddress.ip_address(host)
     except ValueError:
-        return True  # public hostname; see docstring
+        pass
+    try:
+        return ipaddress.ip_address(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None
+
+
+def _is_public_ip(ip) -> bool:
     return not (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast
                 or ip.is_unspecified)
 
 
-def validate_feed(feed: str, input_root: Path) -> str:
+def _public_host(host: str, resolver=None) -> bool:
+    """SSRF guard for owner-registered feed URLs: refuse loopback,
+    private, link-local, reserved, multicast and unspecified addresses
+    in any notation, obvious local names, and hostnames that resolve
+    to any non-public address. Residuals, explicit: DNS can be
+    rebound between this check and the ffmpeg connection, and ffmpeg
+    may follow HTTP redirects to hosts this check never sees (the
+    protocol whitelist still applies to them). Feeds are admin-only
+    and owner-registered; these residuals are accepted and documented,
+    not silently absent."""
+    import ipaddress
+    h = host.lower().rstrip(".")
+    if h == "localhost" or h.endswith(
+            (".localhost", ".local", ".internal", ".lan")):
+        return False
+    ip = _canonical_ip(h)
+    if ip is not None:
+        return _is_public_ip(ip)
+    if resolver is None:
+        import socket
+        def resolver(name):
+            return {ai[4][0] for ai in socket.getaddrinfo(name, None)}
+    try:
+        addrs = resolver(h)
+    except OSError:
+        return False
+    if not addrs:
+        return False
+    return all(_is_public_ip(ipaddress.ip_address(a)) for a in addrs)
+
+
+def validate_feed(feed: str, input_root: Path, resolver=None) -> str:
     """A restream feed is either a credential-free http(s) URL or a
     local file under the authorized input root. Anything else - other
     protocols, userinfo, query/fragment credentials, flag-shaped
@@ -63,7 +97,7 @@ def validate_feed(feed: str, input_root: Path) -> str:
             raise ValueError("feed URL carries credentials/parameters")
         if not p.hostname:
             raise ValueError("feed URL has no host")
-        if not _public_host(p.hostname):
+        if not _public_host(p.hostname, resolver=resolver):
             raise ValueError("feed host is not a public address")
         return f
     root = input_root.resolve()

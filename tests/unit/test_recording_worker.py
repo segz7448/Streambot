@@ -76,3 +76,26 @@ class RecordingWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StderrDrainTests(unittest.TestCase):
+    """A >64KiB stderr line without a newline must not kill the drain:
+    readline() raises LimitOverrunError there; chunk reads survive."""
+
+    def test_huge_line_drain_completes(self):
+        import asyncio
+        import sys
+        from app.recording.ffmpeg import FFmpegRunner
+
+        async def go():
+            runner = FFmpegRunner(sys.executable)
+            proc = await runner.run(
+                ["-c", "import sys; sys.stderr.write('x'*300000)"],
+                session_id="drain-test")
+            rc, tail = await asyncio.wait_for(proc.wait(), timeout=30)
+            return rc, tail
+
+        rc, tail = asyncio.run(go())
+        self.assertEqual(rc, 0)
+        self.assertGreater(len(tail), 0)
+        self.assertLessEqual(len(tail), 100 * 512)

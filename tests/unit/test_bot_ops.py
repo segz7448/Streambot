@@ -10,6 +10,13 @@ class OpsTests(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp())
         (self.state / "relay_enabled").write_text("1")  # gate: reviewed
+        import unittest.mock as _mock
+        # feed-validation now resolves hostnames; these tests exercise
+        # relay process management and journaling, not DNS - stub it
+        p = _mock.patch("socket.getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("8.8.8.8", 0))])
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_clipnow_unconfigured_fails_loudly(self):
         reply = ops.clipnow_reply(self.state, "somechannel")

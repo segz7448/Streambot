@@ -21,6 +21,13 @@ class PreAckWrapperTests(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp())
         self.inbox = PreAckInbox(str(self.dir / "inbox.json"))
         self.wm = UpdateWatermark(str(self.dir / "updates.json"))
+        import unittest.mock as _mock
+        # feed-validation now resolves hostnames; these tests exercise
+        # relay process management and journaling, not DNS - stub it
+        p = _mock.patch("socket.getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("8.8.8.8", 0))])
+        p.start()
+        self.addCleanup(p.stop)
 
     def _put(self, update):
         seen = []
@@ -48,6 +55,12 @@ class PreAckWrapperTests(unittest.TestCase):
 class JournalTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
+        import unittest.mock as _mock
+        # feed-validation now resolves hostnames; journaling tests stub DNS
+        p = _mock.patch("socket.getaddrinfo",
+                        lambda *a, **k: [(2, 1, 6, "", ("8.8.8.8", 0))])
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_round_trip_and_command_mismatch(self):
         ops.journal_record(self.dir, 7, "clipnow", "Clip created: x")

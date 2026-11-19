@@ -55,10 +55,14 @@ class FFmpegProcess:
         assert self._proc is not None and self._proc.stderr is not None
         try:
             while True:
-                line = await self._proc.stderr.readline()
-                if not line:
+                # bounded chunk reads: readline() dies with
+                # LimitOverrunError on a >64KiB line without a newline
+                # and the drain would stop silently, re-creating the
+                # pipe-fill hang this exists to prevent
+                chunk = await self._proc.stderr.read(4096)
+                if not chunk:
                     break
-                self._stderr_tail.append(line)
+                self._stderr_tail.append(chunk[-512:])
         except Exception:
             pass  # drain must never kill the capture
 
