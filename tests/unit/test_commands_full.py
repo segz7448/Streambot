@@ -1,6 +1,8 @@
 import os
+import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from app.bot import commands_full as cf
@@ -66,3 +68,85 @@ class CommandsFullTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishCommandTests(unittest.TestCase):
+
+    def _clip(self, d, clip_id=1):
+        import time
+        conn = sqlite3.connect(str(d / "nova.db"))
+        migrate(conn)
+        conn.close()
+        clip = d / "clip1.mp4"
+        clip.write_bytes(b"mp4data")
+        with sqlite3.connect(str(d / "nova.db")) as conn:
+            conn.execute(
+                "INSERT INTO clips(id, file_path, status, created_at)"
+                " VALUES(?,?,?,?)", (clip_id, str(clip), "HELD", time.time()))
+        return clip
+
+    def test_usage_and_missing_clip(self):
+        d = Path(tempfile.mkdtemp())
+        self.assertEqual(cf.publish_reply(d, "abc"), cf.USAGE_PUBLISH)
+        self.assertEqual(cf.publish_reply(d, ""), cf.USAGE_PUBLISH)
+        conn = sqlite3.connect(str(d / "nova.db"))
+        migrate(conn)
+        conn.close()
+        self.assertIn("No clip #9", cf.publish_reply(d, "9"))
+
+    def test_unconfigured_fails_closed_no_journal(self):
+        d = self._clip(Path(tempfile.mkdtemp())).parent
+        r = cf.publish_reply(d, "1", 555)
+        self.assertIn("not configured", r)
+        from app.bot import ops
+        self.assertIsNone(ops.journal_result(d, 555, "publish"))
+
+    def test_success_journaled_and_replay_guarded(self):
+        d = self._clip(Path(tempfile.mkdtemp())).parent
+        fake = mock.Mock()
+        fake.publish.return_value = "vid9"
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r = cf.publish_reply(d, "1 My title", 556)
+        self.assertIn("PRIVATE", r)
+        self.assertIn("vid9", r)
+        fake.publish.assert_called_once()
+        args, kwargs = fake.publish.call_args
+        self.assertEqual(kwargs.get("privacy"), "private")
+        self.assertEqual(args[1], "My title")
+        # replay: same update id returns the recorded result, no 2nd upload
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r2 = cf.publish_reply(d, "1 My title", 556)
+        self.assertIn("replay guard", r2)
+        fake.publish.assert_called_once()
+
+    def test_api_error_journaled_failed(self):
+        from app.distribution.youtube import YouTubeUploadFailed
+        d = self._clip(Path(tempfile.mkdtemp())).parent
+        fake = mock.Mock()
+        fake.publish.side_effect = YouTubeUploadFailed("upload -> HTTP 403")
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r = cf.publish_reply(d, "1", 557)
+        self.assertIn("failed", r)
+        from app.bot import ops
+        self.assertIn("failed", ops.journal_result(d, 557, "publish"))
+
+    def test_network_failure_marked_uncertain_not_retried(self):
+        import urllib.error
+        d = self._clip(Path(tempfile.mkdtemp())).parent
+        fake = mock.Mock()
+        fake.publish.side_effect = urllib.error.URLError("reset")
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            r = cf.publish_reply(d, "1", 558)
+        self.assertIn("uncertain", r)
+        from app.bot import ops
+        unc = ops.journal_uncertain(d)
+        self.assertEqual(len(unc), 1)
+        self.assertEqual(unc[0]["command"], "publish")
+
+    def test_publish_in_side_effecting(self):
+        from app.bot import ops
+        self.assertIn("publish", ops.SIDE_EFFECTING)

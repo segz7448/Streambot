@@ -127,6 +127,10 @@ class BotService:
         self.router.register("deliveries", self._deliveries,
                              "list held clips; /deliveries flush sends "
                              "them to you")
+        self.router.register("publish",
+                             lambda c: cf.publish_reply(self._state_dir(), c.args, c.update_id),
+                             "upload a clip to YouTube as PRIVATE: "
+                             "/publish <id> [title]")
 
     def _relay(self, cmd) -> str:
         from . import ops

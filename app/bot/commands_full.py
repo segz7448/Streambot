@@ -258,3 +258,66 @@ def record_error(state_dir: Path, text: str) -> None:
         pass
 
 
+
+USAGE_PUBLISH = "Usage: /publish <clip-id> [title]"
+
+
+def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
+    """Upload one clip to YouTube as PRIVATE via the Data API.
+    Side-effecting and journaled: a replayed command returns the
+    recorded result instead of uploading twice. Fails closed with a
+    consent-pending message until the owner completes OAuth (the
+    youtube_* credential files do not exist before then). A network
+    failure mid-upload is ambiguous (the PUT may have completed), so
+    it is preserved for reconciliation, never blind-retried."""
+    from . import ops
+    cached = ops.journal_result(state_dir, update_id, "publish")
+    if cached is not None:
+        return "Already processed (replay guard): " + cached
+    parts = args.split(None, 1)
+    try:
+        clip_id = int(parts[0])
+    except (ValueError, IndexError):
+        return USAGE_PUBLISH
+    title = parts[1].strip() if len(parts) == 2 and parts[1].strip() \
+        else f"Clip #{clip_id}"
+    with _db(state_dir) as conn:
+        row = conn.execute(
+            "SELECT file_path, status FROM clips WHERE id=?",
+            (clip_id,)).fetchone()
+    if row is None:
+        return f"No clip #{clip_id}."
+    path, _status = row
+    if not path or not os.path.exists(path):
+        return f"Clip #{clip_id} has no file on disk."
+    from ..distribution.youtube import (YouTubeNotConfigured,
+                                        YouTubeUploadFailed,
+                                        publisher_from_state)
+    try:
+        pub = publisher_from_state(str(state_dir))
+    except YouTubeNotConfigured:
+        return ("YouTube upload is not configured: OAuth consent is "
+                "still pending. Nothing was uploaded.")
+    try:
+        vid = pub.publish(path, title, privacy="private")
+    except YouTubeUploadFailed as exc:
+        # a definitive API error response - safe to record as failed
+        result = f"YouTube upload of clip #{clip_id} failed: {exc}"
+        ops.journal_record(state_dir, update_id, "publish", result)
+        record_error(state_dir, result)
+        return result
+    except Exception as exc:
+        # network failure with the request possibly in flight: the
+        # upload may have completed server-side. Preserve, do not retry.
+        ops.journal_mark_uncertain(state_dir, update_id, "publish",
+                                   f"/publish {args}")
+        record_error(state_dir,
+                     f"publish clip #{clip_id} outcome uncertain: {exc}")
+        return ("Upload outcome uncertain (network failure mid-request). "
+                "Preserved for reconciliation and NOT retried - check "
+                "YouTube Studio before re-sending /publish.")
+    result = (f"Clip #{clip_id} uploaded PRIVATE to YouTube "
+              f"(video id {vid}). It stays private until you change it "
+              "in YouTube Studio.")
+    ops.journal_record(state_dir, update_id, "publish", result)
+    return result
