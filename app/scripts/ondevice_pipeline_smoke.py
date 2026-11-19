@@ -62,7 +62,7 @@ async def main():
     clip = await asyncio.to_thread(
         extract_clip, f"{PREFIX}/bin/ffmpeg", buf, event_time, clip_path,
         10.0, 5.0)
-    await sup.stop()
+    sup.stopping.set()
     await asyncio.wait_for(task, timeout=20)
     clip_bytes = os.path.getsize(clip_path) if clip and os.path.exists(clip_path) else 0
     conn = connect(db)
