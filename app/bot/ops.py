@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..distribution.relay import DestinationStore, Relayer, RestreamManager
+from ..distribution.relay import (DestinationStore, Relayer,
+                                  RestreamManager, secret_in_rtmp_url)
 from .inbox import PreAckInbox
 from .watermark import UpdateWatermark
 from ..ingestion.twitch_clips import ClipFailed, TwitchClipsClient
@@ -27,11 +28,22 @@ USAGE_RELAY = ("Usage: /relay start <feed_url> <rtmp_dest> [rtmp_dest...] - "
 
 def relay_reply(state_dir: Path, args: str) -> str:
     """Start an RTMP restream of an explicitly owner-provided feed.
-    Refuses without both a feed and at least one destination."""
+    Secret-bearing RTMP destinations are REFUSED: stream keys must not
+    appear in ffmpeg process arguments on this shared host (same-UID
+    processes can read /proc cmdline), and no safe credential transport
+    is implemented yet. Only keyless destinations (path is empty or
+    "/") or local file outputs are accepted."""
     parts = args.split()
     if len(parts) < 3 or parts[0] != "start":
         return USAGE_RELAY
     feed, dests = parts[1], parts[2:]
+    for dest in dests:
+        if secret_in_rtmp_url(dest):
+            return ("Refused: that RTMP destination embeds a stream key, "
+                    "and keys in process arguments are exposed to other "
+                    "workloads on this host. Secret-bearing restream is "
+                    "disabled until a safe credential transport exists. "
+                    "Your key was not used or stored.")
     relayer = Relayer(DestinationStore(str(state_dir / "destinations.json")),
                       lambda c, p, t: 0)
     cmds = relayer.restream(feed, dests,

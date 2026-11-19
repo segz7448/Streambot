@@ -19,6 +19,17 @@ from ..core.logging import get_logger
 log = get_logger("distribution.relay")
 
 
+def secret_in_rtmp_url(url: str) -> bool:
+    """True when an rtmp(s) URL carries a path beyond '/' - that path
+    is the stream key, and it must not enter process arguments on a
+    shared host. Defense in depth alongside the /relay refusal."""
+    if not url.startswith(("rtmp://", "rtmps://")):
+        return False
+    rest = url.split("://", 1)[1]
+    path = rest.partition("/")[2]
+    return bool(path.strip("/"))
+
+
 class DestinationStore:
     """0600 JSON file in the state dir; outside the repo."""
 
@@ -155,6 +166,11 @@ class Relayer:
             raise ValueError("no owner-provided feed configured")
         if not rtmp_destinations:
             raise ValueError("no RTMP destinations configured")
+        for dest in rtmp_destinations:
+            if secret_in_rtmp_url(dest):
+                raise ValueError(
+                    "secret-bearing RTMP destination refused: stream "
+                    "keys must not appear in process arguments")
         cmds = []
         for dest in rtmp_destinations:
             cmds.append([

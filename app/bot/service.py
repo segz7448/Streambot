@@ -66,6 +66,46 @@ class BotService:
                              "/relay start <feed_url> <rtmp_dest>...")
         self.router.register("stoprelay", self._stoprelay,
                              "stop the running restream")
+        from . import commands_full as cf
+        self.router.register("addsource",
+                             lambda c: cf.addsource_reply(self._state_dir(), c.args),
+                             "add a Twitch channel: /addsource <username>")
+        self.router.register("removesource",
+                             lambda c: cf.removesource_reply(self._state_dir(), c.args),
+                             "remove a channel: /removesource <username>")
+        self.router.register("checklive",
+                             lambda c: cf.checklive_reply(self._state_dir(), c.args),
+                             "check if a channel is live: /checklive <username>")
+        self.router.register("startclip",
+                             lambda c: cf.startclip_reply(self._state_dir(), c.args),
+                             "start an authorized clipping session")
+        self.router.register("stopclip",
+                             lambda c: cf.stopclip_reply(self._state_dir(), c.args),
+                             "stop active clipping sessions")
+        self.router.register("sessions",
+                             lambda c: cf.sessions_reply(self._state_dir(), c.args),
+                             "list clipping sessions")
+        self.router.register("clips",
+                             lambda c: cf.clips_reply(self._state_dir(), c.args),
+                             "browse generated clips")
+        self.router.register("clipdetails",
+                             lambda c: cf.clipdetails_reply(self._state_dir(), c.args),
+                             "clip info: /clipdetails <id>")
+        self.router.register("settings",
+                             lambda c: cf.settings_reply(self._state_dir(), c.args),
+                             "view/set configuration")
+        self.router.register("quality",
+                             lambda c: cf.quality_reply(self._state_dir(), c.args),
+                             "output quality preset")
+        self.router.register("subtitles",
+                             lambda c: cf.SUBTITLES_REPLY,
+                             "subtitles (out of scope per owner)")
+        self.router.register("logs",
+                             lambda c: cf.logs_reply(self._state_dir(), c.args),
+                             "recent application errors")
+        self.router.register("restart",
+                             lambda c: cf.RESTART_REPLY,
+                             "restart workers (host-controlled)")
 
     def _relay(self, cmd) -> str:
         from . import ops
@@ -180,10 +220,13 @@ class BotService:
             if reply:
                 await message.reply_text(reply)
             self.inbox.remove(update.update_id)
-        except Exception:
+        except Exception as exc:
             # entry STAYS in the inbox: redelivery is not guaranteed
             # once the offset advanced, so the startup drain retries it
             self.watermark.mark_failed(update.update_id)
+            from . import commands_full as cf
+            cf.record_error(self._state_dir(),
+                            f"command failed: {exc.__class__.__name__}")
             raise
         self.watermark.mark_handled(update.update_id)
 

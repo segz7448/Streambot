@@ -62,10 +62,15 @@ class RelayTests(unittest.TestCase):
     def test_restream_builds_owner_feed_commands(self):
         relay = Relayer(self.store, lambda c, p, t: 0)
         cmds = relay.restream("http://owner/feed",
-                              ["rtmp://dest1/key"], ffmpeg_bin="ffmpeg")
+                              ["rtmp://dest1"], ffmpeg_bin="ffmpeg")
         self.assertEqual(len(cmds), 1)
         self.assertIn("http://owner/feed", cmds[0])
-        self.assertIn("rtmp://dest1/key", cmds[0])
+        self.assertIn("rtmp://dest1", cmds[0])
+
+    def test_secret_bearing_destination_refused(self):
+        relay = Relayer(self.store, lambda c, p, t: 0)
+        with self.assertRaises(ValueError):
+            relay.restream("http://feed", ["rtmp://dest1/secretkey"])
 
 
 if __name__ == "__main__":

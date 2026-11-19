@@ -5,10 +5,16 @@ If the handler crashes after that confirmation, the watermark records
 the failure but Telegram never redelivers - the update would sit in the
 failed set forever. This inbox persists each command BEFORE dispatch
 (0600 file in the state dir), removes it only after successful
-handling, and drains surviving entries on service start, so a crash
-between confirmation and handling is retried at the next boot rather
-than silently stranded.
-"""
+BOUNDARY (honest): the entry is written when the handler is entered.
+Telegram's server-side confirmation happens when the framework's NEXT
+getUpdates call carries the advanced offset. A crash between that ack
+and handler entry (framework queue window) is still uncovered; a crash
+before the ack is covered by Telegram redelivery, and a crash after
+handler entry is covered by this inbox + startup drain. Replay
+idempotence beyond the watermark is per-command: a command that crashed
+AFTER an external side effect (clip creation, restream start) can
+repeat that side effect on drain - side-effecting commands need
+operation-level idempotency, which is NOT yet implemented."""
 from __future__ import annotations
 
 import json

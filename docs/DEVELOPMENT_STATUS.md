@@ -190,3 +190,45 @@ survived both redeploys.
   SIGTERMs the survivor, which finalizes its file (832164 bytes);
   pid file clean afterwards. RTMP-network acceptance (a real streaming
   endpoint) remains untested - needs the owner's actual destination.
+
+## Brief audit + hardening round 2 (2026-11-19, ~03:50 PST)
+
+CODE: main@pending, 149/149. Deployed on phone: e8387be code (running
+deployment f6dcf994); this round's changes are PUSHED-NOT-DEPLOYED.
+
+BRIEF COMMAND AUDIT (section 4 of the brief): the full specified
+surface is now registered - /start /help /addsource /sources
+/removesource /checklive /startclip /stopclip /sessions /clips
+/clipdetails /settings /quality /subtitles /relay /destinations
+/stoprelay /status /storage /logs /restart (plus /clipnow for the
+official trigger route). Behavior tiers: addsource/removesource,
+sessions, clips, clipdetails, settings, quality, logs (0600 error ring
+fed by handler exceptions) are functional against the state DB.
+checklive/startclip/clipnow fail loudly while Twitch credentials are
+unconfigured, per the brief's own rule (explain the missing
+requirement, keep the source registered, never pretend recording
+started). subtitles answers out-of-scope per the owner's decision.
+restart answers honestly that worker restart is host-controlled on AGT.
+
+GAP RESOLUTIONS:
+- Secret-bearing RTMP DISABLED: /relay start and Relayer.restream
+  refuse rtmp(s) URLs whose path carries a stream key (argv is readable
+  by same-UID workloads on this shared host; no safe credential
+  transport exists yet). Keyless destinations and local file outputs
+  remain usable for testing.
+- Inbox boundary corrected: the pre-ack inbox covers crashes AFTER
+  handler entry; the framework queue window (server ack -> handler
+  entry) is still uncovered; replay idempotence of external side
+  effects (clip creation, restream start) is per-command and NOT yet
+  implemented.
+
+STILL MISSING / NOT ESTABLISHED:
+- Continuous capture from a broadcaster-provided feed (mode A) and a
+  retrospective local-recording command (mode C) are not implemented as
+  commands.
+- Gameplay-action selection/framing verified only on synthetic
+  fixtures; HUD/action preservation on real gameplay UNACCEPTED.
+- Live Twitch route, YouTube upload, and real RTMP acceptance each
+  require owner-side setup/consent not yet in place.
+- AI intelligence beyond audio-spike heuristics: no authorized $0
+  provider.

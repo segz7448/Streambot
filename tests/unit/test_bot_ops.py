@@ -43,6 +43,13 @@ class OpsTests(unittest.TestCase):
         self.assertTrue(ops.destinations_reply(self.state, "bogus")
                         .startswith("Usage:"))
 
+    def test_relay_refuses_keyed_destination(self):
+        reply = ops.relay_reply(self.state,
+                                "start http://feed rtmp://live.twitch.tv/app/live_123")
+        self.assertIn("Refused", reply)
+        self.assertNotIn("live_123", reply)
+        self.assertIn("No restream", ops.stoprelay_reply(self.state))
+
     def test_relay_usage_and_stop_idle(self):
         self.assertTrue(ops.relay_reply(self.state, "").startswith("Usage:"))
         self.assertTrue(ops.relay_reply(self.state, "start http://feed")
