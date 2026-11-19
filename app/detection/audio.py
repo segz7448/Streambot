@@ -22,8 +22,8 @@ class LoudnessSample:
 def loudness_samples(ffmpeg: str, path: str) -> list[LoudnessSample]:
     """Return momentary loudness (LUFS) samples for a media file."""
     proc = subprocess.run(
-        [ffmpeg, "-nostats", "-i", path, "-filter_complex", "ebur128",
-         "-f", "null", "-"],
+        [ffmpeg, "-nostats", "-protocol_whitelist", "file",
+         "-i", path, "-filter_complex", "ebur128", "-f", "null", "-"],
         capture_output=True, text=True, timeout=120)
     samples: list[LoudnessSample] = []
     for line in proc.stderr.splitlines():

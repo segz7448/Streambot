@@ -52,12 +52,24 @@ class RollingBuffer:
                 "-reset_timestamps", "1", pattern]
 
     def segments(self) -> list[Segment]:
+        paths = sorted(self.dir.glob("seg-*.ts"))
+        anchor_t: float | None = None
+        anchor_seq = 0
         out = []
-        for path in sorted(self.dir.glob("seg-*.ts")):
+        for path in paths:
             seq = int(path.stem.split("-")[1])
+            mt = path.stat().st_mtime
+            if anchor_t is None:
+                anchor_t, anchor_seq = mt, seq
+            # Content position, not wall clock: a live capture's mtimes
+            # track anchor + seq*segment_seconds, but a finite feed (a
+            # registered local recording) is consumed as fast as ffmpeg
+            # can read it, compressing mtimes and breaking event-window
+            # math. Sequence-derived content time keeps both honest.
+            created = anchor_t + (seq - anchor_seq) * float(
+                self.segment_seconds)
             out.append(Segment(self.session_id, seq, path,
-                               float(self.segment_seconds),
-                               path.stat().st_mtime))
+                               float(self.segment_seconds), created))
         return out
 
     def event_window(self, event_time: float) -> list[Path]:

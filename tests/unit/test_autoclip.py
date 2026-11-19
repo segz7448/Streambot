@@ -130,7 +130,7 @@ class AutoClipTests(unittest.TestCase):
         # unique index + INSERT OR IGNORE keep exactly one clips row.
         calls = {"n": 0}
 
-        def flaky(ffmpeg, buffer, ts, out):
+        def flaky(ffmpeg, buffer, ts, out, **kw):
             calls["n"] += 1
             Path(out).write_text("clip-bytes")
             if calls["n"] == 1:

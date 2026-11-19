@@ -51,7 +51,10 @@ class BotService:
             MessageHandler(filters.TEXT & filters.COMMAND, self._command))
         self.app.add_handler(MessageHandler(
             (filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND,
-            self._media))
+            self._media, block=False))
+        # one video at a time: processing is heavy on this host
+        import asyncio as _asyncio
+        self._media_sem = _asyncio.Semaphore(1)
         # true pre-ack: wrap the update queue's put so command updates
         # are persisted before the framework advances its offset
         from . import ops as _ops
@@ -87,13 +90,14 @@ class BotService:
                              lambda c: cf.checklive_reply(self._state_dir(), c.args),
                              "check if a channel is live: /checklive <username>")
         self.router.register("startclip",
-                             lambda c: cf.startclip_reply(self._state_dir(), c.args),
-                             "start an authorized clipping session")
+                             lambda c: self._startclip(c.args),
+                             "start an authorized clipping session over "
+                             "the source's registered feed")
         self.router.register("stopclip",
-                             lambda c: cf.stopclip_reply(self._state_dir(), c.args),
+                             lambda c: self._stopclip(),
                              "stop active clipping sessions")
         self.router.register("sessions",
-                             lambda c: cf.sessions_reply(self._state_dir(), c.args),
+                             lambda c: self._sessions(),
                              "list clipping sessions")
         self.router.register("clips",
                              lambda c: cf.clips_reply(self._state_dir(), c.args),
@@ -143,6 +147,20 @@ class BotService:
     def _deliveries(self, cmd) -> str:
         from . import ops
         return ops.deliveries_reply(self._state_dir(), cmd.args)
+
+    def _startclip(self, args: str) -> str:
+        from . import media as bot_media
+        from . import sessions as sess
+        ff, fp = bot_media.ffmpeg_paths()
+        return sess.startclip_reply(self._state_dir(), args, ff, fp)
+
+    def _stopclip(self) -> str:
+        from . import sessions as sess
+        return sess.stopclip_reply(self._state_dir())
+
+    def _sessions(self) -> str:
+        from . import sessions as sess
+        return sess.sessions_reply(self._state_dir())
 
     # --- real handler implementations (registered => advertised) ---
 
@@ -280,9 +298,17 @@ class BotService:
             self.watermark.mark_handled(update.update_id)
             return
         try:
-            from . import media as bot_media
-            reply = await bot_media.ingest_media(update, context.bot,
-                                                 self._state_dir())
+            if self._media_sem.locked():
+                self.inbox.remove(update.update_id)
+                self.watermark.mark_handled(update.update_id)
+                await message.reply_text(
+                    "I'm still processing the previous video. Send this "
+                    "one again when it's done.")
+                return
+            async with self._media_sem:
+                from . import media as bot_media
+                reply = await bot_media.ingest_media(
+                    update, context.bot, self._state_dir())
             if reply:
                 await message.reply_text(reply)
             self.inbox.remove(update.update_id)
@@ -303,6 +329,12 @@ class BotService:
 
     def run(self) -> None:
         log.info("telegram service starting (long polling)")
+        from . import sessions as _sess_mod
+        from ..pipeline.session import recover_interrupted_sessions
+        recovered = recover_interrupted_sessions(self._state_dir())
+        if recovered:
+            log.warning("marked %d crashed session(s) INTERRUPTED",
+                        recovered)
         self.drain_inbox()
         # keep the pending backlog: commands sent during a restart must be
         # processed, not discarded; the watermark makes replays idempotent

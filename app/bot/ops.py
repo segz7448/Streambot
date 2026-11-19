@@ -136,7 +136,7 @@ def _journal_read(state_dir: Path) -> dict:
         return {}
 
 
-SIDE_EFFECTING = ("clipnow", "relay", "ingest")
+SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries")
 
 
 def journal_result(state_dir: Path, update_id: int, command: str):
@@ -311,7 +311,16 @@ def drain_inbox(state_dir: Path, router, watermark: UpdateWatermark,
 def deliveries_reply(state_dir: Path, args: str,
                      deliver_fn=None) -> str:
     """List HELD clips; '/deliveries flush' sends them to the admin on
-    explicit request. Mode C never delivers media by itself."""
+    explicit request. Mode C never delivers media by itself.
+
+    Per-clip durability: each clip's send is journaled and committed
+    INDIVIDUALLY - a crash mid-flush keeps clips 1..N delivered. A
+    clip whose send raised is marked UNCERTAIN (it may already have
+    reached Telegram) and is never blind-resent; it stays visible for
+    reconciliation. A clip journaled delivered but still HELD in the
+    DB (crash between send and update) is reconciled to DELIVERED
+    without resending. No exactly-once claim: the uncertain state is
+    the honest answer for a send interrupted mid-flight."""
     import os as _os
     import time as _time
     from ..core.database import connect
@@ -320,10 +329,16 @@ def deliveries_reply(state_dir: Path, args: str,
         "SELECT id, file_path, duration_seconds FROM clips"
         " WHERE status='HELD' ORDER BY id").fetchall()
     if args.strip() != "flush":
+        uncertain = {e["update_id"] for e in journal_uncertain(state_dir)
+                     if e.get("command") == "deliver"}
         conn.close()
         if not rows:
             return "No held clips. Send a video to make one."
-        lines = [f"#{r[0]} ({r[2]:.0f}s)" for r in rows]
+        lines = []
+        for cid, _path, dur in rows:
+            note = " (send uncertain - may already be sent)" \
+                if cid in uncertain else ""
+            lines.append(f"#{cid} ({dur:.0f}s){note}")
         return ("Held clips: " + ", ".join(lines) +
                 ". /deliveries flush sends them to you.")
     if not rows:
@@ -334,20 +349,40 @@ def deliveries_reply(state_dir: Path, args: str,
         token_path = _os.environ["NOVA_TOKEN_FILE"]
         deliver_fn = lambda path, caption: deliver_clip_sync(
             token_path, str(state_dir), path, caption)
-    sent = failed = 0
+    sent = failed = uncertain = 0
     for cid, path, dur in rows:
-        try:
-            deliver_fn(path, f"NOVA clip #{cid} ({dur:.0f}s)")
+        if journal_result(state_dir, cid, "deliver") is not None:
+            # sent earlier, crash before DB update: reconcile, no resend
             conn.execute(
                 "UPDATE clips SET status='DELIVERED', delivered_at=?"
                 " WHERE id=?", (_time.time(), cid))
+            conn.commit()
+            sent += 1
+            continue
+        prior = [e for e in journal_uncertain(state_dir)
+                 if e["update_id"] == cid and e.get("command") == "deliver"]
+        if prior:
+            uncertain += 1
+            continue  # may already have been sent; never blind-resend
+        try:
+            mid = deliver_fn(path, f"NOVA clip #{cid} ({dur:.0f}s)")
+            journal_record(state_dir, cid, "deliver", f"message {mid}")
+            conn.execute(
+                "UPDATE clips SET status='DELIVERED', delivered_at=?"
+                " WHERE id=?", (_time.time(), cid))
+            conn.commit()  # per-clip: survives a crash on the next one
             sent += 1
         except Exception:
+            journal_mark_uncertain(state_dir, cid, "deliver", str(path))
             failed += 1
-    conn.commit()
     conn.close()
-    return (f"Delivered {sent} clip(s)"
-            + (f"; {failed} failed and stay held." if failed else "."))
+    parts = [f"Delivered {sent} clip(s)"]
+    if failed:
+        parts.append(f"{failed} uncertain (may already be sent; held "
+                     "for reconciliation, NOT resent)")
+    if uncertain:
+        parts.append(f"{uncertain} previously uncertain, skipped")
+    return "; ".join(parts) + "."
 
 
 def clipnow_reply(state_dir: Path, channel: str, update_id: int = 0) -> str:

@@ -31,6 +31,53 @@ log = get_logger("clipping.retrospective")
 PRE_ROLL_SECONDS = 10.0
 MIN_CLIP_SECONDS = 5.0
 BASELINE_RETURN_LUFS = 2.0
+MAX_INPUT_SECONDS = 3600.0
+MAX_INPUT_WIDTH = 3840
+MAX_INPUT_HEIGHT = 2160
+
+
+class ValidationError(Exception):
+    """Input recording failed fail-closed validation."""
+
+
+def validate_recording(ffprobe: str, src: str,
+                       max_seconds: float = MAX_INPUT_SECONDS) -> dict:
+    """Fail-closed input validation BEFORE any analysis: the file must
+    probe cleanly (network protocols disabled in the probe), contain a
+    video stream within resolution bounds, have a known bounded
+    duration, and not be a playlist format (hls/dash/concat containers
+    could reference network or local resources). Raises
+    ValidationError on any failure."""
+    try:
+        meta = probe(ffprobe, src)
+    except Exception as exc:
+        raise ValidationError(f"not a readable media file: {exc}")
+    fmt = str(meta.get("format", {}).get("format_name", "")).lower()
+    if any(bad in fmt for bad in ("hls", "dash", "m3u", "concat")):
+        raise ValidationError(f"playlist container {fmt!r} not accepted")
+    streams = meta.get("streams", [])
+    video = next((s for s in streams
+                  if s.get("codec_type") == "video"), None)
+    if video is None:
+        raise ValidationError("no video stream")
+    width = int(video.get("width", 0) or 0)
+    height = int(video.get("height", 0) or 0)
+    if width <= 0 or height <= 0:
+        raise ValidationError("video stream has no dimensions")
+    if width > MAX_INPUT_WIDTH or height > MAX_INPUT_HEIGHT:
+        raise ValidationError(
+            f"resolution {width}x{height} above "
+            f"{MAX_INPUT_WIDTH}x{MAX_INPUT_HEIGHT}")
+    try:
+        duration = float(meta.get("format", {}).get("duration", 0) or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        raise ValidationError("duration unknown")
+    if duration > max_seconds:
+        raise ValidationError(
+            f"duration {duration:.0f}s above {max_seconds:.0f}s limit")
+    return {"duration": duration, "width": width, "height": height}
 
 
 def content_window(samples: list, spike_t: float,
@@ -60,7 +107,8 @@ def extract_window(ffmpeg: str, src: str, out: str, start: float,
     breaks downstream concat/edit on the device build)."""
     import subprocess
     proc = subprocess.run(
-        [ffmpeg, "-y", "-ss", f"{start:.3f}", "-i", src, "-t",
+        [ffmpeg, "-y", "-protocol_whitelist", "file",
+         "-ss", f"{start:.3f}", "-i", src, "-t",
          f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast",
          "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a",
          "128k", "-movflags", "+faststart", out],
@@ -79,6 +127,7 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
                       extract_fn: Callable = extract_window,
                       edit_fn: Callable = edit_clip,
                       qc_fn: Callable = check_media,
+                      validate_fn: Callable = validate_recording,
                       runtime_dir: str = ".nova-runtime") -> dict:
     """Run detect -> size -> plan -> extract -> edit -> QC over a local
     recording. Returns an evidence dict; never fabricates a clip: when
@@ -86,6 +135,9 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     extracted."""
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
+    # fail closed: validation runs even when the caller claims to have
+    # validated (defense in depth; the probe disables network protocols)
+    validate_fn(ffprobe, src_path)
     result: dict = {"source": source_label, "src": src_path}
 
     samples = audio_fn(ffmpeg, src_path)

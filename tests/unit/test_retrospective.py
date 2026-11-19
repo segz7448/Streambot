@@ -49,6 +49,8 @@ class ProcessRecordingTests(unittest.TestCase):
             extract_fn=lambda ff, s, o, st, d: Path(o).write_bytes(b"x" * 20000) or Path(o),
             edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
             qc_fn=lambda fp, ff, p, a, b, c, d: type("QC", (), {"ok": True, "failures": []})(),
+            validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,
+                                       "height": 240},
         )
         args.update(over)
         return retrospective.process_recording(**args)

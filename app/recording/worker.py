@@ -42,6 +42,13 @@ class RecordingWorker:
                 self.buffer.enforce_storage_cap()
                 if not proc.running:
                     rc, stderr = await proc.wait()
+                    if rc == 0:
+                        # finite feed fully consumed: clean completion,
+                        # not a crash - the session finalizes what was
+                        # recorded
+                        log.info("feed exhausted (clean exit); "
+                                 "recording complete")
+                        return
                     raise RuntimeError(
                         f"ffmpeg exited rc={rc}: {stderr[:300]!r}")
                 await asyncio.sleep(self.sweep_seconds)

@@ -110,7 +110,10 @@ class Supervisor:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, self.stopping.set)
-            except NotImplementedError:  # pragma: no cover - non-unix
+            except (NotImplementedError, ValueError, RuntimeError):
+                # non-unix, or not the main thread (command-driven
+                # sessions run the supervisor on a worker thread;
+                # stopping is then driven via the stopping event)
                 pass
         self._tasks = [asyncio.create_task(self._supervise(s), name=s.name)
                        for s in self.services]

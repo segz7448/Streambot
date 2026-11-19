@@ -25,6 +25,7 @@ class AutoClipper:
     def __init__(self, buffer: RollingBuffer, db_path: str,
                  provider: IntelligenceProvider, ffmpeg: str,
                  out_dir: str, min_score: float = 0.6,
+                 pre_seconds: float = 20.0, post_seconds: float = 10.0,
                  extract_fn: Callable = extract_clip):
         self.buffer = buffer
         self.db_path = db_path
@@ -32,6 +33,8 @@ class AutoClipper:
         self.ffmpeg = ffmpeg
         self.out_dir = out_dir
         self.min_score = min_score
+        self.pre_seconds = pre_seconds
+        self.post_seconds = post_seconds
         self.extract_fn = extract_fn
 
     def _pending_events(self, conn) -> list[dict]:
@@ -62,7 +65,7 @@ class AutoClipper:
                   if e["kind"] == "scene_change"]
         try:
             moments = self.provider.score_moments(
-                self.buffer.session_seconds, spikes, scenes)
+                self.buffer.segment_seconds, spikes, scenes)
         except QuotaExhausted:
             # AI understanding was requested; a spent quota means the
             # pipeline is DEGRADED/OFFLINE, not silently heuristic. Queue
@@ -91,8 +94,10 @@ class AutoClipper:
             out = (f"{self.out_dir}/clip-{self.buffer.session_id}-"
                    f"{event['id']}.mp4")
             try:
-                path = self.extract_fn(self.ffmpeg, self.buffer, event["at"],
-                                       out)
+                path = self.extract_fn(self.ffmpeg, self.buffer,
+                                       event["at"], out,
+                                       pre_seconds=self.pre_seconds,
+                                       post_seconds=self.post_seconds)
             except Exception as exc:
                 log.warning("clip extraction failed for event %s: %s",
                             event["id"], exc)

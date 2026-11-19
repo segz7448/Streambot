@@ -27,8 +27,8 @@ class QCResult:
 
 def probe(ffprobe: str, path: str) -> dict:
     proc = subprocess.run(
-        [ffprobe, "-v", "error", "-show_format", "-show_streams",
-         "-of", "json", path],
+        [ffprobe, "-v", "error", "-protocol_whitelist", "file",
+         "-show_format", "-show_streams", "-of", "json", path],
         capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
         raise RuntimeError(f"ffprobe rc={proc.returncode}: {proc.stderr[:200]!r}")

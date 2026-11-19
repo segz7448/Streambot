@@ -17,7 +17,8 @@ def scene_changes(ffmpeg: str, path: str,
                   threshold: float = 0.4) -> list[tuple[float, float]]:
     """Return (t, score) for frames whose scene score exceeds threshold."""
     proc = subprocess.run(
-        [ffmpeg, "-nostats", "-i", path,
+        [ffmpeg, "-nostats", "-protocol_whitelist", "file",
+         "-i", path,
          "-vf", "select='gte(scene,0)',metadata=print:key=lavfi.scene_score",
          "-f", "null", "-"],
         capture_output=True, text=True, timeout=120)
