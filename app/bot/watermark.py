@@ -9,7 +9,10 @@ idempotent across restarts without dropping pending updates.
 An update whose handler FAILED is recorded in a failed set; the
 monotonic watermark never suppresses it, so a later successful update
 cannot skip an earlier failed one, and a redelivery of the failed update
-is processed again. The failed set is capped and thread-safe.
+is processed again. The failed set is never evicted: failed updates
+persist until they succeed or an operator clears them (an operator
+alert threshold is exposed via MAX_FAILED), so no failure is silently
+forgotten. Thread-safe.
 """
 from __future__ import annotations
 
@@ -60,5 +63,11 @@ class UpdateWatermark:
             handled, failed = self._read()
             if update_id not in failed:
                 failed.append(update_id)
-                failed = failed[-MAX_FAILED:]
+            # never evict: a failed update stays retryable until it
+            # succeeds or an operator clears state; overflow is loud
+            if len(failed) > MAX_FAILED:
+                import logging
+                logging.getLogger("bot.watermark").critical(
+                    "failed-update set exceeds %d entries; operator "
+                    "attention required", MAX_FAILED)
             self._write(handled, failed)

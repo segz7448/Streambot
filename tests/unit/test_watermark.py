@@ -49,11 +49,15 @@ class WatermarkTests(unittest.TestCase):
         self.wm.mark_handled(100)
         self.assertTrue(self.wm.already_handled(100))
 
-    def test_failed_set_capped(self):
+    def test_failed_set_never_evicted(self):
         for i in range(1, 300):
             self.wm.mark_failed(i)
         _, failed = self.wm._read()
-        self.assertLessEqual(len(failed), 200)
+        self.assertEqual(len(failed), 299)  # fail loud, never suppress
+        # even beyond the alert threshold, the oldest failure stays retryable
+        self.assertFalse(self.wm.already_handled(1))
+        self.wm.mark_handled(1)
+        self.assertTrue(self.wm.already_handled(1))
 
     def test_corrupt_file_treated_as_fresh(self):
         Path(self.path).write_text("not json")
