@@ -162,3 +162,31 @@ Constraints the owner must hear before consenting:
   private.
 No authorization has been requested or taken; consent, when asked, names
 the exact access (youtube.upload only).
+
+## Deployment + hardening (2026-11-19, 03:04-03:47 PST)
+
+Deployed build: e8387be on agt-3f177cf6, deployment id
+f6dcf994-885e-4903-86e5-28c9b5501f19 (RUNNING). Deploy pulls main HEAD
+at deploy time - the payload has no pin field (reproducibility gap,
+noted). Earlier deployments stopped/removed; pairing + watermark state
+survived both redeploys.
+
+- On-device smoke (prefix Python 3.14): new-module suites 26/26 OK.
+- rtmpfilter: rtmp(s) URLs reduced to scheme://host/<redacted> in all
+  log records. Residual boundary documented: stream keys ride in ffmpeg
+  argv, visible only to same-UID processes under Android sandbox;
+  destinations live in 0600 state files, never in the repo.
+- Pre-ack inbox (inbox.py + ops.drain_inbox): closes the
+  confirm-to-handle gap - commands persisted BEFORE dispatch, removed
+  after success, stranded entries replayed at startup, idempotent via
+  watermark; failures stay for the next drain. 5 unit tests incl.
+  crash-strand and next-boot-retry scenarios.
+- CONTROLLED LOCAL RESTREAM LIFECYCLE - VERIFIED on device with real
+  ffmpeg (25s h264/aac feed, two local .flv destinations, no real RTMP
+  endpoint or stream keys involved): outputs grew 256KiB->512KiB while
+  active; SIGKILL of one process is REAPED (a zombie-counting bug was
+  found by this probe and fixed in e8387be: manager now poll()s its
+  Popen handles / waitpid for foreign children); /stoprelay path
+  SIGTERMs the survivor, which finalizes its file (832164 bytes);
+  pid file clean afterwards. RTMP-network acceptance (a real streaming
+  endpoint) remains untested - needs the owner's actual destination.
