@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from app.intelligence.memory import Memory
-from app.intelligence.planner import SHORTS_MAX_SECONDS, plan_clip
+from app.intelligence.planner import (EDITORIAL_DEFAULT_SECONDS,
+                                      SHORTS_MAX_SECONDS, plan_clip)
 
 
 class MemoryTests(unittest.TestCase):
@@ -42,8 +43,14 @@ class PlannerTests(unittest.TestCase):
     def test_default_plan_uses_verified_rules(self):
         plan = plan_clip("audio_spike", "somechannel", self.mem,
                          game="Elden Ring")
-        self.assertEqual(plan.target_seconds, SHORTS_MAX_SECONDS)
+        self.assertEqual(plan.target_seconds, EDITORIAL_DEFAULT_SECONDS)
         self.assertTrue(any("risk" in r for r in plan.reasons))
+        sized = plan_clip("audio_spike", "somechannel", self.mem,
+                          game="Elden Ring", content_seconds=12)
+        self.assertEqual(sized.target_seconds, 12)  # never padded
+        long_ev = plan_clip("audio_spike", "c", self.mem,
+                            content_seconds=400)
+        self.assertEqual(long_ev.target_seconds, SHORTS_MAX_SECONDS)
         self.assertEqual(plan.preset, "vertical")
         self.assertLessEqual(len(plan.title), 100)
         self.assertIn("eldenring", plan.tags)
@@ -56,8 +63,9 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.target_seconds, SHORTS_MAX_SECONDS)
         self.mem.remember("preference", "shorts_target_seconds", "45",
                           "owner")
-        plan = plan_clip("audio_spike", "chan", self.mem)
-        self.assertEqual(plan.target_seconds, 45)
+        plan = plan_clip("audio_spike", "chan", self.mem,
+                         content_seconds=12)
+        self.assertEqual(plan.target_seconds, 45)  # owner wins over content
         self.mem.remember("preference", "watermark", "@zenas", "owner")
         plan = plan_clip("audio_spike", "chan", self.mem)
         self.assertEqual(plan.watermark, "@zenas")

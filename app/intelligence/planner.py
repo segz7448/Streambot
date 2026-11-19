@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 # verified policy constants (sources in module docstring)
 SHORTS_MAX_SECONDS = 180
 TITLE_MAX_CHARS = 100
+EDITORIAL_DEFAULT_SECONDS = 30  # ours, not policy: used only when no
+                                # content window or owner preference
 
 DEFAULT_TAGS = ["gaming", "gameplay", "twitch", "clip"]
 
@@ -48,20 +50,29 @@ class ClipPlan:
 
 
 def plan_clip(event_kind: str, source_login: str, memory,
-              game: str = "") -> ClipPlan:
+              game: str = "", content_seconds: float = 0.0) -> ClipPlan:
     """Build a clip plan from the event and stored memory."""
     reasons: list[str] = []
     # duration: policy cap, derived claim-safe default, owner override wins
+    # 180s is a MAXIMUM, never a target: size from the content window,
+    # owner preference overrides, never pad a short moment
     pref = memory.get("preference", "shorts_target_seconds")
     if pref and pref["confidence"] == "stated":
         target = int(pref["value"])
         reasons.append(f"duration {target}s from owner preference")
+    elif content_seconds > 0:
+        target = int(content_seconds)
+        reasons.append(f"duration {target}s sized to the detected "
+                       "content window; not padded")
     else:
-        target = SHORTS_MAX_SECONDS
-        reasons.append("duration 180s = the Shorts maximum and the "
-                       "owner's stated target (policy: "
-                       "support.google.com/youtube/answer/15424877)")
+        target = EDITORIAL_DEFAULT_SECONDS
+        reasons.append(f"duration {EDITORIAL_DEFAULT_SECONDS}s editorial "
+                       "default (no content window known); owner "
+                       "preference overrides")
     target = min(target, SHORTS_MAX_SECONDS)
+    if target == SHORTS_MAX_SECONDS:
+        reasons.append("capped at 180s Shorts maximum (policy: "
+                       "support.google.com/youtube/answer/15424877)")
     if target > 60:
         reasons.append("risk: a Short over 60s with ANY active copyright "
                        "claim is blocked globally (same source); original "
