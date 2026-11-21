@@ -12,9 +12,10 @@ the consumer then POSTs the admission notice to the configured n8n
 webhook.
 
 Scope honesty:
-- The external effect today is one authenticated HTTP POST of the
-  admission notice. No upload is performed here: YouTube authorization
-  is on hold and the media transport is unresolved.
+- Default mode: one authenticated HTTP POST of the admission notice.
+  With NOVA_NATIVE_UPLOAD=1 (default off) the consumer instead uploads
+  the admitted clip to YouTube as PRIVATE on-device via
+  app.bot.native_upload; the webhook is not used in that mode.
 - Exactly-once external effect is NOT claimed. A crash between a
   successful POST and the local job completion re-POSTs on reclaim.
   Every POST carries the durable handoff_job_id as the X-Handoff-Id
@@ -39,6 +40,7 @@ recorded redacted (class name only, never the URL or response body).
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -46,6 +48,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -188,8 +191,29 @@ def _process_one_admission(conn, state_dir: Path) -> bool:
         return True
     try:
         from ..core.intake import ClipIntakeAuthority
+        # Admitted metadata comes from the pipeline's own durable rows
+        # (the clip's candidate-event title, the session's registered
+        # source), never from claims inside the job payload.
+        title = streamer = None
+        try:
+            mrow = conn.execute(
+                "SELECT e.metadata_json AS meta, t.username AS source"
+                " FROM clips c"
+                " LEFT JOIN candidate_events e ON c.event_id = e.id"
+                " LEFT JOIN stream_sessions s ON c.session_id = s.id"
+                " LEFT JOIN twitch_sources t ON s.source_id = t.id"
+                " WHERE c.id = ?", (clip_row_id,)).fetchone()
+            if mrow is not None:
+                streamer = mrow["source"] or None
+                if mrow["meta"]:
+                    title = (json.loads(mrow["meta"]) or {}).get("title")
+        except Exception:
+            log.warning("admission job %s: stored metadata unreadable;"
+                        " admitting with registry fallbacks", job_id)
+            title = streamer = None
         verdict = ClipIntakeAuthority(
-            str(Path(state_dir) / "nova.db")).admit_clip(clip_row_id)
+            str(Path(state_dir) / "nova.db")).admit_clip(
+            clip_row_id, title=title, streamer=streamer)
     except Exception as exc:
         queue.fail(job_id, f"admission: {exc.__class__.__name__}")
         log.warning("admission job %s failed: %s",
@@ -205,23 +229,75 @@ def _process_one_admission(conn, state_dir: Path) -> bool:
     return True
 
 
+CONSUMER_LOCK_NAME = "handoff-consumer.lock"
+
+
+@contextmanager
+def _consumer_lock(state_dir: Path):
+    """Single live consumer per state dir, across EVERY mode: admission
+    processing, the native upload branch, the webhook branch and crash
+    recovery all run under this flock. A second live consumer (any
+    mode, any process) skips instead of overlapping, so queue
+    transitions never race a live worker."""
+    fd = os.open(str(Path(state_dir) / CONSUMER_LOCK_NAME),
+                 os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def run_once(state_dir: Path, *,
              ffprobe: str = "ffprobe",
              probe_fn: Optional[Callable[[str], dict]] = None,
              post_fn: Optional[Callable[[str, dict, dict], None]] = None,
+             publisher_factory: Optional[Callable] = None,
              ) -> str:
     """One claim-and-process cycle. Synchronous; call from a thread.
 
     Pending admissions are processed first (local-only, no webhook
     needed). Returns PROCESSED when one job was handled (whatever its
     outcome), UNCONFIGURED when only handoff work remains but no webhook
-    is configured, IDLE when nothing is pending.
+    is configured, IDLE when nothing is pending or another live
+    consumer holds the state-dir lock.
     """
+    state_dir = Path(state_dir)
+    with _consumer_lock(state_dir) as acquired:
+        if not acquired:
+            log.warning("handoff consumer: another live consumer holds "
+                        "the state lock; skipping cycle")
+            return IDLE
+        return _run_once_locked(state_dir, ffprobe=ffprobe,
+                                probe_fn=probe_fn, post_fn=post_fn,
+                                publisher_factory=publisher_factory)
+
+
+def _run_once_locked(state_dir: Path, *,
+                     ffprobe: str = "ffprobe",
+                     probe_fn: Optional[Callable[[str], dict]] = None,
+                     post_fn: Optional[Callable[[str, dict, dict], None]] = None,
+                     publisher_factory: Optional[Callable] = None,
+                     ) -> str:
     state_dir = Path(state_dir)
     conn = connect(str(state_dir / "nova.db"))
     try:
         if _process_one_admission(conn, state_dir):
             return PROCESSED
+        from . import native_upload
+        if native_upload.enabled():
+            # Native mode (NOVA_NATIVE_UPLOAD=1, default off): upload the
+            # admitted clip directly as PRIVATE. No webhook, no n8n.
+            return PROCESSED if native_upload.process_one(
+                conn, state_dir, publisher_factory=publisher_factory,
+                probe_fn=probe_fn, ffprobe=ffprobe) else IDLE
         config = _webhook_config()
         if config is None:
             return UNCONFIGURED
@@ -295,19 +371,26 @@ def recover(state_dir: Path) -> int:
     """Requeue interrupted admission and handoff jobs after a crash.
     Scoped to this consumer's own two kinds: unrelated job kinds and
     their external effects are never replayed by this path. Call once at
-    service startup before the consumer loop starts."""
-    conn = connect(str(Path(state_dir) / "nova.db"))
-    try:
-        with conn:
-            cur = conn.execute(
-                "UPDATE job_queue SET state = 'PENDING', locked_by = NULL,"
-                " locked_at = NULL, updated_at = ? WHERE kind IN (?, ?)"
-                " AND state NOT IN ('PENDING', 'COMPLETED', 'FAILED',"
-                " 'CANCELLED')",
-                (time.time(), ADMIT_JOB_KIND, HANDOFF_JOB_KIND))
-            return int(cur.rowcount)
-    finally:
-        conn.close()
+    service startup before the consumer loop starts. Runs under the
+    shared consumer lock: with a live consumer present it skips rather
+    than requeueing jobs a live worker may hold."""
+    with _consumer_lock(Path(state_dir)) as acquired:
+        if not acquired:
+            log.warning("handoff recover: a live consumer holds the "
+                        "state lock; skipping recovery")
+            return 0
+        conn = connect(str(Path(state_dir) / "nova.db"))
+        try:
+            with conn:
+                cur = conn.execute(
+                    "UPDATE job_queue SET state = 'PENDING',"
+                    " locked_by = NULL, locked_at = NULL, updated_at = ?"
+                    " WHERE kind IN (?, ?) AND state NOT IN ('PENDING',"
+                    " 'COMPLETED', 'FAILED', 'CANCELLED')",
+                    (time.time(), ADMIT_JOB_KIND, HANDOFF_JOB_KIND))
+                return int(cur.rowcount)
+        finally:
+            conn.close()
 
 
 async def run_consumer(state_dir: Path, *, poll_interval: float = 5.0,

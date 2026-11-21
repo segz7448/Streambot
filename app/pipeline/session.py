@@ -100,13 +100,51 @@ class ClipSession:
                 qc = check_media(self.ffprobe, self.ffmpeg, str(edited),
                                  1.0, 100, 100, True)
                 if qc.ok:
-                    conn.execute(
-                        "UPDATE clips SET file_path=?, preset=?,"
-                        " status='HELD', qc_report_json=? WHERE id=?",
-                        (str(edited), plan.preset,
-                         json.dumps({"qc_passed": True,
-                                     "plan_reasons": plan.reasons}),
-                         clip_id))
+                    # Atomic HELD-to-admission outbox: the HELD update,
+                    # the stored-metadata update and the durable
+                    # admission job commit in ONE transaction, so a
+                    # failed outbox write rolls the clip back instead
+                    # of silently stranding it with no admission. The
+                    # outer per-clip handler then marks it FAILED and
+                    # visible, and other clips are unaffected.
+                    from ..bot.handoff import ADMIT_JOB_KIND
+                    from ..core.jobs import JobQueue
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE clips SET file_path=?, preset=?,"
+                            " status='HELD', qc_report_json=? WHERE id=?",
+                            (str(edited), plan.preset,
+                             json.dumps({"qc_passed": True,
+                                         "plan_reasons": plan.reasons}),
+                             clip_id))
+                        # Stored pipeline metadata the admission flow
+                        # reads: the planner's title on the clip's own
+                        # candidate event (streamer comes from the
+                        # session's registered source row). Durable, no
+                        # schema change, never a job-payload claim.
+                        ev = conn.execute(
+                            "SELECT metadata_json FROM candidate_events"
+                            " WHERE id = (SELECT event_id FROM clips"
+                            " WHERE id = ?)", (clip_id,)).fetchone()
+                        try:
+                            meta = (json.loads(ev["metadata_json"])
+                                    if ev and ev["metadata_json"] else {})
+                            if not isinstance(meta, dict):
+                                meta = {}
+                        except Exception:
+                            meta = {}
+                        meta["title"] = plan.title
+                        conn.execute(
+                            "UPDATE candidate_events SET metadata_json = ?"
+                            " WHERE id = (SELECT event_id FROM clips"
+                            " WHERE id = ?)", (json.dumps(meta), clip_id))
+                        JobQueue(conn).enqueue(
+                            ADMIT_JOB_KIND, {"clip_row_id": int(clip_id)})
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
                     mem.remember(
                         "clip", f"session:{session_id}:{clip_id}",
                         f"{dur:.0f}s {plan.preset} clip from "
@@ -126,29 +164,6 @@ class ClipSession:
                     (clip_id,))
         conn.commit()
         if held_ids:
-            # Authoritative intake admission: each newly HELD clip gets
-            # its own durable admission job (kind 'clip_intake_admit').
-            # The handoff consumer performs the admission itself with
-            # bounded scheduled retry and owner-visible terminal
-            # failure, so an admission problem can never fail the
-            # finish or silently drop the clip. Per-clip isolation: one
-            # clip's enqueue failure is logged and never skips the
-            # others; the durable job makes a missed admission
-            # recoverable.
-            from ..bot.handoff import ADMIT_JOB_KIND
-            from ..core.jobs import JobQueue
-            for cid in held_ids:
-                try:
-                    aconn = connect(str(self.state_dir / "nova.db"))
-                    try:
-                        JobQueue(aconn).enqueue(
-                            ADMIT_JOB_KIND, {"clip_row_id": int(cid)})
-                    finally:
-                        aconn.close()
-                except Exception as exc:
-                    log.warning("admission enqueue failed for clip %s "
-                                "in session %s: %s", cid, session_id,
-                                exc)
             # automatic delivery ergonomics: when the owner preference
             # is on (default), QC-passed clips go to the paired admin
             # right away instead of waiting for /deliveries flush.

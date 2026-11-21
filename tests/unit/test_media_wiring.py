@@ -269,3 +269,41 @@ class MediaPathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServiceHandoffFfprobeTests(unittest.TestCase):
+    """The service entry must start the handoff consumer with the real
+    discovered device ffprobe, never the bare PATH default."""
+
+    def test_service_wires_discovered_ffprobe(self):
+        import asyncio
+        from unittest import mock
+        from app.bot import media as bot_media, handoff, service as svc_mod
+
+        captured = {}
+
+        async def fake_run_consumer(state_dir, *, poll_interval=5.0,
+                                    ffprobe="ffprobe"):
+            captured["ffprobe"] = ffprobe
+            captured["state_dir"] = str(state_dir)
+            await asyncio.sleep(3600)
+
+        svc = object.__new__(svc_mod.BotService)
+        svc._state_dir = lambda: pathlib.Path("/tmp/nonexistent-nova-state")
+        with mock.patch.object(bot_media, "ffmpeg_paths",
+                               return_value=("/dev/ffmpeg",
+                                             "/dev/discovered-ffprobe")), \
+             mock.patch.object(handoff, "run_consumer", fake_run_consumer):
+            asyncio.run(svc._start_handoff_consumer(None))
+            task = svc._handoff_task
+            try:
+                self.assertEqual(captured.get("ffprobe"),
+                                 "/dev/discovered-ffprobe")
+            finally:
+                async def _stop():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                asyncio.run(_stop())

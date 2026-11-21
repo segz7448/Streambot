@@ -217,25 +217,55 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
         (source_id, "RETROSPECTIVE", now, now, "upload",
          "mode C: owner-supplied recording"))
     session_id = cur.lastrowid
-    cur = conn.execute(
-        "INSERT INTO candidate_events (session_id, detected_at, kind,"
-        " confidence, status, metadata_json) VALUES (?,?,?,?,?,?)",
-        (session_id, now - duration, best["kind"], best["conf"],
-         "CLIPPED", json.dumps({"retrospective": True,
-                                "offset_seconds": best["t"]})))
-    event_id = cur.lastrowid
-    cur = conn.execute(
-        "INSERT INTO clips (event_id, session_id, file_path, preset,"
-        " duration_seconds, status, qc_report_json, created_at)"
-        " VALUES (?,?,?,?,?,?,?,?)",
-        (event_id, session_id, edited, preset.name, duration,
-         "HELD", json.dumps({"qc_passed": True}), now))
-    conn.commit()
+    # Stored pipeline metadata the admission flow reads: the admitted
+    # title names the detected kind, the registered source label and
+    # the duration (a synthetic fixture's label appears verbatim),
+    # never a job-payload claim.
+    admitted_title = (f"{best['kind']} clip from {source_label} "
+                      f"({duration:.0f}s)")
+    # Atomic HELD-to-admission outbox, the same durable path the
+    # session pipeline uses: the candidate event (with its stored
+    # title), the HELD clip row and the admission job (kind
+    # 'clip_intake_admit') commit in ONE explicit transaction (this
+    # connection is autocommit otherwise). A failed outbox write rolls
+    # the finish back instead of silently stranding the clip. The
+    # handoff consumer performs the real ClipIntakeAuthority policy
+    # verdict and only an ACCEPTED admission writes the durable
+    # handoff job, so a retrospective clip reaches upload eligibility
+    # exclusively through a genuine admission - never through a fake
+    # registry or job insertion.
+    from ..bot.handoff import ADMIT_JOB_KIND
+    from ..core.jobs import JobQueue
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "INSERT INTO candidate_events (session_id, detected_at,"
+            " kind, confidence, status, metadata_json) VALUES"
+            " (?,?,?,?,?,?)",
+            (session_id, now - duration, best["kind"], best["conf"],
+             "CLIPPED", json.dumps({"retrospective": True,
+                                    "offset_seconds": best["t"],
+                                    "title": admitted_title})))
+        event_id = cur.lastrowid
+        cur = conn.execute(
+            "INSERT INTO clips (event_id, session_id, file_path,"
+            " preset, duration_seconds, status, qc_report_json,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (event_id, session_id, edited, preset.name, duration,
+             "HELD", json.dumps({"qc_passed": True}), now))
+        clip_row_id = int(cur.lastrowid)
+        JobQueue(conn).enqueue(ADMIT_JOB_KIND,
+                               {"clip_row_id": clip_row_id})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
     conn.close()
-    result["clip_id"] = cur.lastrowid
+    result["clip_id"] = clip_row_id
 
     memory.remember(
-        "clip", f"retrospective:{cur.lastrowid}",
+        "clip", f"retrospective:{clip_row_id}",
         f"{duration:.0f}s {preset.name} clip from {source_label} "
         f"({best['kind']})", "mode C pipeline", confidence="observed")
     result["status"] = "held"

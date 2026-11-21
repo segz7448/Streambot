@@ -341,9 +341,13 @@ class BotService:
         self.watermark.mark_handled(update.update_id)
 
     async def _start_handoff_consumer(self, _app) -> None:
-        from . import handoff
+        from . import handoff, media as _media
+        # Real device media tools: the relocated termux prefix (or the
+        # NOVA_FFPROBE override), never a bare PATH guess.
+        _, ffprobe_path = _media.ffmpeg_paths()
         self._handoff_task = asyncio.create_task(
-            handoff.run_consumer(self._state_dir()))
+            handoff.run_consumer(self._state_dir(),
+                                 ffprobe=ffprobe_path))
 
     async def _stop_handoff_consumer(self, _app) -> None:
         task = getattr(self, "_handoff_task", None)

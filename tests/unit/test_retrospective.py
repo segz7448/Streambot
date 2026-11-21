@@ -120,3 +120,114 @@ class ProcessRecordingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetrospectiveAdmissionEnqueueTests(unittest.TestCase):
+    """A retrospective HELD clip must reach upload eligibility only via
+    the genuine durable admission path: one clip_intake_admit job whose
+    consumer performs the real ClipIntakeAuthority verdict."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        (self.dir / "src.mp4").write_bytes(b"fake")
+        self.mem = Memory(str(self.dir / "memory.json"))
+
+    def test_held_clip_enqueues_real_admission_job(self):
+        import json as _json
+        import sqlite3 as _sq
+        result = retrospective.process_recording(
+            ffmpeg="ff", ffprobe="fp", src_path=str(self.dir / "src.mp4"),
+            work_dir=str(self.dir / "work"), db_path=str(self.dir / "n.db"),
+            memory=self.mem,
+            audio_fn=lambda ff, p: _samples(),
+            scene_fn=lambda ff, p: [],
+            extract_fn=lambda ff, s, o, st, d: Path(o).write_bytes(b"x" * 20000) or Path(o),
+            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
+            qc_fn=lambda fp, ff, p, a, b, c, d: type("QC", (), {"ok": True, "failures": []})(),
+            validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,
+                                       "height": 240})
+        self.assertEqual(result["status"], "held")
+        conn = _sq.connect(str(self.dir / "n.db"))
+        jobs = conn.execute(
+            "SELECT kind, payload_json, state FROM job_queue").fetchall()
+        conn.close()
+        admits = [j for j in jobs if j[0] == "clip_intake_admit"]
+        self.assertEqual(len(admits), 1)
+        payload = _json.loads(admits[0][1])
+        self.assertEqual(payload["clip_row_id"], result["clip_id"])
+        self.assertEqual(admits[0][2], "PENDING")
+
+
+class GeneratedAdmissionCycleTests(unittest.TestCase):
+    """Generated completion -> real admission cycle -> bound handoff:
+    the first ACCEPTED verdict comes from handoff.run_once reading
+    stored pipeline metadata, never a direct admit or registry edit."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        (self.dir / "src.mp4").write_bytes(b"fake")
+        self.mem = Memory(str(self.dir / "memory.json"))
+
+    def _run(self, **over):
+        args = dict(
+            ffmpeg="ff", ffprobe="fp", src_path=str(self.dir / "src.mp4"),
+            work_dir=str(self.dir / "work"),
+            db_path=str(self.dir / "nova.db"), memory=self.mem,
+            source_label="synthetic-fixture",
+            audio_fn=lambda ff, p: _samples(),
+            scene_fn=lambda ff, p: [],
+            extract_fn=lambda ff, s, o, st, d: Path(o).write_bytes(b"x" * 20000) or Path(o),
+            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
+            qc_fn=lambda fp, ff, p, a, b, c, d: type("QC", (), {"ok": True, "failures": []})(),
+            validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,
+                                       "height": 240},
+        )
+        args.update(over)
+        return retrospective.process_recording(**args)
+
+    def test_first_acceptance_comes_from_consumer_with_stored_title(self):
+        import sqlite3 as _sq
+        from app.bot import handoff
+        result = self._run()
+        self.assertEqual(result["status"], "held")
+        status = handoff.run_once(
+            self.dir,
+            probe_fn=lambda p: {"format": {"duration": "30.0"},
+                                "streams": []})
+        self.assertEqual(status, handoff.PROCESSED)
+        conn = _sq.connect(str(self.dir / "nova.db"))
+        reg = conn.execute(
+            "SELECT status, title, streamer, handoff_job_id"
+            " FROM clip_intake").fetchone()
+        jobs = conn.execute(
+            "SELECT kind, state FROM job_queue ORDER BY id").fetchall()
+        conn.close()
+        self.assertEqual(reg[0], "ACCEPTED")
+        self.assertIn("synthetic-fixture", reg[1])  # synthetic labeled
+        self.assertEqual(reg[2], "synthetic-fixture")
+        self.assertIsNotNone(reg[3])  # bound handoff job id
+        kinds = {k: s for k, s in jobs}
+        self.assertEqual(kinds.get("clip_intake_admit"), "COMPLETED")
+        self.assertIn("clip_intake_handoff", kinds)
+
+    def test_admission_enqueue_failure_rolls_back_held_clip(self):
+        import sqlite3 as _sq
+        from app.core import jobs as jobs_mod
+        orig = jobs_mod.JobQueue.enqueue
+
+        def boom(self, *a, **k):
+            raise RuntimeError("simulated outbox write failure")
+        jobs_mod.JobQueue.enqueue = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self._run()
+        finally:
+            jobs_mod.JobQueue.enqueue = orig
+        conn = _sq.connect(str(self.dir / "nova.db"))
+        clips = conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0]
+        jobs_n = conn.execute(
+            "SELECT COUNT(*) FROM job_queue").fetchone()[0]
+        conn.close()
+        # atomic: no stranded HELD clip and no orphan admission job
+        self.assertEqual(clips, 0)
+        self.assertEqual(jobs_n, 0)
