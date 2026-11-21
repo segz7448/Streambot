@@ -16,10 +16,10 @@ What it refuses (fail closed, never retried here):
 Secrets: the signed token and playlist URL are held in memory only, are
 never logged, never put in exception text, and never appear in repr().
 Capture/upload is NOT performed here and nothing calls this module yet:
-turning it on needs the owner's source/rights decision (see the caller).
-Residual, explicit: the signed URL is handed to ffmpeg as an argument, so a
-same-UID process listing can see it for the life of that process. It
-expires with the token. Undocumented endpoints can change without notice.
+turning it on needs the owner's source/rights decision. ffmpeg is never
+given this URL: app.ingestion.hls_pump downloads every playlist and segment
+through the same validated opener and pipes bytes to a network-less ffmpeg.
+Undocumented endpoints can change without notice.
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ _QUERY = ("query PlaybackAccessToken($login: String!, $isLive: Boolean!, "
 
 class PlaybackRefused(Exception):
     """kind: unauthorized | invalid | offline | restricted | challenge |
-    blocked | error. Message never contains a URL or token."""
+    blocked | quality | error. Message never contains a URL or token."""
 
     def __init__(self, kind: str, detail: str = ""):
         super().__init__(f"{kind}: {detail}" if detail else kind)
@@ -158,7 +158,7 @@ def _get_token(channel, opener, timeout):
     try:
         doc = json.loads(raw.decode("utf-8"))
     except Exception:
-        raise PlaybackRefused("error", "token response not JSON")
+        raise PlaybackRefused("error", "token response not JSON") from None
     errs = doc.get("errors") if isinstance(doc, dict) else None
     if errs:
         txt = json.dumps(errs).lower()
@@ -169,18 +169,22 @@ def _get_token(channel, opener, timeout):
         tok = doc["data"]["streamPlaybackAccessToken"]
         value, sig = tok["value"], tok["signature"]
     except (KeyError, TypeError):
-        raise PlaybackRefused("offline", "no playback token returned")
+        raise PlaybackRefused("offline", "no playback token returned") from None
     if not (isinstance(value, str) and isinstance(sig, str) and value and sig):
         raise PlaybackRefused("error", "token malformed")
     try:
         meta = json.loads(value)
-        auth = meta.get("authorization") or {}
-        if auth.get("forbidden"):
-            raise PlaybackRefused("restricted", "playback forbidden for anonymous viewers")
-    except PlaybackRefused:
-        raise
     except Exception:
-        pass
+        raise PlaybackRefused("error", "token metadata not JSON") from None
+    if not isinstance(meta, dict):
+        raise PlaybackRefused("error", "token metadata malformed")
+    auth = meta.get("authorization")
+    if not isinstance(auth, dict) or auth.get("forbidden") is not False:
+        raise PlaybackRefused("restricted", "playback not authorized for anonymous viewers")
+    if meta.get("blackout_enabled") is True:
+        raise PlaybackRefused("restricted", "channel blackout in effect")
+    if str(meta.get("geoblock_reason") or "").strip():
+        raise PlaybackRefused("restricted", "geoblocked")
     return value, sig
 
 
@@ -192,12 +196,13 @@ def parse_master(text: str, host_ok=None) -> list:
         attrs = ln.split(":", 1)[1]
         m = re.search(r"RESOLUTION=(\d+)x(\d+)", attrs)
         b = re.search(r"BANDWIDTH=(\d+)", attrs)
-        n = re.search(r'NAME="([^"]*)"', attrs)
         url = lines[i + 1].strip() if i + 1 < len(lines) else ""
         if not m or not url or not _host_ok(url, host_ok):
             continue  # audio-only, malformed or off-allowlist: skipped
-        out.append(Variant(n.group(1) if n else f"{m.group(2)}p",
-                           int(m.group(2)), int(b.group(1)) if b else 0, url))
+        # display label derived ONLY from validated numbers; no external
+        # string (NAME etc.) is ever copied into a repr/log-visible field
+        h = int(m.group(2))
+        out.append(Variant(f"{h}p", h, int(b.group(1)) if b else 0, url))
     return out
 
 
@@ -234,22 +239,11 @@ def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
     except PlaybackRefused:
         raise
     except Exception as exc:  # network error text can carry a URL
-        raise PlaybackRefused("error", redact(type(exc).__name__))
+        raise PlaybackRefused("error", redact(type(exc).__name__)) from None
     if not variants:
         raise PlaybackRefused("error", "no usable video variant")
     fit = [v for v in variants if v.height <= max_height]
-    best = (max(fit, key=lambda v: (v.height, v.bandwidth)) if fit
-            else min(variants, key=lambda v: v.height))
+    if not fit:
+        raise PlaybackRefused("quality", "no variant within the height cap")
+    best = max(fit, key=lambda v: (v.height, v.bandwidth))
     return Resolved(login, best, tuple(variants), now)
-
-
-def ffmpeg_args(ffmpeg: str, resolved: Resolved, out_path: str,
-                seconds: int, protocols: str = "https,tls,tcp,crypto") -> list:
-    """Bounded capture args (stream copy, hard duration cap). The caller
-    owns the process (track and reap it) and the authorization."""
-    if not (0 < int(seconds) <= 3600):
-        raise ValueError("seconds out of range")
-    return [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-            "-protocol_whitelist", protocols,
-            "-i", resolved.ffmpeg_input(), "-t", str(int(seconds)),
-            "-c", "copy", "-f", "mpegts", out_path]

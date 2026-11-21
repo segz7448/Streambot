@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -55,9 +56,9 @@ class ResolveTests(Base):
 
     def test_picks_best_variant_under_cap_and_skips_audio_and_offlist(self):
         r = self.res(opener=fake(), max_height=720)
-        self.assertEqual(r.variant.name, "720p60")
-        self.assertEqual([v.name for v in r.variants], ["1080p60", "720p60"])
-        self.assertEqual(self.res(opener=fake(), max_height=1080).variant.name, "1080p60")
+        self.assertEqual(r.variant.name, "720p")
+        self.assertEqual([v.name for v in r.variants], ["1080p", "720p"])
+        self.assertEqual(self.res(opener=fake(), max_height=1080).variant.name, "1080p")
 
     def test_repr_and_errors_never_leak_signed_values(self):
         r = self.res(opener=fake())
@@ -125,55 +126,208 @@ class ResolveTests(Base):
         finally:
             srv.shutdown(); srv.server_close(); t.join(5)
 
-    def test_ffmpeg_args_bounded(self):
-        r = self.res(opener=fake())
-        a = tp.ffmpeg_args("ffmpeg", r, "/tmp/o.ts", 30)
-        self.assertIn("-t", a); self.assertEqual(a[a.index("-t") + 1], "30")
-        self.assertIn("-nostdin", a)
-        for bad in (0, -1, 99999):
-            with self.assertRaises(ValueError):
-                tp.ffmpeg_args("ffmpeg", r, "/tmp/o.ts", bad)
+
+    def test_malformed_token_metadata_fails_closed(self):
+        def g(value):
+            return (200, json.dumps({"data": {"streamPlaybackAccessToken": {
+                "value": value, "signature": "SECRETSIG"}}}).encode())
+        cases = [("not-json", "error"), ("[]", "error"), ("{}", "restricted"),
+                 (json.dumps({"authorization": "x"}), "restricted"),
+                 (json.dumps({"authorization": {"forbidden": None}}), "restricted"),
+                 (json.dumps({"authorization": {"forbidden": False}, "blackout_enabled": True}), "restricted"),
+                 (json.dumps({"authorization": {"forbidden": False}, "geoblock_reason": "region"}), "restricted")]
+        for v, kind in cases:
+            tp._last.clear()
+            with self.assertRaises(tp.PlaybackRefused) as c:
+                self.res(opener=fake(gql=g(v)))
+            self.assertEqual(c.exception.kind, kind, v)
+
+    def test_max_height_is_a_cap(self):
+        only1080 = MASTER.split("#EXT-X-STREAM-INF:BANDWIDTH=3000000")[0]
+        with self.assertRaises(tp.PlaybackRefused) as c:
+            self.res(opener=fake(usher=(200, only1080.encode())), max_height=720)
+        self.assertEqual(c.exception.kind, "quality")
+
+    def test_external_name_never_reaches_repr_log_or_traceback(self):
+        import traceback
+        evil = ('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,'
+                'NAME="https://x.ttvnw.net/a?sig=SECRETSIG&token=SECRETTOK"\n'
+                'https://video-weaver.x.hls.ttvnw.net/v1/a.m3u8?sig=SECRETSIG\n')
+        r = self.res(opener=fake(usher=(200, evil.encode())))
+        self.assertEqual(r.variant.name, "720p")
+        for s in (repr(r), str(r), repr(r.variants), repr(r.variant)):
+            self.assertNotIn("SECRET", s)
+
+    def test_full_traceback_has_no_signed_values(self):
+        import traceback
+        def op(req, timeout):
+            raise OSError("boom https://usher.ttvnw.net/x?sig=SECRETSIG&token=SECRETTOK")
+        try:
+            self.res(opener=op)
+        except tp.PlaybackRefused as e:
+            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        self.assertNotIn("SECRET", tb)
+        def bad_json(req, timeout):
+            return 200, b'{"data": SECRETTOK'
+        tp._last.clear()
+        try:
+            self.res(opener=bad_json)
+        except tp.PlaybackRefused as e:
+            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        self.assertNotIn("SECRET", tb)
+
+
+from app.ingestion import hls_pump
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg unavailable")
-class LocalFixtureIngest(Base):
-    """Our own generated HLS fixture served from 127.0.0.1: proves the
-    adapter's output feeds ffmpeg end to end. No third-party stream."""
+class PumpTests(Base):
+    """Owned generated HLS fixture; nothing third-party is fetched. The
+    fixture URLs sit on a *.ttvnw.net-shaped name and are answered by an
+    in-process opener, so the production host allowlist is exercised
+    unmodified (a fixture does not prove Twitch's real nested hosts)."""
+    BASE = "https://video-weaver.fixture.ttvnw.net/v1/"
 
-    def test_generated_hls_through_adapter_to_ffmpeg(self):
-        d = Path(tempfile.mkdtemp())
+    @classmethod
+    def setUpClass(cls):
+        cls.d = Path(tempfile.mkdtemp())
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                         "-i", "testsrc=size=320x180:rate=15", "-f", "lavfi",
-                        "-i", "sine=frequency=440", "-t", "6", "-c:v", "libx264",
-                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "hls",
+                        "-i", "sine=frequency=440", "-t", "8", "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", "-force_key_frames", "expr:gte(t,n_forced*2)", "-c:a", "aac", "-f", "hls",
                         "-hls_time", "2", "-hls_list_size", "0",
-                        str(d / "v.m3u8")], check=True)
-        class Quiet(http.server.SimpleHTTPRequestHandler):
-            def log_message(self, *a, **k):
-                pass
-        handler = functools.partial(Quiet, directory=str(d))
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
+                        str(cls.d / "v.m3u8")], check=True)
+        cls.playlist = (cls.d / "v.m3u8").read_text()
+
+    def opener(self, playlist=None, seen=None, overrides=None):
+        pl = (playlist or self.playlist).encode()
+        overrides = overrides or {}
+
+        def op(req, timeout):
+            u = req.full_url
+            if seen is not None:
+                seen.append(u)
+            if u in overrides:
+                return overrides[u]
+            name = u[len(self.BASE):].split("?")[0]
+            if name == "v.m3u8":
+                return 200, pl
+            f = self.d / name
+            return (200, f.read_bytes()) if f.exists() else (404, b"")
+        return op
+
+    def resolved(self):
+        master = ('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=320x180\n'
+                  + self.BASE + 'v.m3u8?sig=SECRETSIG\n')
+        return tp.resolve("fixturech", authorized=True, min_interval=0,
+                          opener=fake(usher=(200, master.encode())))
+
+    def probe(self, path):
+        pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                             "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
+        return float(pr.stdout.strip() or 0)
+
+    def alive(self, pid):
         try:
-            port = srv.server_port
-            master = ('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=320x180,NAME="180p"\n'
-                      f'https://fixture.test/v.m3u8\n')
-            r = tp.resolve("fixturech", authorized=True, min_interval=0,
-                           opener=fake(usher=(200, master.encode())),
-                           host_ok=lambda h: h == "fixture.test" or h == "usher.ttvnw.net")
-            # point the fixture host at the local server
-            local = r.ffmpeg_input().replace("https://fixture.test", f"http://127.0.0.1:{port}")
-            lr = tp.Resolved(r.channel, tp.Variant(r.variant.name, r.variant.height,
-                                                    r.variant.bandwidth, local), r.variants, r.resolved_at)
-            out = d / "cap.ts"
-            args = tp.ffmpeg_args("ffmpeg", lr, str(out), 4, protocols="http,tcp,file,crypto")
-            p = subprocess.run(args, capture_output=True, timeout=60)
-            self.assertEqual(p.returncode, 0, p.stderr[-300:])
-            pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                                 "-of", "default=nw=1:nk=1", str(out)], capture_output=True, text=True)
-            self.assertGreater(float(pr.stdout.strip()), 1.5)
-        finally:
-            srv.shutdown(); srv.server_close(); t.join(5)
+            import os
+            os.killpg(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def test_ended_playlist_captured_through_pipe_with_network_less_ffmpeg(self):
+        out = self.d / "cap1.ts"
+        seen = []
+        r = hls_pump.capture(self.resolved(), "ffmpeg", str(out), max_media_seconds=60,
+                             deadline_sec=60, opener=self.opener(seen=seen))
+        self.assertEqual(r.reason, "ended")
+        self.assertEqual(r.ffmpeg_rc, 0)
+        self.assertGreaterEqual(r.segments, 2)
+        self.assertGreater(self.probe(out), 3.0)
+        self.assertFalse(self.alive(r.ffmpeg_pid))
+        self.assertTrue(all(u.startswith(self.BASE) for u in seen))
+
+    def test_media_cap_stops_early(self):
+        out = self.d / "cap2.ts"
+        r = hls_pump.capture(self.resolved(), "ffmpeg", str(out), max_media_seconds=2,
+                             deadline_sec=60, opener=self.opener())
+        self.assertEqual(r.reason, "media_cap")
+        self.assertFalse(self.alive(r.ffmpeg_pid))
+
+    def test_off_allowlist_segment_uri_blocked_and_never_requested(self):
+        evil = self.playlist.replace("v1.ts", "https://evil.example.com/x.ts") \
+            if "v1.ts" in self.playlist else self.playlist + "#EXTINF:2.0,\nhttps://evil.example.com/x.ts\n"
+        seen = []
+        with self.assertRaises(tp.PlaybackRefused) as c:
+            hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "cap3.ts"),
+                             max_media_seconds=60, deadline_sec=60,
+                             opener=self.opener(playlist=evil, seen=seen))
+        self.assertEqual(c.exception.kind, "blocked")
+        self.assertFalse([u for u in seen if "evil.example.com" in u])
+
+    def test_encrypted_or_foreign_key_and_http_uri_refused(self):
+        for extra, kind in (('#EXT-X-KEY:METHOD=AES-128,URI="https://evil.example.com/k"\n', "restricted"),
+                            ('#EXT-X-MAP:URI="http://video-weaver.fixture.ttvnw.net/init"\n', "blocked")):
+            pl = self.playlist.replace("#EXTINF", extra + "#EXTINF", 1)
+            with self.assertRaises(tp.PlaybackRefused) as c:
+                hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "cap4.ts"),
+                                 max_media_seconds=60, deadline_sec=60,
+                                 opener=self.opener(playlist=pl))
+            self.assertEqual(c.exception.kind, kind)
+
+    def test_restriction_on_segment_fails_closed_without_retry_and_reaps(self):
+        seen = []
+        first = [l for l in self.playlist.splitlines() if l.endswith(".ts")][0]
+        with self.assertRaises(tp.PlaybackRefused) as c:
+            hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "cap5.ts"),
+                             max_media_seconds=60, deadline_sec=60,
+                             opener=self.opener(seen=seen, overrides={self.BASE + first: (403, b"")}))
+        self.assertEqual(c.exception.kind, "restricted")
+        self.assertEqual(len([u for u in seen if u.endswith(first)]), 1)
+
+    def test_deadline_and_stop_with_endless_live_playlist(self):
+        live = "\n".join(l for l in self.playlist.splitlines() if l != "#EXT-X-ENDLIST") + "\n"
+        t0 = time.time()
+        r = hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "cap6.ts"),
+                             max_media_seconds=3600, deadline_sec=3, opener=self.opener(playlist=live))
+        self.assertEqual(r.reason, "deadline")
+        self.assertLess(time.time() - t0, 20)
+        self.assertFalse(self.alive(r.ffmpeg_pid))
+        ev = threading.Event(); ev.set()
+        r = hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "cap7.ts"),
+                             max_media_seconds=60, deadline_sec=60, opener=self.opener(playlist=live),
+                             stop_event=ev)
+        self.assertEqual(r.reason, "stopped")
+
+    def test_hung_ffmpeg_is_killed_with_its_process_group(self):
+        script = self.d / "fakeffmpeg.sh"
+        script.write_text("#!/bin/sh\nsleep 300 &\nwait\n"); script.chmod(0o755)
+        t0 = time.time()
+        r = hls_pump.capture(self.resolved(), str(script), str(self.d / "cap8.ts"),
+                             max_media_seconds=1, deadline_sec=5, opener=self.opener(),
+                             grace=1)
+        self.assertLess(time.time() - t0, 25)
+        self.assertFalse(self.alive(r.ffmpeg_pid))
+
+    def test_stderr_tail_is_redacted_and_bounded(self):
+        script = self.d / "noisyffmpeg.sh"
+        script.write_text('#!/bin/sh\necho "failed https://x.ttvnw.net/a?sig=SECRETSIG&token=SECRETTOK" >&2\nexit 1\n')
+        script.chmod(0o755)
+        r = hls_pump.capture(self.resolved(), str(script), str(self.d / "cap9.ts"),
+                             max_media_seconds=1, deadline_sec=5, opener=self.opener(), grace=1)
+        self.assertNotIn("SECRET", r.stderr_tail)
+        self.assertLessEqual(len(r.stderr_tail), 500)
+
+    def test_pump_exception_traceback_is_clean(self):
+        import traceback
+        def op(req, timeout):
+            raise OSError("boom https://x.ttvnw.net/a?sig=SECRETSIG&token=SECRETTOK")
+        try:
+            hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "capA.ts"),
+                             max_media_seconds=1, deadline_sec=5, opener=op)
+        except tp.PlaybackRefused as e:
+            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        self.assertNotIn("SECRET", tb)
 
 
 if __name__ == "__main__":
