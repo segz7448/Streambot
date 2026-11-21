@@ -19,7 +19,7 @@ _CONFIGURED = False
 
 # Telegram bot tokens look like <digits>:<35 url-safe chars>. Any such
 # string, and any /bot<token>/ URL segment, is masked before it is written.
-_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
+_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
 
 
 def redact(text: str) -> str:
@@ -86,6 +86,14 @@ def setup_service_logging(log_dir: str, level: str = "INFO") -> logging.Logger:
             tg.addHandler(h)
         tg.setLevel(getattr(logging, level, logging.INFO))
         tg.propagate = False
+    # Everything else (httpx, asyncio, anything unexpected) reaches the
+    # Python root logger; give it the same redacting handlers so no record
+    # can fall through to the unredacted last-resort stderr handler.
+    py_root = logging.getLogger()
+    if not py_root.handlers:
+        for h in root.handlers:
+            py_root.addHandler(h)
+        py_root.setLevel(logging.WARNING)
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     return root
