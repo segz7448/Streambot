@@ -399,37 +399,67 @@ class BotService:
                                  ffprobe=ffprobe_path))
         self._sched_task = asyncio.create_task(self._schedule_loop())
 
+    @staticmethod
+    async def _blocking(fn, *args):
+        """Run fn in a thread and ALWAYS wait for it to finish, even if this
+        coroutine is cancelled: a schedule transition must never keep
+        running after shutdown has returned."""
+        fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(fut)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if fut.done():
+                    fut.exception()
+                    break
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
     async def _schedule_loop(self) -> None:
-        """Advance owner-scheduled windows; deliver durable notices.
-        Windows only ever start through the normal authorized paths
-        (registered feed, or public playback with record auth ON)."""
+        """Advance owner-scheduled plans and deliver durable notices.
+        Sessions only start through allowed paths (registered feed, or
+        public playback with record auth ON)."""
+        from ..clipping.retrospective import validate_recording
         from ..core import schedule as _sched
         from . import sessions as _sess
         from . import media as _m
         sd = self._state_dir()
         ff, fp = _m.ffmpeg_paths()
+
+        def valid(path):
+            try:
+                validate_recording(fp, path)
+                return True
+            except Exception:
+                return False
+        ops = _sched.Ops(
+            start=lambda u, a: _sess.start_scheduled(sd, u, ff, fp, a),
+            stop=_sess.stop_session, running=_sess.session_running,
+            alive=_sess.session_alive, stopping=_sess.session_stopping,
+            confirm=lambda a: _sched.confirm_recording(sd, a, valid),
+            error=_sess.session_error)
         while True:
             try:
-                events = await asyncio.to_thread(
-                    _sched.tick, sd,
-                    lambda u: _sess.start_scheduled(sd, u, ff, fp),
-                    _sess.stop_session,
-                    alive_fn=_sess.session_alive,
-                    confirm_fn=lambda u, since: _sched.confirm_recording(
-                        sd, u, since),
-                    error_fn=_sess.session_error)
-                await asyncio.to_thread(_sched.enqueue_notices, sd, events)
+                await self._blocking(_sched.tick, sd, ops)
                 admin = self.store.admin_id()
-                if admin is not None:
-                    for nid, text in await asyncio.to_thread(
-                            _sched.pending_notices, sd):
-                        try:
-                            await self.app.bot.send_message(admin, text)
-                        except Exception:
-                            log.exception("schedule notice send failed; "
-                                          "stays queued")
-                            break
-                        await asyncio.to_thread(_sched.mark_notice_sent, sd, nid)
+                while admin is not None:
+                    claimed = await self._blocking(_sched.claim_notice, sd)
+                    if claimed is None:
+                        break
+                    nid, text = claimed
+                    try:
+                        await self.app.bot.send_message(admin, text)
+                    except asyncio.CancelledError:
+                        raise      # stays "sending": reconcile labels the repeat
+                    except Exception:
+                        log.exception("schedule notice send failed; stays queued")
+                        await self._blocking(_sched.release_notice, sd, nid)
+                        break
+                    await self._blocking(_sched.mark_notice_sent, sd, nid)
             except asyncio.CancelledError:
                 raise
             except Exception:

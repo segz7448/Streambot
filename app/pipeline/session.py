@@ -69,10 +69,14 @@ class ClipSession:
 
     def _notes(self, now: float) -> str:
         """Durable origin and authorization snapshot (session row)."""
+        attempt = getattr(self, "attempt_id", None)
         if self.playback is None:
-            return "mode A session"
+            if attempt is None:
+                return "mode A session"
+            return json.dumps({"mode": "feed", "sched_attempt": attempt})
         from ..bot import source_auth
         return json.dumps({
+            "sched_attempt": attempt,
             "origin": "twitch_public_playback", "mode": "playback",
             "source": self.source_label,
             "record_authorized_at_start": source_auth.allowed(

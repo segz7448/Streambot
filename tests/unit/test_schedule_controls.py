@@ -1,288 +1,458 @@
+"""Scheduler core: durable attempt ownership, exact-session confirmation on
+real finalized media, atomic state+notice, day eligibility, stop/cancel,
+restart, DST budgets. No Telegram transport and no network."""
+import json
 import os
 import sqlite3
+import subprocess
 import tempfile
-import time
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
-from app.bot import schedule_cmds as sc
 from app.bot import commands_full as cf
+from app.bot import schedule_cmds as sc
+from app.clipping.retrospective import validate_recording
 from app.core import schedule as sched
 from app.core.database import migrate
 from app.core.intake import resolve_timezone
 
+LA = resolve_timezone("America/Los_Angeles")
 
-class ScheduleTests(unittest.TestCase):
+
+def ts(y, mo, d, h=0, mi=0):
+    return datetime(y, mo, d, h, mi, tzinfo=LA).timestamp()
+
+
+class World:
+    """Stand-in for the live session registry, keyed by attempt id."""
+    def __init__(self, d):
+        self.d = d
+        self.s = {}              # aid -> dict(running, stopping, error)
+        self.starts = []
+        self.mode = "start"      # start | not_started | raise_registered | raise_ghost
+        self.stops = []
+        self.stop_raises = 0
+        self.confirmed = set()
+        self.user_before = None
+
+    def start(self, user, aid):
+        self.starts.append((user, aid))
+        if self.user_before:
+            self.user_before(aid)
+        if self.mode == "not_started":
+            return "not_started", "Not started: the channel is offline or unknown."
+        if self.mode == "raise_registered":
+            self.s[aid] = dict(running=True, stopping=False, error="")
+            raise RuntimeError("secret-looking text must not leak")
+        if self.mode == "raise_ghost":
+            raise RuntimeError("boom")
+        self.s[aid] = dict(running=True, stopping=False, error="")
+        return "started", "ok"
+
+    def stop(self, user, aid):
+        if self.stop_raises:
+            self.stop_raises -= 1
+            raise RuntimeError("stop failed")
+        s = self.s.get(aid)
+        self.stops.append(aid)
+        if s and not s["stopping"]:
+            s["stopping"] = True
+            return True
+        return False
+
+    def finish(self, aid, error=""):
+        self.s[aid]["running"] = False
+        self.s[aid]["error"] = error
+
+    def ops(self):
+        g = lambda aid, k: bool(self.s.get(aid, {}).get(k))
+        return sched.Ops(
+            start=self.start, stop=self.stop,
+            running=lambda u, a: g(a, "running"),
+            alive=lambda u, a: g(a, "running") and not g(a, "stopping"),
+            stopping=lambda u, a: g(a, "stopping"),
+            confirm=lambda a: a in self.confirmed,
+            error=lambda u, a: self.s.get(a, {}).get("error", ""))
+
+
+class Base(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
         c = sqlite3.connect(str(self.d / "nova.db"))
         migrate(c)
         c.close()
         cf.addsource_reply(self.d, "kaicenat")
-        self.now = datetime(2026, 11, 21, 9, 0, tzinfo=resolve_timezone("America/Los_Angeles")).timestamp()
+        cf.addsource_reply(self.d, "ishowspeed")
+        self.w = World(self.d)
+        self.now = ts(2026, 11, 21, 9)
 
-    def test_parse_pst(self):
-        t = sched.parse_when("2026-11-22 10:30", now=self.now)
-        self.assertEqual(datetime.fromtimestamp(t, resolve_timezone("America/Los_Angeles")).strftime("%H:%M %Z"), "10:30 PST")
-        self.assertEqual(sched.parse_when("tomorrow 10:30", now=self.now), t)
-        for bad in ("tomorrow", "2026-13-01 10:00", "today 25:00", "x y"):
-            with self.assertRaises(ValueError):
-                sched.parse_when(bad, now=self.now)
+    def tick(self, t):
+        sched.tick(self.d, self.w.ops(), now=t)
 
-    def test_add_validation(self):
-        t = self.now + 3600
-        with self.assertRaises(ValueError): sched.add(self.d, "ghostuser", t, 3600, now=self.now)
-        with self.assertRaises(ValueError): sched.add(self.d, "kaicenat", self.now - 7200, 3600, now=self.now)
-        with self.assertRaises(ValueError): sched.add(self.d, "kaicenat", t, 60, now=self.now)
-        with self.assertRaises(ValueError): sched.add(self.d, "bad name!", t, 3600, now=self.now)
-        sid = sched.add(self.d, "KaiCenat", t, 3600, now=self.now)
-        with self.assertRaises(ValueError): sched.add(self.d, "kaicenat", t + 1800, 3600, now=self.now)  # overlap
-        self.assertTrue(sched.cancel(self.d, sid))
-        self.assertFalse(sched.cancel(self.d, sid))
-
-    def test_dst_gap_and_fold_rejected(self):
-        with self.assertRaises(ValueError): sched.parse_when("2027-03-14 02:30", now=self.now)  # gap
-        with self.assertRaises(ValueError): sched.parse_when("2026-11-01 01:30", now=self.now)  # fold
-        sched.parse_when("2026-11-22 02:30", now=self.now)
-
-    def test_day_bounds_dst_exact(self):
-        a, b = sched.parse_day("2026-11-01", now=self.now)
-        self.assertEqual(round((b - a) / 3600), 25)
-        a, b = sched.parse_day("2027-03-14", now=self.now)
-        self.assertEqual(round((b - a) / 3600), 23)
-
-    def _cbs(self, **kw):
-        log = {"start": [], "stop": []}
-        d = dict(alive=True, confirm=False, token="tok1", err="")
-        d.update(kw)
-        def start(u):
-            log["start"].append(u)
-            if d["token"] is None:
-                return "No authorized feed for x. Nothing is recording.", None
-            return "Clipping session started", d["token"]
-        def stop(u, t):
-            log["stop"].append((u, t))
-            return d.get("stopok", True)
-        return log, d, dict(start_fn=start, stop_fn=stop,
-                            alive_fn=lambda u, t: d["alive"],
-                            confirm_fn=lambda u, since: d["confirm"],
-                            error_fn=lambda u, t: d["err"])
-
-    def _tick(self, cb, now):
-        return sched.tick(self.d, cb["start_fn"], cb["stop_fn"], alive_fn=cb["alive_fn"],
-                          confirm_fn=cb["confirm_fn"], error_fn=cb["error_fn"], now=now)
-
-    def test_launch_is_not_recording_until_segment(self):
-        t = self.now + 60
-        sched.add(self.d, "kaicenat", t, 3600, now=self.now)
-        log, st, cb = self._cbs()
-        self.assertEqual(self._tick(cb, self.now), [])
-        ev = self._tick(cb, t + 5)
-        self.assertEqual([e[1] for e in ev], ["LAUNCHED"])
-        self.assertNotIn("recording confirmed", ev[0][2])
-        self.assertEqual(self._tick(cb, t + 10), [])      # no double launch, no confirm yet
-        st["confirm"] = True
-        ev = self._tick(cb, t + 40)
-        self.assertEqual([e[1] for e in ev], ["RECORDING"])
-        self.assertEqual(len(log["start"]), 1)
-        ev = self._tick(cb, t + 3601)
-        self.assertEqual([e[1] for e in ev], ["DONE"])
-        self.assertEqual(log["stop"], [("kaicenat", "tok1")])
-        self.assertIn("session stopped", ev[0][2])
-
-    def test_async_failure_never_reported_as_recording(self):
-        t = self.now + 60
-        sched.add(self.d, "kaicenat", t, 3600, now=self.now)
-        log, st, cb = self._cbs()
-        self._tick(cb, t + 1)
-        st["alive"] = False
-        st["err"] = "FFmpegError: input invalid"
-        ev = self._tick(cb, t + 20)
-        self.assertEqual(ev[0][1], "MISSED")
-        self.assertIn("input invalid", ev[0][2])
-
-    def test_unconfirmed_launch_times_out(self):
-        t = self.now + 60
-        sched.add(self.d, "kaicenat", t, 3600, now=self.now)
-        log, st, cb = self._cbs()
-        self._tick(cb, t + 1)
-        ev = self._tick(cb, t + 1 + sched.CONFIRM_TIMEOUT_S + 5)
-        self.assertEqual(ev[0][1], "MISSED")
-
-    def test_stop_false_reported_truthfully(self):
-        t = self.now + 60
-        sched.add(self.d, "kaicenat", t, 600, now=self.now)
-        log, st, cb = self._cbs(confirm=True, stopok=False)
-        self._tick(cb, t + 1); self._tick(cb, t + 40)
-        ev = self._tick(cb, t + 700)
-        self.assertIn("no longer running", ev[0][2])
-        self.assertNotIn("session stopped", ev[0][2])
-
-    def test_launch_exception_commits_claim_no_repeat(self):
-        t = self.now + 60
-        sched.add(self.d, "kaicenat", t, 3600, now=self.now)
-        n = []
-        def boom(u):
-            n.append(1); raise RuntimeError("x")
-        cb = dict(start_fn=boom, stop_fn=lambda u, t: True, alive_fn=lambda u, t: False,
-                  confirm_fn=lambda u, s: False, error_fn=lambda u, t: "")
-        self._tick(cb, t + 1); self._tick(cb, t + 40)
-        self.assertEqual(len(n), 1)
-        self.assertEqual(sched.list_open(self.d), [])
-
-    def test_restart_reconcile_never_relaunches(self):
-        t = self.now + 60
-        sched.add(self.d, "kaicenat", t, 3600, now=self.now)
-        log, st, cb = self._cbs()
-        self._tick(cb, t + 1)
-        self.assertEqual(sched.reconcile(self.d), 1)
-        self._tick(cb, t + 100)
-        self.assertEqual(len(log["start"]), 1)
-        self.assertEqual(sched.list_open(self.d), [])
-
-    def test_day_mark_retries_then_launches(self):
-        a, b = sched.parse_day("2026-11-22", now=self.now)
-        sched.add(self.d, "kaicenat", a, None, now=self.now, day_end=b)
-        log, st, cb = self._cbs(token=None)
-        ev = self._tick(cb, a + 5)
-        self.assertEqual([e[1] for e in ev], ["WAITING"])
-        self.assertEqual(self._tick(cb, a + 60), [])           # throttled
-        self.assertEqual(len(log["start"]), 1)
-        self._tick(cb, a + 400)
-        self.assertEqual(len(log["start"]), 2)
-        st["token"] = "tokD"
-        ev = self._tick(cb, a + 800)
-        self.assertEqual([e[1] for e in ev], ["LAUNCHED"])
-
-    def test_day_mark_ends_missed_truthfully(self):
-        a, b = sched.parse_day("2026-11-22", now=self.now)
-        sched.add(self.d, "kaicenat", a, None, now=self.now, day_end=b)
-        log, st, cb = self._cbs(token=None)
-        self._tick(cb, a + 5)
-        ev = self._tick(cb, b + 1)
-        self.assertEqual(ev[0][1], "MISSED")
-        self.assertIn("no recording started", ev[0][2])
-
-    def test_stale_window_missed_not_started(self):
-        t = self.now + 60
-        sched.add(self.d, "kaicenat", t, 3600, now=self.now)
-        log, st, cb = self._cbs()
-        ev = self._tick(cb, t + 3600 - 5 + 3000)
-        self.assertEqual(ev[0][1], "MISSED")
-        self.assertEqual(log["start"], [])
-
-    def test_outbox_durable(self):
-        sched.enqueue_notices(self.d, [(1, "X", "hello")])
-        n = sched.pending_notices(self.d)
-        self.assertEqual([t for _, t in n], ["hello"])
-        sched.mark_notice_sent(self.d, n[0][0])
-        self.assertEqual(sched.pending_notices(self.d), [])
-
-    def test_commands_need_timezone_then_work(self):
-        self.assertIn("NOT set", sc.schedule_reply(self.d, "kaicenat 2099-01-01"))
-        self.assertIn("NOT set", sc.timezone_reply(self.d, ""))
-        self.assertIn("Unknown", sc.timezone_reply(self.d, "Mars/Base"))
-        self.assertIn("set to", sc.timezone_reply(self.d, "America/Los_Angeles"))
-        self.assertIn("Usage", sc.schedule_reply(self.d, ""))
-        self.assertIn("Not scheduled", sc.schedule_reply(self.d, "kaicenat 2020-01-01"))
-        r = sc.schedule_reply(self.d, "kaicenat 2099-01-01")
-        self.assertIn("Scheduled #1", r)
-        self.assertIn("cannot see when the streamer goes live", r)
-        self.assertIn("Scheduled #2", sc.schedule_reply(self.d, "kaicenat 2099-01-02 10:00 3"))
-        out = sc.schedules_reply(self.d)
-        self.assertIn("day", out); self.assertIn("3h", out)
-        self.assertIn("cancelled", sc.unschedule_reply(self.d, "1"))
-
-
-class _FakeSess:
-    def __init__(self, tok, alive=True):
-        import threading
-        self._sched_token = tok
-        self._stopping = threading.Event()
-        self._alive = alive
-        self.error = "boom"
-        self.stopped = 0
-
-    def alive(self):
-        return self._alive
-
-    def stop(self):
-        self.stopped += 1
-        self._stopping.set()
-
-
-class SessionBridgeTests(unittest.TestCase):
-    def setUp(self):
-        from app.bot import sessions as ss
-        self.ss = ss
-        self.d = Path(tempfile.mkdtemp())
-        c = sqlite3.connect(str(self.d / "nova.db"))
-        migrate(c)
-        c.close()
-        cf.addsource_reply(self.d, "kaicenat")
-        ss._sessions.clear()
-        self.addCleanup(ss._sessions.clear)
-
-    def test_no_feed_no_record_auth_starts_nothing(self):
-        reply, tok = self.ss.start_scheduled(self.d, "kaicenat", "ff", "fp")
-        self.assertIsNone(tok)
-        self.assertIn("not authorized", reply)
-        self.assertEqual(self.ss._sessions, {})
-
-    def test_token_exactness(self):
-        a, b = _FakeSess("a"), _FakeSess("b")
-        self.ss._sessions["kaicenat"] = a
-        self.assertTrue(self.ss.session_alive("kaicenat", "a"))
-        self.assertFalse(self.ss.session_alive("kaicenat", "b"))
-        self.assertFalse(self.ss.session_alive("kaicenat", None))
-        self.assertEqual(self.ss.session_error("kaicenat", "a"), "boom")
-        self.assertEqual(self.ss.session_error("kaicenat", "b"), "")
-        # a later session replaced ours: stopping our token must not touch it
-        self.ss._sessions["kaicenat"] = b
-        self.assertFalse(self.ss.stop_session("kaicenat", "a"))
-        self.assertEqual(b.stopped, 0)
-        self.assertTrue(self.ss.stop_session("kaicenat", "b"))
-        self.assertFalse(self.ss.stop_session("kaicenat", "b"))  # already stopping
-        self.assertEqual(b.stopped, 1)
-
-    def test_feed_start_binds_token(self):
-        (self.d / "feeds").mkdir()
-        (self.d / "feeds" / "kaicenat.url").write_text("https://relay.example/x.m3u8")
-        made = []
-
-        def factory(*a, **k):
-            s = _FakeSess(None)
-            s.start = lambda: None
-            made.append(s)
-            return s
-        import unittest.mock as m
-        orig = self.ss.startclip_reply
-        with m.patch.object(self.ss, "validate_feed", lambda f, d: f):
-            reply = orig(self.d, "kaicenat", "ff", "fp", session_factory=factory)
-            tok = getattr(made[0], "_sched_token", None)
-        self.assertIn("started", reply)
-        self.assertTrue(tok)
-        self.assertTrue(self.ss.session_alive("kaicenat", tok))
-
-    def test_confirm_recording_needs_segment_after_claim(self):
-        t = 1000.0
-        self.assertFalse(sched.confirm_recording(self.d, "kaicenat", t))
+    def rows(self, sql, args=()):
         c = sqlite3.connect(str(self.d / "nova.db"))
         try:
-            sid = c.execute("SELECT id FROM twitch_sources WHERE username='kaicenat'").fetchone()[0]
-            c.execute("INSERT INTO stream_sessions (source_id,state,started_at) VALUES (?,?,?)",
-                      (sid, "RECORDING", 500.0))
-            c.execute("INSERT INTO recording_segments (session_id,file_path,sequence,created_at) VALUES (1,'x',0,501)")
-            c.commit()
-            self.assertFalse(sched.confirm_recording(self.d, "kaicenat", t))  # older session
-            c.execute("INSERT INTO stream_sessions (source_id,state,started_at) VALUES (?,?,?)",
-                      (sid, "RECORDING", 1001.0))
-            c.commit()
-            self.assertFalse(sched.confirm_recording(self.d, "kaicenat", t))  # no segment yet
-            c.execute("INSERT INTO recording_segments (session_id,file_path,sequence,created_at) VALUES (2,'y',0,1002)")
+            return c.execute(sql, args).fetchall()
+        finally:
+            c.close()
+
+    def plan(self, sid):
+        return self.rows("SELECT state,note FROM clip_schedules WHERE id=?", (sid,))[0]
+
+    def attempts(self, sid=None):
+        return self.rows("SELECT id,state,stop_by FROM schedule_attempts"
+                         + (" WHERE schedule_id=%d" % sid if sid else "") + " ORDER BY created_at")
+
+    def notices(self):
+        return [r[0] for r in self.rows("SELECT text FROM schedule_notices ORDER BY id")]
+
+    def day(self, user="kaicenat", day="2026-11-21"):
+        t0, t1 = sched.parse_day(day, tzname="America/Los_Angeles")
+        return sched.add(self.d, user, t0, None, now=self.now, day_end=t1), t0, t1
+
+
+class OwnershipTests(Base):
+    def test_attempt_committed_before_launch(self):
+        sid, t0, _ = self.day()
+        seen = {}
+
+        def probe(aid):
+            seen["attempt"] = self.rows("SELECT state FROM schedule_attempts WHERE id=?", (aid,))
+            seen["plan"] = self.plan(sid)[0]
+        self.w.user_before = probe
+        self.tick(self.now)
+        self.assertEqual(seen["attempt"], [("INTENT",)])     # durable before any launch
+        self.assertEqual(seen["plan"], "ACTIVE")
+        self.assertEqual(self.attempts(sid)[0][1], "LAUNCHED")
+
+    def test_exception_with_running_session_binds_not_duplicates(self):
+        sid, _, _ = self.day()
+        self.w.mode = "raise_registered"
+        self.tick(self.now)
+        self.assertEqual(self.attempts(sid)[0][1], "LAUNCHED")
+        for k in range(1, 6):
+            self.tick(self.now + 300 * k)
+        self.assertEqual(len(self.w.starts), 1)              # no duplicate launch
+        self.assertFalse(any("secret-looking" in n for n in self.notices()))
+
+    def test_exception_ambiguous_holds_no_retry_until_restart(self):
+        sid, _, _ = self.day()
+        self.w.mode = "raise_ghost"
+        self.tick(self.now)
+        self.assertEqual(self.plan(sid)[0], "UNCERTAIN")
+        self.assertEqual(self.attempts(sid)[0][1], "UNCERTAIN")
+        for k in range(1, 10):
+            self.tick(self.now + 300 * k)
+        self.assertEqual(len(self.w.starts), 1)
+        self.assertTrue(any("cannot tell" in n for n in self.notices()))
+        self.assertEqual(sched.reconcile(self.d, now=self.now + 4000), 1)
+        self.assertEqual(self.plan(sid)[0], "SCHEDULED")     # restart killed any orphan
+        self.w.mode = "start"
+        self.tick(self.now + 4100)
+        self.assertEqual(len(self.w.starts), 2)
+
+    def test_definitive_not_started_retries_with_backoff_inside_end(self):
+        sid, t0, t1 = self.day()
+        self.w.mode = "not_started"
+        t = self.now
+        while t < t1 + 3600:
+            self.tick(t)
+            t += 30
+        n = len(self.w.starts)
+        self.assertTrue(n < 120, n)                         # not 288 fixed attempts, backoff bound
+        self.assertEqual(self.plan(sid)[0], "MISSED")
+        starts_after_end = [a for a in self.rows("SELECT created_at FROM schedule_attempts") if a[0] > t1]
+        self.assertEqual(starts_after_end, [])
+        self.assertEqual(sum("not recording yet" in n for n in self.notices()), 1)
+
+    def test_one_owner_per_streamer_and_overlap_is_atomic(self):
+        self.day()
+        with self.assertRaises(ValueError):
+            self.day()
+        errs, ok = [], []
+        t0, t1 = sched.parse_day("2026-11-22", tzname="America/Los_Angeles")
+
+        def go():
+            try:
+                ok.append(sched.add(self.d, "ishowspeed", t0, None, now=self.now, day_end=t1))
+            except ValueError as e:
+                errs.append(e)
+        th = [threading.Thread(target=go) for _ in range(6)]
+        [x.start() for x in th]; [x.join() for x in th]
+        self.assertEqual((len(ok), len(errs)), (1, 5))
+
+
+class DayAndStopTests(Base):
+    def test_day_stays_eligible_after_early_end_and_records_again(self):
+        sid, t0, t1 = self.day()
+        self.tick(self.now)
+        a1 = self.w.starts[0][1]
+        self.w.confirmed.add(a1)
+        self.tick(self.now + 30)
+        self.assertEqual(self.attempts(sid)[0][1], "RECORDING")
+        self.w.finish(a1, "SomeError: text")
+        self.tick(self.now + 60)
+        self.assertEqual(self.plan(sid)[0], "SCHEDULED")     # whole-day eligibility survives
+        self.tick(self.now + 200)
+        self.assertEqual(len(self.w.starts), 2)
+        self.assertNotEqual(self.w.starts[1][1], a1)
+        self.assertTrue(any("try again" in n for n in self.notices()))
+        self.assertFalse(any("text" in n for n in self.notices()))  # class-name only
+        self.tick(t1 + 1)
+        self.assertEqual(self.w.s[self.w.starts[1][1]]["stopping"], True)
+        self.w.finish(self.w.starts[1][1])
+        self.tick(t1 + 31)
+        self.assertEqual(self.plan(sid)[0], "DONE")
+
+    def test_user_stop_cancels_plan_never_relaunches(self):
+        sid, _, _ = self.day()
+        self.tick(self.now)
+        aid = self.w.starts[0][1]
+        self.w.s[aid]["stopping"] = True        # /stopclip signalled the session
+        self.assertTrue(sched.user_stopped(self.d, aid, now=self.now + 5))
+        self.assertEqual(self.plan(sid)[0], "CANCELLED")
+        self.w.finish(aid)
+        for k in range(1, 6):
+            self.tick(self.now + 100 * k)
+        self.assertEqual(len(self.w.starts), 1)
+        self.assertEqual(self.attempts(sid)[0][1], "ENDED")
+
+    def test_user_stop_detected_even_if_hook_failed(self):
+        sid, _, _ = self.day()
+        self.tick(self.now)
+        aid = self.w.starts[0][1]
+        self.w.s[aid]["stopping"] = True        # stopped, but user_stopped never ran
+        self.tick(self.now + 30)
+        self.assertEqual(self.plan(sid)[0], "CANCELLED")
+        self.w.finish(aid)
+        self.tick(self.now + 400)
+        self.assertEqual(len(self.w.starts), 1)
+
+    def test_unschedule_active_stops_exact_session_no_relaunch(self):
+        sid, _, _ = self.day()
+        self.tick(self.now)
+        aid = self.w.starts[0][1]
+        self.assertEqual(sched.cancel(self.d, sid, now=self.now + 5), "cancelled_running")
+        self.tick(self.now + 30)
+        self.assertEqual(self.w.stops, [aid])
+        self.w.finish(aid)
+        self.tick(self.now + 60)
+        self.assertEqual(self.attempts(sid)[0][1], "ENDED")
+        self.tick(self.now + 600)
+        self.assertEqual(len(self.w.starts), 1)
+        self.assertEqual(sched.cancel(self.d, sid), "none")
+
+    def test_stop_exception_stays_stopping_and_retries(self):
+        sid, _, t1 = self.day()
+        self.tick(self.now)
+        aid = self.w.starts[0][1]
+        sched.cancel(self.d, sid, now=self.now + 1)
+        self.w.stop_raises = 2
+        self.tick(self.now + 30)
+        self.assertEqual(self.attempts(sid)[0][1], "STOPPING")
+        self.tick(self.now + 60)
+        self.assertEqual(self.attempts(sid)[0][1], "STOPPING")
+        self.tick(self.now + 90)                  # third call works
+        self.assertEqual(self.w.stops, [aid])
+        self.w.finish(aid)
+        self.tick(self.now + 120)
+        self.assertEqual(self.attempts(sid)[0][1], "ENDED")
+        self.assertEqual(sum("has not stopped" in n for n in self.notices()), 1)
+
+    def test_unconfirmed_launch_times_out_and_retries(self):
+        sid, _, _ = self.day()
+        self.tick(self.now)
+        self.tick(self.now + 100)
+        self.assertEqual(self.attempts(sid)[0][1], "LAUNCHED")
+        self.assertFalse(any("recording confirmed" in n for n in self.notices()))
+        self.tick(self.now + sched.CONFIRM_TIMEOUT_S + 30)
+        self.assertEqual(self.attempts(sid)[0][1], "STOPPING")
+        self.w.finish(self.w.starts[0][1])
+        self.tick(self.now + sched.CONFIRM_TIMEOUT_S + 60)
+        self.assertEqual(self.plan(sid)[0], "SCHEDULED")
+
+    def test_fixed_window_only_when_given_and_missed_if_late(self):
+        t = self.now + 3600
+        sid = sched.add(self.d, "kaicenat", t, 3600, now=self.now)
+        self.tick(t + sched.GRACE_S + 60)
+        self.assertEqual(self.plan(sid)[0], "MISSED")
+        self.assertEqual(self.w.starts, [])
+        with self.assertRaises(ValueError):
+            sched.add(self.d, "ishowspeed", t, 60, now=self.now)
+
+
+class RestartAndNoticeTests(Base):
+    def test_restart_interrupts_attempt_keeps_day_eligible_and_notifies(self):
+        sid, t0, t1 = self.day()
+        self.tick(self.now)
+        self.assertEqual(sched.reconcile(self.d, now=self.now + 50), 1)
+        self.assertEqual(self.attempts(sid)[0][1], "INTERRUPTED")
+        self.assertEqual(self.plan(sid)[0], "SCHEDULED")
+        self.assertTrue(any("restarted" in n for n in self.notices()))
+        self.tick(self.now + 60)
+        self.assertEqual(len(self.w.starts), 2)
+        # past the end: a restart finishes it, never relaunches
+        sid2 = sched.add(self.d, "ishowspeed", t0, None, now=self.now, day_end=t1)
+        self.tick(self.now + 70)
+        sched.reconcile(self.d, now=t1 + 5)
+        self.assertEqual(self.plan(sid2)[0], "MISSED")
+
+    def test_state_and_notice_commit_together(self):
+        sid, _, _ = self.day()
+        with mock.patch.object(sched, "_notice", side_effect=RuntimeError("db")):
+            with self.assertRaises(RuntimeError):
+                self.tick(self.now)       # not_started/started path writes a notice
+        # nothing half-written: the plan did not move on without its notice
+        self.assertEqual(self.notices(), [])
+        st = self.attempts(sid)
+        self.assertTrue(all(s[1] == "INTENT" for s in st))   # intent was durable, outcome rolled back
+        self.assertEqual(len(self.w.starts), 1)
+        self.tick(self.now + 30)                              # the live session is adopted, not relaunched
+        self.assertEqual(self.attempts(sid)[0][1], "LAUNCHED")
+        self.assertEqual(len(self.w.starts), 1)
+
+    def test_notice_send_crash_is_labelled_possible_repeat(self):
+        sid, _, _ = self.day()
+        self.tick(self.now)
+        nid, text = sched.claim_notice(self.d)
+        self.assertNotIn("possible repeat", text)
+        self.assertEqual(sched.claim_notice(self.d), None)    # only one in flight
+        # crash before mark_sent: after restart it is resent, labelled
+        sched.reconcile(self.d, now=self.now + 10)
+        got = sched.claim_notice(self.d)
+        self.assertEqual(got[0], nid)
+        self.assertIn("(possible repeat)", got[1])
+        sched.mark_notice_sent(self.d, nid)
+        self.assertNotEqual(sched.claim_notice(self.d), None)  # the restart notice, once
+        # failed send is released and labelled
+        sched.release_notice(self.d, nid + 1)
+        self.assertIn("possible repeat", sched.claim_notice(self.d)[1])
+
+    def test_startup_notices_survive_until_admin_exists(self):
+        self.day()
+        self.tick(self.now)
+        sched.reconcile(self.d, now=self.now + 5)
+        self.assertGreaterEqual(len(sched.pending_notices(self.d)), 2)
+
+
+class ConfirmTests(Base):
+    def _media(self, name, ok=True):
+        p = Path(tempfile.mkdtemp()) / name
+        if ok:
+            r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                                "testsrc=size=160x120:rate=10", "-t", "2", "-pix_fmt",
+                                "yuv420p", str(p)], capture_output=True)
+            assert r.returncode == 0
+        else:
+            p.write_bytes(b"not media at all" * 50)
+        return str(p)
+
+    def _session(self, user, attempt, seg_path, state="RECORDING"):
+        c = sqlite3.connect(str(self.d / "nova.db"))
+        try:
+            sid = c.execute("SELECT id FROM twitch_sources WHERE username=?", (user,)).fetchone()[0]
+            notes = json.dumps({"mode": "feed", "sched_attempt": attempt}) if attempt else "mode A session"
+            cur = c.execute("INSERT INTO stream_sessions (source_id,state,started_at,notes) "
+                            "VALUES (?,?,?,?)", (sid, state, 1.0, notes))
+            if seg_path:
+                c.execute("INSERT INTO recording_segments (session_id,file_path,sequence,created_at)"
+                          " VALUES (?,?,?,?)", (cur.lastrowid, seg_path, 0, 1.0))
             c.commit()
         finally:
             c.close()
-        self.assertTrue(sched.confirm_recording(self.d, "kaicenat", t))
-        self.assertFalse(sched.confirm_recording(Path(tempfile.mkdtemp()), "kaicenat", t))
+
+    def conf(self, attempt):
+        return sched.confirm_recording(self.d, attempt,
+                                       lambda p: _valid(p))
+
+    def test_only_own_session_with_real_valid_media_confirms(self):
+        good, bad = self._media("a.mp4"), self._media("b.mp4", ok=False)
+        aid = "a" * 32
+        self.assertFalse(self.conf(aid))                              # no session row
+        self._session("kaicenat", None, good, state="ENDED")          # unrelated ended session
+        self.assertFalse(self.conf(aid))
+        self._session("kaicenat", aid, "/nonexistent/seg.mp4")
+        self.assertFalse(self.conf(aid))                              # missing file
+        bid = "b" * 32
+        self._session("kaicenat", bid, bad)
+        self.assertFalse(self.conf(bid))                              # unreadable file
+        cid = "c" * 32
+        self._session("kaicenat", cid, good)
+        self.assertTrue(self.conf(cid))                               # real, probe-valid
+        self.assertFalse(self.conf(aid))                              # another attempt still no
+
+    def test_tick_uses_confirm_for_recording_state(self):
+        sid, _, _ = self.day()
+        self.tick(self.now)
+        aid = self.w.starts[0][1]
+        self.tick(self.now + 30)
+        self.assertEqual(self.attempts(sid)[0][1], "LAUNCHED")
+        self.w.confirmed.add(aid)
+        self.tick(self.now + 60)
+        self.assertEqual(self.attempts(sid)[0][1], "RECORDING")
+
+
+def _valid(p):
+    try:
+        validate_recording("ffprobe", p)
+        return True
+    except Exception:
+        return False
+
+
+class DstBudgetTests(Base):
+    def _run_day(self, day):
+        t0, t1 = sched.parse_day(day, tzname="America/Los_Angeles")
+        self.now = t0 - 10
+        sid = sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
+        self.w.mode = "not_started"
+        t = t0
+        while t < t1 + 120:
+            self.tick(t)
+            t += 30
+        return sid, t0, t1, len(self.w.starts)
+
+    def test_25h_and_23h_days_use_end_at_not_attempt_count(self):
+        sid, t0, t1, n25 = self._run_day("2026-11-01")
+        self.assertEqual((t1 - t0) / 3600, 25)
+        self.assertEqual(self.plan(sid)[0], "MISSED")
+        self.assertEqual(len(self.w.starts), n25)
+        self.setUp()
+        sid, t0, t1, n23 = self._run_day("2026-03-08")
+        self.assertEqual((t1 - t0) / 3600, 23)
+        self.assertEqual(self.plan(sid)[0], "MISSED")
+        self.assertGreater(n25, n23)                    # more hours, more tries: end_at bound
+
+    def test_parse_and_dst_validation(self):
+        with self.assertRaises(ValueError):
+            sched.parse_when("2026-03-08 02:30", tzname="America/Los_Angeles")   # gap
+        with self.assertRaises(ValueError):
+            sched.parse_when("2026-11-01 01:30", tzname="America/Los_Angeles")   # fold
+        self.assertEqual(datetime.fromtimestamp(sched.parse_when("2026-11-21 10:00", tzname="America/Los_Angeles"), LA).hour, 10)
+
+
+class CommandTests(Base):
+    def test_commands(self):
+        self.assertIn("NOT set", sc.schedule_reply(self.d, "kaicenat 2099-01-01"))
+        self.assertIn("set to", sc.timezone_reply(self.d, "America/Los_Angeles"))
+        self.assertIn("Unknown", sc.timezone_reply(self.d, "Mars/Base"))
+        u = sc.schedule_reply(self.d, "kaicenat 2099-01-01 10:00")
+        self.assertIn("No time or duration is ever assumed", u)
+        self.assertIn("Not scheduled", sc.schedule_reply(self.d, "kaicenat 2020-01-01"))
+        r = sc.schedule_reply(self.d, "kaicenat 2099-01-01")
+        self.assertIn("Scheduled #1", r)
+        self.assertNotIn("/setfeed", r)
+        self.assertIn("records nothing", r)
+        self.assertIn("Scheduled #2", sc.schedule_reply(self.d, "kaicenat 2099-01-02 10:00 3"))
+        out = sc.schedules_reply(self.d)
+        self.assertIn("whole day", out); self.assertIn("3h", out)
+        self.assertIn("cancelled", sc.unschedule_reply(self.d, "1"))
+        self.assertIn("No open schedule", sc.unschedule_reply(self.d, "1"))
+        self.assertIn("Usage", sc.unschedule_reply(self.d, "x"))
+
+
+if __name__ == "__main__":
+    unittest.main()

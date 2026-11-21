@@ -53,9 +53,10 @@ def _fmt(ts: float, tzname: str = DEFAULT_TIMEZONE) -> str:
 
 def schedule_reply(state_dir, args: str) -> str:
     usage = ("Usage:\n/schedule <user> <today|tomorrow|YYYY-MM-DD>   (mark the "
-             "whole local day: clip when a feed is available)\n"
-             "/schedule <user> <day> <HH:MM> <hours>   (a fixed window)\n"
-             "Hours 0.17 to 12.")
+             "streamer for that whole local day)\n"
+             "Optional, only if you want a fixed window instead: "
+             "/schedule <user> <day> <HH:MM> <hours>  (hours 0.17 to 12). "
+             "No time or duration is ever assumed for you.")
     tz = get_tz(state_dir)
     if tz is None:
         return timezone_reply(state_dir, "")
@@ -79,13 +80,17 @@ def schedule_reply(state_dir, args: str) -> str:
             what = f"the whole day {_fmt(when, tz)[:14]} ({tz}, to {_fmt(end, tz)})"
     except (ValueError, OverflowError) as exc:
         return f"Not scheduled: {exc}\n{usage}"
-    return (f"Scheduled #{sid}: {p[0].lstrip('@').lower()} {what}. It starts the "
-            "normal authorized-feed session when a feed is registered (see "
-            "/setfeed), and counts as recording only after the first segment "
-            "is saved. Live detection needs Twitch credentials, which are not "
-            "configured, so a day mark cannot see when the streamer goes live; "
-            "it only retries launching your registered feed. Clips stay "
-            "private. /schedules lists, /unschedule <id> cancels.")
+    return (f"Scheduled #{sid}: {p[0].lstrip('@').lower()} {what}. This only "
+            "marks the streamer as eligible; the mark itself records nothing. "
+            "While it is in effect I try every few minutes to start a session, "
+            "only through an allowed route: a registered broadcaster feed, or "
+            "public playback if recording is authorized for this streamer "
+            "(default OFF). If the streamer is offline or the route is not "
+            "allowed, nothing starts. It counts as recording only when a valid "
+            "segment is saved. If a session ends early I try again until the "
+            "schedule ends. I message you when a session starts, ends, or the "
+            "schedule ends with nothing recorded. /stopclip or /unschedule <id> "
+            "cancels it and nothing restarts. Clips stay private.")
 
 
 def schedules_reply(state_dir, _args="") -> str:
@@ -93,9 +98,9 @@ def schedules_reply(state_dir, _args="") -> str:
     if not rows:
         return "No scheduled clipping windows."
     tz = get_tz(state_dir) or DEFAULT_TIMEZONE
-    return "Scheduled windows:\n" + "\n".join(
+    return "Schedules:\n" + "\n".join(
         f"#{r['id']} {r['username']} {_fmt(r['start_at'], tz)} "
-        f"{'day' if r.get('mode') == 'day' else format(r['duration_s'] / 3600, 'g') + 'h'}"
+        f"{'whole day' if r['mode'] == 'day' else format((r['end_at'] - r['start_at']) / 3600, 'g') + 'h'}"
         f" {r['state']}" for r in rows)
 
 
@@ -104,6 +109,10 @@ def unschedule_reply(state_dir, args: str) -> str:
         sid = int(args.strip())
     except ValueError:
         return "Usage: /unschedule <id>"
-    return (f"Schedule #{sid} cancelled." if sched.cancel(state_dir, sid)
-            else f"No cancellable schedule #{sid} (only SCHEDULED can be cancelled; "
-                 "use /stopclip for a running one).")
+    r = sched.cancel(state_dir, sid)
+    if r == "cancelled":
+        return f"Schedule #{sid} cancelled. Nothing will start from it."
+    if r == "cancelled_running":
+        return (f"Schedule #{sid} cancelled. Its running session is being "
+                "stopped (within about 30 seconds) and will not restart.")
+    return f"No open schedule #{sid} (already finished or cancelled)."

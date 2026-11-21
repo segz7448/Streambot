@@ -7,9 +7,9 @@ endpoints before any process starts.
 from __future__ import annotations
 
 import contextlib
+import logging
 import sqlite3
 import threading
-import uuid
 from pathlib import Path
 
 from ..distribution.relay import validate_feed
@@ -44,50 +44,78 @@ def _feed_for(state_dir: Path, username: str) -> str | None:
 
 
 _tl = threading.local()
+_log = logging.getLogger(__name__)
+
+
+def _bind(session) -> None:
+    """Stamp the scheduler attempt id on a session BEFORE it launches, so
+    the durable row (notes.sched_attempt) and the in-memory token agree."""
+    aid = getattr(_tl, "attempt", None)
+    session.attempt_id = aid
+    session._sched_token = aid
+
+
+def _launched() -> None:
+    _tl.started = True
 
 
 def start_scheduled(state_dir: Path, username: str, ffmpeg: str,
-                    ffprobe: str) -> tuple[str, str | None]:
-    """Scheduler launch. Uses the broadcaster-authorized feed when one is
-    registered; otherwise public playback, which itself refuses unless
-    record authorization is ON for this source (default OFF). Returns
-    (reply, token); token identifies exactly the session this call started
-    and is None when nothing started."""
-    _tl.token = None
-    if _feed_for(state_dir, username) is not None:
-        reply = startclip_reply(state_dir, username, ffmpeg, ffprobe)
-    else:
-        reply = startplayback_reply(state_dir, username, ffmpeg, ffprobe)
-    token, _tl.token = getattr(_tl, "token", None), None
-    return reply, token
+                    ffprobe: str, attempt_id: str) -> tuple[str, str]:
+    """Scheduler launch for an already-committed attempt id. Uses the
+    broadcaster-authorized feed when registered, else public playback,
+    which refuses unless record auth is ON for this source (default OFF).
+    ('started', reply) only when a session thread was launched;
+    ('not_started', reason) is definitive. An exception means unknown."""
+    _tl.attempt, _tl.started = attempt_id, False
+    try:
+        if _feed_for(state_dir, username) is not None:
+            reply = startclip_reply(state_dir, username, ffmpeg, ffprobe)
+        else:
+            reply = startplayback_reply(state_dir, username, ffmpeg, ffprobe)
+        return ("started" if _tl.started else "not_started"), reply
+    finally:
+        _tl.attempt, _tl.started = None, False
 
 
-def session_alive(username: str, token: str | None) -> bool:
+def _match(username: str, attempt_id):
+    sess = _sessions.get(username)
+    if (sess is not None and attempt_id is not None
+            and getattr(sess, "_sched_token", None) == attempt_id):
+        return sess
+    return None
+
+
+def session_running(username: str, attempt_id) -> bool:
     with _lock:
-        sess = _sessions.get(username)
-        return (sess is not None and token is not None
-                and getattr(sess, "_sched_token", None) == token
-                and sess.alive() and not sess._stopping.is_set())
+        s = _match(username, attempt_id)
+        return s is not None and s.alive()
 
 
-def session_error(username: str, token: str | None) -> str:
+def session_alive(username: str, attempt_id) -> bool:
     with _lock:
-        sess = _sessions.get(username)
-        if (sess is not None and token is not None
-                and getattr(sess, "_sched_token", None) == token):
-            return sess.error or ""
-    return ""
+        s = _match(username, attempt_id)
+        return s is not None and s.alive() and not s._stopping.is_set()
 
 
-def stop_session(username: str, token: str | None) -> bool:
-    """Stop exactly the session identified by token; False (no effect)
-    when it is gone, already stopping, or replaced by a later one."""
+def session_stopping(username: str, attempt_id) -> bool:
     with _lock:
-        sess = _sessions.get(username)
-        if (sess is not None and token is not None
-                and getattr(sess, "_sched_token", None) == token
-                and not sess._stopping.is_set()):
-            sess.stop()
+        s = _match(username, attempt_id)
+        return s is not None and s._stopping.is_set()
+
+
+def session_error(username: str, attempt_id) -> str:
+    with _lock:
+        s = _match(username, attempt_id)
+        return (s.error or "") if s is not None else ""
+
+
+def stop_session(username: str, attempt_id) -> bool:
+    """Stop exactly the session carrying attempt_id; False (no effect) when
+    it is gone, already stopping, or replaced by a later session."""
+    with _lock:
+        s = _match(username, attempt_id)
+        if s is not None and not s._stopping.is_set():
+            s.stop()
             return True
     return False
 
@@ -141,9 +169,9 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
                         "nothing was started.")
         session = session_factory(ffmpeg, ffprobe, feed, username,
                                   state_dir)
+        _bind(session)
         session.start()
-        session._sched_token = uuid.uuid4().hex
-        _tl.token = session._sched_token
+        _launched()
         _sessions[username] = session
     return (f"Clipping session started for {username} from its "
             "registered feed: recording, detecting and clipping now. "
@@ -152,12 +180,22 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
 
 
 def stopclip_reply(state_dir: Path) -> str:
+    scheduled = []
     with _lock:
         stopped = 0
         for name, session in list(_sessions.items()):
             if not session._stopping.is_set():
                 session.stop()
                 stopped += 1
+                tok = getattr(session, "_sched_token", None)
+                if tok:
+                    scheduled.append(tok)
+    for tok in scheduled:      # a user stop cancels the plan: no silent relaunch
+        try:
+            from ..core import schedule as _sched
+            _sched.user_stopped(state_dir, tok)
+        except Exception:
+            _log.exception("could not cancel the schedule for a stopped session")
     if stopped:
         return (f"Stopping {stopped} session(s). Final clips still go "
                 "through QC and are held.")
@@ -281,9 +319,9 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
                 msg = None
                 session = session_factory(ffmpeg, ffprobe, "", username,
                                           state_dir, playback=pb)
+                _bind(session)
                 session.start()
-                session._sched_token = uuid.uuid4().hex
-                _tl.token = session._sched_token
+                _launched()
                 res._released = True
                 _sessions[username] = session
         if msg is not None:
