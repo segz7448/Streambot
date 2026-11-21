@@ -84,14 +84,16 @@ def sourceauth_reply(state_dir, args: str) -> str:
         return (f"Could NOT change {scope} authorization for {user} "
                 "(database unavailable). Nothing changed.")
     note = {
-        ("record", True): "The bot may now capture this streamer's public live "
-                          "playback when you run /startplayback. Clips stay HELD "
-                          "for you and are NOT queued for YouTube unless repost is also on.",
-        ("record", False): "Capture is off. A running playback session will stop "
-                           "within a few seconds.",
-        ("repost", True): "Clips from playback sessions of this streamer may now be "
-                          "queued for YouTube (private upload, existing daily cap).",
-        ("repost", False): "Repost is off. New clips stay HELD and are not queued. "
-                           "Clips already queued before this change are not recalled.",
+        ("record", True): "Capture of this streamer's public live playback is now "
+                          "permitted once playback capture is available. Clips "
+                          "stay HELD for you and are not queued for YouTube "
+                          "unless repost is also on.",
+        ("record", False): "Capture is off. A running playback session is told to "
+                           "stop at its next authorization check (not instant).",
+        ("repost", True): "Playback clips from this streamer may now be queued for "
+                          "YouTube (private upload, existing daily cap).",
+        ("repost", False): "Repost is off: any later publish attempt for this "
+                           "streamer's playback clips (automatic, queued or manual) "
+                           "is refused. An upload already in flight cannot be recalled.",
     }[(scope, on)]
     return f"{user} {scope}: {'ON' if on else 'off'}. {note}"

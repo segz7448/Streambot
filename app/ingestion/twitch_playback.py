@@ -97,18 +97,42 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def default_opener(req: urllib.request.Request, timeout: float):
-    """(status, body) with redirects refused and the body size bounded."""
+def default_opener(req: urllib.request.Request, timeout: float,
+                   limit: int = MAX_BYTES, deadline=None):
+    """(status, body). Redirects refused. Reads limit+1 bytes in chunks and
+    raises PlaybackRefused('error') on overflow instead of truncating. An
+    absolute monotonic ``deadline`` is checked between chunks and bounds the
+    connect timeout; a single blocked socket read can still run up to one
+    socket timeout past it (documented, bounded by min(timeout, remaining))."""
+    def remaining():
+        return (deadline - time.monotonic()) if deadline is not None else timeout
+    if remaining() <= 0:
+        raise PlaybackRefused("error", "deadline reached")
     op = urllib.request.build_opener(_NoRedirect)
     try:
-        with op.open(req, timeout=timeout) as r:
-            return r.status, r.read(MAX_BYTES)
+        with op.open(req, timeout=max(0.2, min(timeout, remaining()))) as r:
+            chunks, n = [], 0
+            while True:
+                if remaining() <= 0:
+                    raise PlaybackRefused("error", "deadline reached during read")
+                b = r.read1(min(65536, limit + 1 - n))
+                if not b:
+                    break
+                chunks.append(b); n += len(b)
+                if n > limit:
+                    raise PlaybackRefused("error", "response too large")
+            return r.status, b"".join(chunks)
     except urllib.error.HTTPError as e:
         try:
             body = e.read(4096)
         except Exception:
             body = b""
         return e.code, body
+
+
+def call_opener(op, req, timeout, limit=MAX_BYTES, deadline=None):
+    """Uniform call so injected test openers and the real one agree."""
+    return op(req, timeout, limit, deadline)
 
 
 _last: dict = {}
@@ -144,7 +168,7 @@ def _status_refusal(code: int, stage: str) -> PlaybackRefused:
     return PlaybackRefused("error", f"{stage} HTTP {code}")
 
 
-def _get_token(channel, opener, timeout):
+def _get_token(channel, opener, timeout, deadline=None):
     body = json.dumps({"operationName": "PlaybackAccessToken",
                        "variables": {"isLive": True, "login": channel,
                                      "playerType": "site"},
@@ -152,7 +176,7 @@ def _get_token(channel, opener, timeout):
     req = urllib.request.Request(GQL_URL, data=body, headers={
         "Client-ID": PLAYER_CLIENT_ID, "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0"})
-    code, raw = opener(req, timeout)
+    code, raw = call_opener(opener, req, timeout, 100_000, deadline)
     if code != 200:
         raise _status_refusal(code, "token")
     try:
@@ -221,8 +245,9 @@ def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
     if not _rate_ok(login, now, min_interval):
         raise PlaybackRefused("blocked", "too soon since last resolve")
     op = opener or default_opener
+    dl = time.monotonic() + max(timeout * 3, 1.0)   # whole-resolve deadline
     try:
-        value, sig = _get_token(login, op, timeout)
+        value, sig = _get_token(login, op, timeout, dl)
         usher = (f"https://{USHER_HOST}/api/channel/hls/{login}.m3u8?"
                  + urllib.parse.urlencode({
                      "sig": sig, "token": value, "allow_source": "true",
@@ -231,8 +256,9 @@ def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
                      "p": random.randint(0, 999999)}))
         if not _host_ok(usher, host_ok):
             raise PlaybackRefused("blocked", "playlist host not allowed")
-        code, raw = op(urllib.request.Request(
-            usher, headers={"User-Agent": "Mozilla/5.0"}), timeout)
+        code, raw = call_opener(op, urllib.request.Request(
+            usher, headers={"User-Agent": "Mozilla/5.0"}), timeout,
+            MAX_BYTES, dl)
         if code != 200:
             raise _status_refusal(code, "playlist")
         variants = parse_master(raw.decode("utf-8", "replace"), host_ok)

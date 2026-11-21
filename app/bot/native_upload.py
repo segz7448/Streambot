@@ -391,6 +391,14 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                 log.info("native upload job %s: paused at reserve; returned "
                          "to the queue unspent", job_id)
                 return True
+            if decision == "repost_denied":
+                _fail_permanent(
+                    queue, job_id,
+                    "repost not authorized for this playback source; "
+                    "clip stays HELD (nothing uploaded)")
+                log.info("native upload job %s: repost not authorized; "
+                         "no upload", job_id)
+                return True
             if decision == "blocked":
                 if rec["state"] == "CONFIRMED":
                     # Already uploaded: idempotent success, zero network.

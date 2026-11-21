@@ -189,6 +189,13 @@ def _process_one_admission(conn, state_dir: Path) -> bool:
         log.warning("admission job %s had an undecodable payload; "
                     "completed without effect", job_id)
         return True
+    from ..core.provenance import repost_allowed
+    if not repost_allowed(conn, clip_row_id)[0]:
+        queue.complete(job_id)
+        log.info("admission job %s: playback clip %s, repost not "
+                 "authorized; not admitted, clip stays HELD", job_id,
+                 clip_row_id)
+        return True
     try:
         from ..core.intake import ClipIntakeAuthority
         # Admitted metadata comes from the pipeline's own durable rows
@@ -320,6 +327,12 @@ def _run_once_locked(state_dir: Path, *,
             queue.complete(job_id)
             log.warning("handoff job %s had an undecodable payload; "
                         "completed without effect", job_id)
+            return PROCESSED
+        from ..core.provenance import repost_allowed as _ra
+        if not _ra(conn, row_id)[0]:
+            queue.complete(job_id)
+            log.info("handoff job %s: playback clip %s, repost not "
+                     "authorized; no post", job_id, row_id)
             return PROCESSED
         row = conn.execute(
             "SELECT file_path FROM clips WHERE id = ?", (row_id,)).fetchone()

@@ -1,3 +1,4 @@
+import urllib.request
 import functools
 import http.server
 import json
@@ -29,7 +30,7 @@ def fake(gql=None, usher=None, calls=None):
         "signature": "SECRETSIG"}}}).encode())
     usher = usher or (200, MASTER.encode())
 
-    def op(req, timeout):
+    def op(req, timeout, limit=None, deadline=None):
         if calls is not None:
             calls.append(req.full_url)
         return gql if req.full_url.startswith(tp.GQL_URL) else usher
@@ -96,7 +97,7 @@ class ResolveTests(Base):
             self.assertEqual(c.exception.kind, kind, kw)
 
     def test_network_exception_text_is_not_propagated(self):
-        def op(req, timeout):
+        def op(req, timeout, limit=None, deadline=None):
             raise OSError("boom https://usher.ttvnw.net/x?sig=SECRETSIG")
         with self.assertRaises(tp.PlaybackRefused) as c:
             self.res(opener=op)
@@ -121,7 +122,7 @@ class ResolveTests(Base):
         t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
         try:
             import urllib.request
-            code, _ = tp.default_opener(urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/"), 5)
+            code, _ = tp.default_opener(urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/"), 5, 1000, None)
             self.assertEqual(code, 302)
         finally:
             srv.shutdown(); srv.server_close(); t.join(5)
@@ -160,14 +161,14 @@ class ResolveTests(Base):
 
     def test_full_traceback_has_no_signed_values(self):
         import traceback
-        def op(req, timeout):
+        def op(req, timeout, limit=None, deadline=None):
             raise OSError("boom https://usher.ttvnw.net/x?sig=SECRETSIG&token=SECRETTOK")
         try:
             self.res(opener=op)
         except tp.PlaybackRefused as e:
             tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         self.assertNotIn("SECRET", tb)
-        def bad_json(req, timeout):
+        def bad_json(req, timeout, limit=None, deadline=None):
             return 200, b'{"data": SECRETTOK'
         tp._last.clear()
         try:
@@ -203,7 +204,7 @@ class PumpTests(Base):
         pl = (playlist or self.playlist).encode()
         overrides = overrides or {}
 
-        def op(req, timeout):
+        def op(req, timeout, limit=None, deadline=None):
             u = req.full_url
             if seen is not None:
                 seen.append(u)
@@ -267,13 +268,89 @@ class PumpTests(Base):
 
     def test_encrypted_or_foreign_key_and_http_uri_refused(self):
         for extra, kind in (('#EXT-X-KEY:METHOD=AES-128,URI="https://evil.example.com/k"\n', "restricted"),
-                            ('#EXT-X-MAP:URI="http://video-weaver.fixture.ttvnw.net/init"\n', "blocked")):
+                            ('#EXT-X-MAP:URI="http://video-weaver.fixture.ttvnw.net/init"\n', "error")):
             pl = self.playlist.replace("#EXTINF", extra + "#EXTINF", 1)
             with self.assertRaises(tp.PlaybackRefused) as c:
                 hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "cap4.ts"),
                                  max_media_seconds=60, deadline_sec=60,
                                  opener=self.opener(playlist=pl))
             self.assertEqual(c.exception.kind, kind)
+
+    def test_strict_parsing_regressions(self):
+        base = "https://x.ttvnw.net/p.m3u8"
+        cases = [
+            ('#EXT-X-KEY:METHOD=AES-128,URI="https://k/NONE"\n#EXTINF:2.0,\na.ts\n', "restricted"),
+            ('#EXTINF:nan,\na.ts\n', "error"),
+            ('#EXTINF:inf,\na.ts\n', "error"),
+            ('#EXTINF:-1,\na.ts\n', "error"),
+            ('#EXT-X-BYTERANGE:10@0\n#EXTINF:2.0,\na.ts\n', "error"),
+            ('#EXT-X-DISCONTINUITY\n#EXTINF:2.0,\na.ts\n', "error"),
+            ('#EXT-X-TARGETDURATION:nan\n#EXTINF:2.0,\na.ts\n', "error"),
+        ]
+        for body, kind in cases:
+            with self.assertRaises(tp.PlaybackRefused) as c:
+                hls_pump.parse_media("#EXTM3U\n" + body, base)
+            self.assertEqual(c.exception.kind, kind, body)
+        with self.assertRaises(tp.PlaybackRefused):
+            hls_pump.parse_media("#EXTINF:2.0,\na.ts\n", base)  # no header
+        segs, _, _ = hls_pump.parse_media(
+            "#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2.0,\na.ts\n", base)
+        self.assertEqual(len(segs), 1)
+
+    def test_real_opener_no_truncation_overflow_and_deadline(self):
+        import http.server, socketserver
+        big = b"x" * 1_500_000
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                if self.path == "/slow":
+                    self.send_response(200); self.send_header("Content-Length", "100"); self.end_headers()
+                    for _ in range(100):
+                        try:
+                            self.wfile.write(b"y"); self.wfile.flush()
+                        except OSError: return
+                        time.sleep(0.2)
+                    return
+                self.send_response(200); self.send_header("Content-Length", str(len(big))); self.end_headers()
+                self.wfile.write(big)
+        class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+        srv = S(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            u = f"http://127.0.0.1:{srv.server_port}"
+            code, body = tp.default_opener(urllib.request.Request(u + "/big"), 5, 20_000_000, None)
+            self.assertEqual((code, len(body)), (200, 1_500_000))      # not cut to 1MB
+            with self.assertRaises(tp.PlaybackRefused):
+                tp.default_opener(urllib.request.Request(u + "/big"), 5, 1_000_000, None)
+            t0 = time.time()
+            with self.assertRaises(tp.PlaybackRefused):
+                tp.default_opener(urllib.request.Request(u + "/slow"), 5, 1000,
+                                  time.monotonic() + 1.0)
+            self.assertLess(time.time() - t0, 3)
+        finally:
+            srv.shutdown(); srv.server_close()
+
+    def test_group_cleanup_after_leader_exit_and_spawn_failure(self):
+        script = self.d / "leaderexit.sh"
+        script.write_text("#!/bin/sh\nsleep 300 &\necho $! > %s\nexit 0\n" % (self.d / "child.pid"))
+        script.chmod(0o755)
+        r = hls_pump.capture(self.resolved(), str(script), str(self.d / "cap9.ts"),
+                             max_media_seconds=1, deadline_sec=5, opener=self.opener(), grace=1)
+        time.sleep(0.3)
+        child = int((self.d / "child.pid").read_text())
+        self.assertFalse(self.alive(child))
+        with self.assertRaises(OSError):
+            hls_pump.capture(self.resolved(), "/nonexistent/ffmpeg", str(self.d / "c10.ts"),
+                             max_media_seconds=1, deadline_sec=5, opener=self.opener())
+
+    def test_stderr_is_bounded_ring(self):
+        script = self.d / "noisy.sh"
+        script.write_text("#!/bin/sh\nhead -c 3000000 /dev/zero | tr '\\0' 'e' >&2\ncat >/dev/null\n")
+        script.chmod(0o755)
+        r = hls_pump.capture(self.resolved(), str(script), str(self.d / "cap11.ts"),
+                             max_media_seconds=1, deadline_sec=10, opener=self.opener(), grace=2)
+        self.assertLessEqual(len(r.stderr_tail), 500)
 
     def test_restriction_on_segment_fails_closed_without_retry_and_reaps(self):
         seen = []
@@ -296,7 +373,7 @@ class PumpTests(Base):
         ev = threading.Event(); ev.set()
         r = hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "cap7.ts"),
                              max_media_seconds=60, deadline_sec=60, opener=self.opener(playlist=live),
-                             stop_event=ev)
+                             should_stop=ev.is_set)
         self.assertEqual(r.reason, "stopped")
 
     def test_hung_ffmpeg_is_killed_with_its_process_group(self):
@@ -320,7 +397,7 @@ class PumpTests(Base):
 
     def test_pump_exception_traceback_is_clean(self):
         import traceback
-        def op(req, timeout):
+        def op(req, timeout, limit=None, deadline=None):
             raise OSError("boom https://x.ttvnw.net/a?sig=SECRETSIG&token=SECRETTOK")
         try:
             hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "capA.ts"),

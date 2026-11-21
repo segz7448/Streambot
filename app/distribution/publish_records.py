@@ -113,6 +113,13 @@ def reserve(state_dir, clip_id, reserved_by, *, lease, gate=None):
         if gate is not None and not gate(conn):
             conn.rollback()
             return 'gated', None
+        # playback-origin clips need CURRENT repost authorization at the
+        # single reservation boundary shared by native, manual and
+        # operator paths (provenance read from durable rows)
+        from ..core.provenance import repost_allowed
+        if not repost_allowed(conn, clip_id)[0]:
+            conn.rollback()
+            return 'repost_denied', None
         row = conn.execute('SELECT * FROM publish_records WHERE clip_id=?',
                            (clip_id,)).fetchone()
         if row is not None and row['state'] != 'FAILED':

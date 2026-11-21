@@ -348,6 +348,11 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
                    else "operator-native")
     def _publish_with_lease(lease):
         decision, rec = publish_records.reserve(state_dir, clip_id, reserved_by, lease=lease)
+        if decision == "repost_denied":
+            return (f"Clip #{clip_id} came from a playback session and repost "
+                    "is not authorized for its source. Not uploaded. "
+                    "(/sourceauth <user> repost on, only with the streamer's "
+                    "permission.)")
         token = rec.get("attempt_token")
         if decision == "blocked":
             if rec["state"] == "CONFIRMED":

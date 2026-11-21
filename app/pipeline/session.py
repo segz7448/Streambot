@@ -139,8 +139,10 @@ class ClipSession:
                             "UPDATE candidate_events SET metadata_json = ?"
                             " WHERE id = (SELECT event_id FROM clips"
                             " WHERE id = ?)", (json.dumps(meta), clip_id))
-                        JobQueue(conn).enqueue(
-                            ADMIT_JOB_KIND, {"clip_row_id": int(clip_id)})
+                        from ..core.provenance import repost_allowed
+                        if repost_allowed(conn, clip_id)[0]:
+                            JobQueue(conn).enqueue(
+                                ADMIT_JOB_KIND, {"clip_row_id": int(clip_id)})
                         conn.commit()
                     except Exception:
                         conn.rollback()
