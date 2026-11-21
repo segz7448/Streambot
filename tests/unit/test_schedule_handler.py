@@ -360,7 +360,7 @@ class TerminationProofTests(Base):
         c = connect(str(self.dir / "nova.db"))
         src = c.execute("SELECT id FROM twitch_sources LIMIT 1").fetchone()
         if src is None:
-            c.execute("INSERT INTO twitch_sources (username,created_at) VALUES ('ishowspeed',0)")
+            c.execute("INSERT INTO twitch_sources (username,created_at,updated_at) VALUES ('ishowspeed',0,0)")
             src = c.execute("SELECT id FROM twitch_sources LIMIT 1").fetchone()
         aid = "c" * 32
         note = lambda **k: json.dumps({"mode": "feed", "sched_attempt": aid, **k})
