@@ -359,6 +359,7 @@ class ClipSession:
             self._stopping.set()
             sup.stopping.set()
             self.phase = "stopping"
+            skip_finalize = False
             try:
                 if self.playback is not None:
                     # asyncio.wait never cancels the task on timeout; a
@@ -389,37 +390,39 @@ class ClipSession:
                     self.error = ("capture thread drained late; session "
                                   "interrupted, analysis skipped")
                     self._mark_state(db_path, session_id, "INTERRUPTED")
-                    return
+                    skip_finalize = True
             # finalize: analyze what remains, clip, finish
-            self.phase = "finalizing"
-            try:
-                await asyncio.to_thread(detector.process_new_segments)
-                await asyncio.to_thread(clipper.process_pending)
-                await asyncio.to_thread(
-                    self._finish_clips, session_id, work,
-                    self.state_dir / "runtime")
-                conn = connect(db_path)
-                if self.playback is not None:
-                    try:
-                        row = conn.execute("SELECT notes FROM stream_sessions WHERE id=?", (session_id,)).fetchone()
-                        n = json.loads(row[0]) if row and row[0] else {}
-                        n["end_reason"] = getattr(worker, "end_reason", "unknown")
-                        n["error"] = self.error
-                        conn.execute("UPDATE stream_sessions SET notes=? WHERE id=?", (json.dumps(n), session_id))
-                    except Exception:
-                        log.exception("playback notes update failed")
-                conn.execute(
-                    "UPDATE stream_sessions SET state=?, ended_at=?"
-                    " WHERE id=?",
-                    ("INTERRUPTED" if crashed else "ENDED",
-                     time.time(), session_id))
-                conn.commit()
-                conn.close()
-            except Exception as exc:
-                log.error("session finalize failed: %s", exc.__class__.__name__)
-                # sanitized (class name only), durable, never left STARTING/RECORDING
-                self.error = f"finalize failed: {exc.__class__.__name__}"
-                self._mark_state(db_path, session_id, "INTERRUPTED", self.error)
+            if not skip_finalize:
+                self.phase = "finalizing"
+                try:
+                    await asyncio.to_thread(detector.process_new_segments)
+                    await asyncio.to_thread(clipper.process_pending)
+                    await asyncio.to_thread(
+                        self._finish_clips, session_id, work,
+                        self.state_dir / "runtime")
+                    conn = connect(db_path)
+                    if self.playback is not None:
+                        try:
+                            row = conn.execute("SELECT notes FROM stream_sessions WHERE id=?", (session_id,)).fetchone()
+                            n = json.loads(row[0]) if row and row[0] else {}
+                            n["end_reason"] = getattr(worker, "end_reason", "unknown")
+                            n["error"] = self.error
+                            conn.execute("UPDATE stream_sessions SET notes=? WHERE id=?", (json.dumps(n), session_id))
+                        except Exception:
+                            log.exception("playback notes update failed")
+                    conn.execute(
+                        "UPDATE stream_sessions SET state=?, ended_at=?"
+                        " WHERE id=?",
+                        ("INTERRUPTED" if crashed else "ENDED",
+                         time.time(), session_id))
+                    conn.commit()
+                    conn.close()
+                except Exception as exc:
+                    log.error("session finalize failed: %s", exc.__class__.__name__)
+                    # sanitized (class name only), durable, never left STARTING/RECORDING
+                    self.error = f"finalize failed: {exc.__class__.__name__}"
+                    self._mark_state(db_path, session_id, "INTERRUPTED", self.error)
+                self.phase = "ended"
 
 
 def recover_interrupted_sessions(state_dir: Path) -> int:
