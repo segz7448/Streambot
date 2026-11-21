@@ -13,6 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from app.core import database
+from tests.unit import _prov
 from app.core.intake import ClipIntakeAuthority, HANDOFF_JOB_KIND
 from app.bot import handoff, native_upload
 from app.distribution import publish_records
@@ -85,8 +86,8 @@ class NativeUploadTests(unittest.TestCase):
         with conn:
             cur = conn.execute(
                 "INSERT INTO clips (duration_seconds, file_path, status,"
-                " created_at) VALUES (?, ?, ?, 0)",
-                (120.0, str(media), status))
+                " created_at, session_id) VALUES (?, ?, ?, 0, ?)",
+                (120.0, str(media), status, _prov.feed_session_id(conn)))
             cid = int(cur.lastrowid)
         conn.close()
         return cid
@@ -501,14 +502,20 @@ class NativeUploadV3Tests(NativeUploadTests):
                       call["description"])
         self.assertEqual(call["tags"], [])  # never fabricated
 
-    def test_sourceless_clip_description_is_honest(self):
+    def test_clip_without_session_origin_is_denied_not_uploaded(self):
+        # production denies unresolved provenance: a clip with no session
+        # (no source) is never uploaded and the refusal is visible
         cid = self._add_held_clip()
-        self._admit(cid)  # no admitted title/streamer, no session source
+        conn = database.connect(self.db)
+        with conn:
+            conn.execute("UPDATE clips SET session_id=NULL WHERE id=?", (cid,))
+        conn.close()
+        self._admit(cid)
         self._run_once()
-        call = self.publisher.calls[0]
-        self.assertEqual(call["title"], f"Clip #{cid}")
-        self.assertNotIn("Clipped from", call["description"])
-        self.assertIn("NOVA Clip Engine", call["description"])
+        self.assertEqual(self.publisher.calls, [])
+        rows = self._jobs()
+        self.assertEqual(rows[0]["state"], "FAILED")
+        self.assertTrue(rows[0]["last_error"].startswith("provenance_unreadable:"))
 
     def test_lease_contention_bounded_and_visible(self):
         cid = self._add_held_clip()

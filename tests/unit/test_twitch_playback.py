@@ -445,3 +445,79 @@ class PumpTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnedEndpointEndToEnd(Base):
+    """Whole resolver + pump over a local owned HTTP endpoint using the REAL
+    worker transport (no opener mocks). Only the scheme/host policy and the
+    endpoint constants are patched to reach loopback; this proves transport,
+    method, body and header fidelity, not Twitch hosts."""
+
+    def test_resolve_then_capture_real_worker(self):
+        from unittest import mock
+        from app.ingestion import hls_pump
+        d = Path(tempfile.mkdtemp())
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "testsrc=size=320x180:rate=15", "-f", "lavfi", "-i", "sine=frequency=440",
+                        "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-force_key_frames", "expr:gte(t,n_forced*2)", "-c:a", "aac", "-f", "hls",
+                        "-hls_time", "2", "-hls_list_size", "0", str(d / "v.m3u8")], check=True)
+        seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+
+            def _send(self, code, body, ctype="application/octet-stream"):
+                self.send_response(code); self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(body)
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n)
+                seen.append(("POST", self.path, self.headers.get("Client-ID"), body))
+                if self.path == "/gql" and json.loads(body).get("variables", {}).get("login") == "somechannel":
+                    self._send(200, json.dumps({"data": {"streamPlaybackAccessToken": {
+                        "value": json.dumps({"authorization": {"forbidden": False}}),
+                        "signature": "sig"}}}).encode(), "application/json")
+                else:
+                    self._send(404, b"{}")
+
+            def do_GET(self):
+                seen.append(("GET", self.path, None, b""))
+                path = self.path.split("?")[0]
+                base = f"http://127.0.0.1:{self.server.server_port}"
+                if path.startswith("/api/channel/hls/"):
+                    self._send(200, ('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=320x180\n'
+                                     f'{base}/media/v.m3u8\n').encode())
+                elif path == "/media/v.m3u8":
+                    self._send(200, (d / "v.m3u8").read_bytes())
+                elif path.startswith("/media/") and (d / path[7:]).exists():
+                    self._send(200, (d / path[7:]).read_bytes())
+                else:
+                    self._send(404, b"")
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_port}"
+        loop_ok = lambda url, host_ok=None: url.startswith(base + "/")
+        try:
+            with mock.patch.object(tp, "GQL_URL", base + "/gql"), \
+                 mock.patch.object(tp, "USHER_BASE", base), \
+                 mock.patch.object(tp, "_host_ok", loop_ok), \
+                 mock.patch.object(hls_pump.tp, "_host_ok", loop_ok):
+                r = self.res(timeout=10)
+                self.assertEqual(r.variant.name, "180p")
+                out = d / "cap.ts"
+                res = hls_pump.capture(r, "ffmpeg", str(out), max_media_seconds=60,
+                                       deadline_sec=60, timeout=10)
+        finally:
+            srv.shutdown(); srv.server_close()
+        posts = [s for s in seen if s[0] == "POST"]
+        self.assertEqual(len(posts), 1)                      # method preserved
+        self.assertEqual(posts[0][2], tp.PLAYER_CLIENT_ID)   # header preserved
+        self.assertIn(b"somechannel", posts[0][3].lower())    # body preserved
+        self.assertEqual(res.reason, "ended")
+        self.assertGreaterEqual(res.segments, 3)
+        self.assertGreater(out.stat().st_size, 1000)
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(out)], capture_output=True, text=True)
+        self.assertGreater(float(probe.stdout.strip()), 3.0)

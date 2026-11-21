@@ -46,17 +46,26 @@ def allowed(state_dir, user: str, scope: str) -> bool:
     return bool(r and r[0] == "1")
 
 
-def set_scope(state_dir, user: str, scope: str, on: bool) -> None:
+def set_scope(state_dir, user: str, scope: str, on: bool) -> int:
+    """Save the scope and (for repost on) requeue this source's grant-denied
+    jobs in ONE transaction: either both happen or neither. Returns the
+    number of jobs requeued."""
     c = _db(state_dir)
     try:
         c.execute("BEGIN IMMEDIATE")
-        c.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key)"
-                  " DO UPDATE SET value=excluded.value",
-                  (_key(user, scope), "1" if on else "0"))
-        c.commit()
-        if scope == "repost" and on:
-            from ..core.provenance import requeue_denied
-            requeue_denied(c)       # jobs refused only for a missing grant
+        try:
+            c.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key)"
+                      " DO UPDATE SET value=excluded.value",
+                      (_key(user, scope), "1" if on else "0"))
+            n = 0
+            if scope == "repost" and on:
+                from ..core.provenance import requeue_denied
+                n = requeue_denied(c, user)
+            c.commit()
+            return n
+        except BaseException:
+            c.rollback()
+            raise
     finally:
         c.close()
 
@@ -82,7 +91,7 @@ def sourceauth_reply(state_dir, args: str) -> str:
         return usage
     scope, on = parts[1].lower(), parts[2].lower() == "on"
     try:
-        set_scope(state_dir, user, scope, on)
+        requeued = set_scope(state_dir, user, scope, on)
     except sqlite3.Error:
         return (f"Could NOT change {scope} authorization for {user} "
                 "(database unavailable). Nothing changed.")
@@ -100,4 +109,6 @@ def sourceauth_reply(state_dir, args: str) -> str:
                            "is refused. Work already reserved or in flight may still start or "
                            "finish; it cannot be recalled.",
     }[(scope, on)]
-    return f"{user} {scope}: {'ON' if on else 'off'}. {note}"
+    extra = (f" {requeued} earlier-refused job(s) for this streamer re-queued "
+             "(each is re-checked before anything is sent).") if requeued else ""
+    return f"{user} {scope}: {'ON' if on else 'off'}. {note}{extra}"

@@ -73,17 +73,53 @@ def prefixed(o: Origin) -> str:
     return (DENIED_PREFIX if o.retryable else UNREADABLE_PREFIX) + o.reason
 
 
-def requeue_denied(conn) -> int:
-    """Owner granted repost: put jobs that were refused for a MISSING GRANT
-    back to PENDING. Each re-runs the gate, so a still-unauthorized source
-    is refused again. Unreadable-provenance failures stay FAILED."""
-    with conn:
-        cur = conn.execute(
+def _job_clip(kind, payload_json):
+    import json
+    try:
+        d = json.loads(payload_json)
+        if kind == "clip_intake_admit":
+            return int(d["clip_row_id"])
+        return int(str(d["clip_id"]).split(":", 1)[1])   # handoff/native jobs
+    except Exception:
+        return None
+
+
+def requeue_denied(conn, user) -> int:
+    """Called INSIDE the grant's transaction (no commit here). Requeues only
+    FAILED jobs of the supported kinds that were refused for a missing grant
+    AND whose clip resolves to this source. Each re-runs the full gate."""
+    from .intake import HANDOFF_JOB_KIND
+    n = 0
+    rows = conn.execute(
+        "SELECT id, kind, payload_json FROM job_queue WHERE state='FAILED'"
+        " AND last_error LIKE ? AND kind IN ('clip_intake_admit', ?)",
+        (DENIED_PREFIX + "%", HANDOFF_JOB_KIND)).fetchall()
+    for jid, kind, pj in rows:
+        cid = _job_clip(kind, pj)
+        if cid is None:
+            continue
+        o = _repost_allowed_real_for_user(conn, cid, user)
+        if not o:
+            continue
+        conn.execute(
             "UPDATE job_queue SET state='PENDING', attempts=0, locked_by=NULL,"
             " locked_at=NULL, last_error=NULL, run_after=0, updated_at=?"
-            " WHERE state='FAILED' AND last_error LIKE ?",
-            (time.time(), DENIED_PREFIX + "%"))
-    return cur.rowcount
+            " WHERE id=? AND state='FAILED'", (time.time(), jid))
+        n += 1
+    return n
+
+
+def _repost_allowed_real_for_user(conn, clip_id, user) -> bool:
+    """True when the clip is playback-origin from exactly this source."""
+    try:
+        r = conn.execute(
+            "SELECT t.username, s.ingest_mode FROM clips c"
+            " JOIN stream_sessions s ON c.session_id=s.id"
+            " JOIN twitch_sources t ON s.source_id=t.id WHERE c.id=?",
+            (int(clip_id),)).fetchone()
+        return bool(r and r[0] == user and r[1] == PLAYBACK)
+    except (sqlite3.Error, ValueError, TypeError):
+        return False
 
 
 repost_allowed = _repost_allowed_real

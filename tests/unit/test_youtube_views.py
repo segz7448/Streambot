@@ -1,3 +1,4 @@
+from tests.unit import _prov
 import json
 import os
 import sqlite3
@@ -12,6 +13,11 @@ from app.bot import youtube_views as yv
 from app.core.database import migrate
 from app.core.jobs import JobQueue
 from app.distribution import publish_records as pr
+
+
+def _reserve(sd, cid, *a, **k):
+    _prov.seed_clip(sd, cid)
+    return pr.reserve(sd, cid, *a, **k)
 
 
 class Base(unittest.TestCase):
@@ -109,16 +115,16 @@ class PauseTests(Base):
     def test_gate_inside_reserve_blocks_and_writes_nothing(self):
         with pr.ClipLease(self.d, 5) as lease:
             pause.set_paused(self.d, True)
-            dec, rec = pr.reserve(self.d, 5, "t", lease=lease, gate=pause.gate_in_tx)
+            dec, rec = _reserve(self.d, 5, "t", lease=lease, gate=pause.gate_in_tx)
             self.assertEqual((dec, rec), ("gated", None))
             self.assertIsNone(pr.get(self.d, 5))
             pause.set_paused(self.d, False)
-            dec, rec = pr.reserve(self.d, 5, "t", lease=lease, gate=pause.gate_in_tx)
+            dec, rec = _reserve(self.d, 5, "t", lease=lease, gate=pause.gate_in_tx)
             self.assertEqual(dec, "reserved")
 
     def test_pause_after_reserve_is_reported_in_flight(self):
         with pr.ClipLease(self.d, 6) as lease:
-            pr.reserve(self.d, 6, "t", lease=lease, gate=pause.gate_in_tx)
+            _reserve(self.d, 6, "t", lease=lease, gate=pause.gate_in_tx)
             out = pause.autopublish_reply(self.d, "pause")
             self.assertIn("1 upload(s) are already reserved", out)
         self.assertIn("reserved/in-flight 1", pause.autopublish_reply(self.d, ""))
@@ -136,7 +142,7 @@ class PauseTests(Base):
                 r = pause.gate_in_tx(conn)
                 self._t = t
                 return r
-            dec, _ = pr.reserve(self.d, 8, "t", lease=lease, gate=gate)
+            dec, _ = _reserve(self.d, 8, "t", lease=lease, gate=gate)
             self._t.join(10)
         self.assertEqual(dec, "reserved")
         self.assertEqual(seen, [True])

@@ -3,7 +3,7 @@
 Runs in its own process so the parent can enforce an absolute deadline and
 cancellation by killing the process group, covering DNS, connect, TLS,
 headers and body reads (none of which urllib can bound in total). Request
-comes on stdin as JSON {url, headers, limit, timeout} so a signed URL never
+comes on stdin as JSON {url, method, data(base64, optional), headers, limit, timeout} so a signed URL never
 appears in an argument list. Output on stdout: 4-byte big-endian status then
 the body (at most limit+1 bytes read; the parent detects overflow). Exit
 code 2 on any error, with no message text (nothing external is echoed).
@@ -22,8 +22,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def main() -> int:
     try:
-        spec = json.loads(sys.stdin.buffer.read(65536))
-        req = urllib.request.Request(spec["url"], headers=spec.get("headers") or {})
+        spec = json.loads(sys.stdin.buffer.read(400000))
+        import base64
+        data = base64.b64decode(spec["data"]) if spec.get("data") else None
+        req = urllib.request.Request(spec["url"], data=data,
+                                     headers=spec.get("headers") or {},
+                                     method=spec.get("method") or "GET")
         limit = int(spec["limit"])
         op = urllib.request.build_opener(_NoRedirect)
         out = sys.stdout.buffer

@@ -1,3 +1,4 @@
+from tests.unit import _prov
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -9,9 +10,14 @@ from app.core.database import migrate
 from app.distribution import publish_records as pr
 
 
+def _reserve(sd, cid, *a, **k):
+    _prov.seed_clip(sd, cid)
+    return pr.reserve(sd, cid, *a, **k)
+
+
 def held_worker(state, ready, release):
     with pr.ClipLease(Path(state), 1) as lease:
-        _, row = pr.reserve(Path(state), 1, 'child', lease=lease)
+        _, row = _reserve(Path(state), 1, 'child', lease=lease)
         ready.set()
         release.wait(10)
         pr.confirm(Path(state), 1, 'child-video', lease=lease, attempt_token=row['attempt_token'])
@@ -27,7 +33,7 @@ class PublishRecordsTests(unittest.TestCase):
 
     def test_confirmed_blocks_and_stale_token_rejected(self):
         with pr.ClipLease(self.d, 1) as lease:
-            decision, row = pr.reserve(self.d, 1, 'test', lease=lease)
+            decision, row = _reserve(self.d, 1, 'test', lease=lease)
             self.assertEqual(decision, 'reserved')
             token = row['attempt_token']
             with self.assertRaises(pr.PublishStateError):
@@ -35,16 +41,16 @@ class PublishRecordsTests(unittest.TestCase):
             pr.confirm(self.d, 1, 'video-id', lease=lease, attempt_token=token)
             with self.assertRaises(pr.PublishStateError):
                 pr.confirm(self.d, 1, 'other', lease=lease, attempt_token=token)
-            self.assertEqual(pr.reserve(self.d, 1, 'repeat', lease=lease)[0], 'blocked')
+            self.assertEqual(_reserve(self.d, 1, 'repeat', lease=lease)[0], 'blocked')
         self.assertEqual(pr.get(self.d, 1)['video_id'], 'video-id')
         with self.assertRaises(pr.PublishStateError):
             pr.confirm(self.d, 1, 'closed', lease=lease, attempt_token=token)
 
     def test_definitive_failure_new_token_fences_old_attempt(self):
         with pr.ClipLease(self.d, 1) as lease:
-            _, first = pr.reserve(self.d, 1, 'test', lease=lease)
+            _, first = _reserve(self.d, 1, 'test', lease=lease)
             pr.fail_definitive(self.d, 1, 'auth', lease=lease, attempt_token=first['attempt_token'])
-            _, second = pr.reserve(self.d, 1, 'retry', lease=lease)
+            _, second = _reserve(self.d, 1, 'retry', lease=lease)
             self.assertEqual(second['attempts'], 2)
             self.assertNotEqual(first['attempt_token'], second['attempt_token'])
             with self.assertRaises(pr.PublishStateError):
@@ -52,7 +58,7 @@ class PublishRecordsTests(unittest.TestCase):
 
     def test_uncertainty_requires_exact_reconciliation(self):
         with pr.ClipLease(self.d, 1) as lease:
-            _, row = pr.reserve(self.d, 1, 'test', lease=lease)
+            _, row = _reserve(self.d, 1, 'test', lease=lease)
             token = row['attempt_token']
             pr.mark_uncertain(self.d, 1, 'timeout', lease=lease, attempt_token=token)
             with self.assertRaises(pr.PublishBusy):
@@ -63,11 +69,11 @@ class PublishRecordsTests(unittest.TestCase):
             pr.reconcile(self.d, 1, expected_attempt_token=token)
         pr.reconcile(self.d, 1, expected_attempt_token=token, absent_verified=True)
         with pr.ClipLease(self.d, 1) as lease:
-            self.assertEqual(pr.reserve(self.d, 1, 'retry', lease=lease)[0], 'reserved')
+            self.assertEqual(_reserve(self.d, 1, 'retry', lease=lease)[0], 'reserved')
 
     def test_recovery_skips_live_then_recovers_after_lease_release(self):
         with pr.ClipLease(self.d, 1) as lease:
-            pr.reserve(self.d, 1, 'test', lease=lease)
+            _reserve(self.d, 1, 'test', lease=lease)
             self.assertEqual(pr.recover_interrupted(self.d), 0)
             self.assertEqual(pr.get(self.d, 1)['state'], 'RESERVED')
         self.assertEqual(pr.recover_interrupted(self.d), 1)
@@ -106,7 +112,7 @@ class PublishRecordsTests(unittest.TestCase):
             proc.join(5)
         self.assertEqual(pr.recover_interrupted(self.d), 1)
         with pr.ClipLease(self.d, 1) as lease:
-            self.assertEqual(pr.reserve(self.d, 1, 'retry', lease=lease)[0], 'blocked')
+            self.assertEqual(_reserve(self.d, 1, 'retry', lease=lease)[0], 'blocked')
 
     def test_bulk_promotion_preserves_old_evidence_without_clip_row(self):
         entries = {'publish:99': {'command': 'publish', 'result': 'yt:old'},

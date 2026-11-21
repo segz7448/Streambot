@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from app.core import database
+from tests.unit import _prov
 from app.core.intake import ClipIntakeAuthority, HANDOFF_JOB_KIND
 from app.core.jobs import JobQueue
 from app.bot import handoff
@@ -59,8 +60,8 @@ class HandoffIntegrationTests(unittest.TestCase):
         with conn:
             cur = conn.execute(
                 "INSERT INTO clips (duration_seconds, file_path, status,"
-                " created_at) VALUES (?, ?, 'HELD', 0)",
-                (duration, str(media)))
+                " created_at, session_id) VALUES (?, ?, 'HELD', 0, ?)",
+                (duration, str(media), _prov.feed_session_id(conn)))
             cid = int(cur.lastrowid)
         conn.close()
         return cid
@@ -400,14 +401,16 @@ class HandoffIntegrationTests(unittest.TestCase):
         conn.close()
         self.assertEqual(status, "HELD")
 
-    def test_clip_row_deleted_after_admission_completes_without_effect(self):
+    def test_clip_row_deleted_after_admission_fails_visibly_without_effect(self):
         cid = self._add_held_clip()
         self.auth.admit_clip(cid)
         conn = database.connect(self.db)
         conn.execute("DELETE FROM clips WHERE id = ?", (cid,))
         conn.close()
         self.assertEqual(self._run_once(), handoff.PROCESSED)
-        self.assertEqual(self._job_rows()[0]["state"], "COMPLETED")
+        row = self._job_rows()[0]
+        self.assertEqual(row["state"], "FAILED")     # visible, not silently completed
+        self.assertTrue(row["last_error"].startswith("provenance_unreadable:"))
         self.assertEqual(len(self.posts), 0)
 
     def test_concurrent_admission_and_consumption(self):

@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 
 GQL_URL = "https://gql.twitch.tv/gql"
 USHER_HOST = "usher.ttvnw.net"
+USHER_BASE = "https://" + USHER_HOST
 # Public web-player client id (not a secret, not an account credential).
 PLAYER_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 _ALLOWED_SUFFIXES = (".ttvnw.net", ".live-video.net")
@@ -108,7 +109,7 @@ def default_opener(req: urllib.request.Request, timeout: float,
     outlive them (bounded by the poll interval, ~0.1s, plus kill/reap).
     Overflow past ``limit`` raises instead of truncating. Redirects refused
     in the child. The URL goes to the child on stdin, never in argv."""
-    import json, os, select, signal, struct, subprocess, sys
+    import base64, json, os, select, signal, struct, subprocess, sys
     def left():
         return (deadline - time.monotonic()) if deadline is not None else timeout
     if left() <= 0:
@@ -129,7 +130,10 @@ def default_opener(req: urllib.request.Request, timeout: float,
     try:
         try:
             proc.stdin.write(json.dumps({
-                "url": req.full_url, "headers": dict(req.header_items()),
+                "url": req.full_url, "method": req.get_method(),
+                "data": (base64.b64encode(req.data).decode()
+                         if req.data else None),
+                "headers": dict(req.header_items()),
                 "limit": limit, "timeout": max(0.2, min(timeout, left()))}).encode())
             proc.stdin.close()
         except OSError:
@@ -295,7 +299,7 @@ def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
     dl = time.monotonic() + max(timeout * 3, 1.0)   # whole-resolve deadline
     try:
         value, sig = _get_token(login, op, timeout, dl, should_stop)
-        usher = (f"https://{USHER_HOST}/api/channel/hls/{login}.m3u8?"
+        usher = (f"{USHER_BASE}/api/channel/hls/{login}.m3u8?"
                  + urllib.parse.urlencode({
                      "sig": sig, "token": value, "allow_source": "true",
                      "allow_audio_only": "true", "player": "twitchweb",

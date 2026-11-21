@@ -1,3 +1,4 @@
+from tests.unit import _prov
 import os
 import sqlite3
 import tempfile
@@ -92,9 +93,10 @@ class PublishCommandTests(unittest.TestCase):
         clip.write_bytes(b"mp4data")
         with sqlite3.connect(str(d / "nova.db")) as conn:
             conn.execute(
-                "INSERT INTO clips(id, file_path, status, created_at)"
-                " VALUES(?,?,?,?)",
-                (clip_id, str(clip), status, time.time()))
+                "INSERT INTO clips(id, file_path, status, created_at, session_id)"
+                " VALUES(?,?,?,?,?)",
+                (clip_id, str(clip), status, time.time(),
+                 _prov.feed_session_id(conn)))
         return clip
 
     def test_usage_and_missing_clip(self):
