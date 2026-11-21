@@ -43,38 +43,89 @@ class FfmpegPathsHomeIndependent(unittest.TestCase):
 
 
 class NoTzDatabase(unittest.TestCase):
-    def test_los_angeles_falls_back_and_matches_zoneinfo(self):
-        real = ZoneInfo("America/Los_Angeles")
-        fb = intake._USPacific()
-        t = datetime(2008, 1, 1, tzinfo=timezone.utc).timestamp()
-        end = datetime(2036, 1, 1, tzinfo=timezone.utc).timestamp()
+    """Host with NO tz database: ZoneInfo search path is an empty dir and
+    tzdata package lookup is blocked; the vendored IANA file is used."""
+
+    def setUp(self):
+        import zoneinfo
+        self.empty = tempfile.mkdtemp()
+        self._old = zoneinfo.TZPATH
+        zoneinfo.reset_tzpath(to=[self.empty])
+        ZoneInfo.clear_cache()
+        self._p = mock.patch.dict("sys.modules", {"tzdata": None, "tzdata.zoneinfo": None})
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        self.addCleanup(zoneinfo.reset_tzpath, to=list(self._old))
+        self.addCleanup(ZoneInfo.clear_cache)
+
+    def test_host_really_has_no_zone(self):
+        with self.assertRaises(ZoneInfoNotFoundError):
+            ZoneInfo("America/Los_Angeles")
+
+    def test_vendored_matches_host_data_incl_far_future_and_folds(self):
+        import zoneinfo
+        zoneinfo.reset_tzpath(to=list(self._old))
+        ZoneInfo.clear_cache()
+        try:
+            real = ZoneInfo("America/Los_Angeles")
+        except ZoneInfoNotFoundError:
+            self.skipTest("no host tz database to compare against")
+        zoneinfo.reset_tzpath(to=[self.empty])
+        ZoneInfo.clear_cache()
+        fb = intake.resolve_timezone("America/Los_Angeles")
+        self.assertNotEqual(fb.key, None)
+        t = datetime(1990, 1, 1, tzinfo=timezone.utc).timestamp()
+        end = datetime(2100, 1, 1, tzinfo=timezone.utc).timestamp()
         n = 0
         while t < end:
             a = datetime.fromtimestamp(t, real)
             b = datetime.fromtimestamp(t, fb)
-            self.assertEqual(a.utcoffset(), b.utcoffset(), a)
-            self.assertEqual(a.date(), b.date())
-            t += 1800 * 7 + 11
+            self.assertEqual((a.utcoffset(), a.dst(), a.tzname()),
+                             (b.utcoffset(), b.dst(), b.tzname()), a)
+            t += 86400 * 3 + 3571
             n += 1
-        self.assertGreater(n, 1000)
-        # transitions exactly
-        for y in (2024, 2026, 2030):
-            for m, dday in ((3, None), (11, None)):
-                pass
+        self.assertGreater(n, 3000)
+        # exact transitions and the ambiguous/nonexistent local hours
         for ts in ("2026-03-08T09:59:59", "2026-03-08T10:00:00",
                    "2026-11-01T08:59:59", "2026-11-01T09:00:00"):
             u = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
             self.assertEqual(u.astimezone(real).utcoffset(),
                              u.astimezone(fb).utcoffset(), ts)
+        for fold in (0, 1):
+            x = datetime(2026, 11, 1, 1, 30, fold=fold)
+            self.assertEqual(x.replace(tzinfo=real).utcoffset(),
+                             x.replace(tzinfo=fb).utcoffset())
+        x = datetime(2026, 3, 8, 2, 30)
+        self.assertEqual(x.replace(tzinfo=real).utcoffset(),
+                         x.replace(tzinfo=fb).utcoffset())
+        # before the first transition behaves like the host (LMT), no raise
+        old = datetime(1800, 1, 1)
+        self.assertEqual(old.replace(tzinfo=real).utcoffset(),
+                         old.replace(tzinfo=fb).utcoffset())
 
-    def test_authority_starts_with_no_zoneinfo(self):
-        with mock.patch.object(intake, "ZoneInfo",
-                               side_effect=ZoneInfoNotFoundError("x")):
-            self.assertIsInstance(
-                intake.resolve_timezone("America/Los_Angeles"),
-                intake._USPacific)
-            with self.assertRaises(ZoneInfoNotFoundError):
-                intake.resolve_timezone("Europe/Paris")
+    def test_authority_initializes_with_no_host_tz_data(self):
+        from app.core import database
+        d = Path(tempfile.mkdtemp())
+        db = str(d / "n.db")
+        conn = database.connect(db)
+        database.migrate(conn)
+        conn.close()
+        auth = intake.ClipIntakeAuthority(db)
+        self.assertEqual(auth._tz.key, "America/Los_Angeles")
+
+    def test_unknown_and_hostile_names_fail_fast(self):
+        for bad in ("Europe/Paris", "../../etc/passwd", "/etc/passwd",
+                    "America//Los_Angeles", "", "America/Nowhere"):
+            with self.assertRaises((ZoneInfoNotFoundError, ValueError),
+                                   msg=bad):
+                intake.resolve_timezone(bad)
+
+    def test_vendored_file_pinned(self):
+        import hashlib
+        f = intake._VENDORED_TZ_DIR / "America" / "Los_Angeles"
+        self.assertEqual(
+            hashlib.sha256(f.read_bytes()).hexdigest(),
+            "200d05754f6d83a371cf408d7085125797657b3b0bebeba1e508cffe86a3e5c8")
 
 
 class TitleUsesMeasuredDuration(unittest.TestCase):

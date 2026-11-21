@@ -435,12 +435,22 @@ class NativeUploadV3Tests(NativeUploadTests):
         import fcntl
         cid = self._add_held_clip()
         self._admit(cid)
-        fd = os.open(str(self.state_dir / native_upload.LOCK_NAME),
+        fd = os.open(str(self.state_dir / handoff.CONSUMER_LOCK_NAME),
                      os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             status = self._run_once()
             self.assertEqual(status, handoff.IDLE)
+            # Direct entry (public process_one) is fenced by the SAME
+            # lock: it must skip, never overlap the live consumer, and
+            # crash recovery must not run either.
+            conn = database.connect(self.db)
+            try:
+                self.assertFalse(native_upload.process_one(
+                    conn, self.state_dir, probe_fn=self.probe_fn,
+                    publisher_factory=lambda: self.publisher))
+            finally:
+                conn.close()
             self.assertEqual(self.publisher.calls, [])
             states = [r["state"] for r in self._jobs()]
             self.assertEqual(states, ["PENDING"])

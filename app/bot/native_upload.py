@@ -29,7 +29,7 @@ Safety contract (same machinery as /publish, never weakened here):
   exists), never a fresh generic plan; tags are never fabricated; a
   source-less clip is described as what it is.
 - Singleton lifecycle: every cycle runs under an flock on
-  native-upload.lock, so exactly one live consumer owns a state dir.
+  the handoff-consumer lock, so exactly one live consumer owns a state dir.
   Chosen-entry preparation (legacy publication-evidence promotion,
   stranded-reservation recovery, crash-leftover job requeue) runs once
   per state dir per process under that lock before the first claim -
@@ -161,29 +161,37 @@ def process_one(conn, state_dir: Path, *,
     when a job was handled (whatever its outcome). Synchronous; call
     from a thread via the handoff consumer loop.
 
-    Singleton: every cycle runs under an flock on native-upload.lock;
+    Singleton: every cycle runs under the handoff-consumer flock;
     a second live consumer skips the cycle instead of overlapping, so
     queue recovery and clip-lease transitions never race."""
-    import fcntl
+    from .handoff import _consumer_lock
     state_dir = Path(state_dir)
-    lock_fd = os.open(str(state_dir / LOCK_NAME),
-                      os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+    # ONE lock for every consumer entry path: this is the same
+    # handoff-consumer flock run_once holds, so a direct caller of
+    # process_one can never overlap a live run_once consumer (or
+    # another direct caller) in any process.
+    with _consumer_lock(state_dir) as acquired:
+        if not acquired:
             log.warning("native upload: another live consumer holds "
                         "the state lock; skipping cycle")
             return False
-        try:
-            _prepare(state_dir, conn)
-            return _process_one_locked(
-                conn, state_dir, publisher_factory=publisher_factory,
-                probe_fn=probe_fn, ffprobe=ffprobe)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    finally:
-        os.close(lock_fd)
+        return process_one_locked(
+            conn, state_dir, publisher_factory=publisher_factory,
+            probe_fn=probe_fn, ffprobe=ffprobe)
+
+
+def process_one_locked(conn, state_dir: Path, *,
+                       publisher_factory: Optional[Callable] = None,
+                       probe_fn: Optional[Callable[[str], dict]] = None,
+                       ffprobe: str = "ffprobe") -> bool:
+    """Caller MUST hold the handoff-consumer lock (run_once does; the
+    public process_one takes it). Crash recovery runs here, under that
+    lock, so it can never requeue a job a live worker is processing."""
+    state_dir = Path(state_dir)
+    _prepare(state_dir, conn)
+    return _process_one_locked(
+        conn, state_dir, publisher_factory=publisher_factory,
+        probe_fn=probe_fn, ffprobe=ffprobe)
 
 
 def _process_one_locked(conn, state_dir: Path, *,

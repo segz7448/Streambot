@@ -295,7 +295,7 @@ def _run_once_locked(state_dir: Path, *,
         if native_upload.enabled():
             # Native mode (NOVA_NATIVE_UPLOAD=1, default off): upload the
             # admitted clip directly as PRIVATE. No webhook, no n8n.
-            return PROCESSED if native_upload.process_one(
+            return PROCESSED if native_upload.process_one_locked(
                 conn, state_dir, publisher_factory=publisher_factory,
                 probe_fn=probe_fn, ffprobe=ffprobe) else IDLE
         config = _webhook_config()

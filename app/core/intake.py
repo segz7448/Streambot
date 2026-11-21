@@ -88,7 +88,7 @@ import sqlite3
 import time
 from datetime import datetime
 from typing import Callable, Optional
-from datetime import datetime as _dt, timedelta as _td, tzinfo as _tzinfo
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.database import connect
@@ -195,64 +195,26 @@ def _is_real_number(value: object) -> bool:
         and math.isfinite(value)
 
 
-def _nth_sunday(year: int, month: int, n: int) -> _dt:
-    d = _dt(year, month, 1)
-    d += _td(days=(6 - d.weekday()) % 7)
-    return d + _td(weeks=n - 1)
-
-
-class _USPacific(_tzinfo):
-    """Built-in America/Los_Angeles rules (US DST since 2007: second
-    Sunday of March 02:00 to first Sunday of November 02:00 local).
-    Used only when the host has no tz database (the AGT Android phone
-    ships none). Not valid for dates before 2007."""
-    _STD = _td(hours=-8)
-    _DST = _td(hours=-7)
-
-    def _dst_range(self, year: int):
-        return (_nth_sunday(year, 3, 2) + _td(hours=2),
-                _nth_sunday(year, 11, 1) + _td(hours=2))
-
-    def utcoffset(self, dt):
-        if dt is None:
-            return None
-        start, end = self._dst_range(dt.year)
-        naive = dt.replace(tzinfo=None)
-        if start <= naive < end:
-            # ambiguous hour 01:00-02:00 on fall-back day: fold picks
-            if naive >= end - _td(hours=1) and getattr(dt, "fold", 0) == 0:
-                return self._DST
-            if naive >= end - _td(hours=1):
-                return self._STD
-            return self._DST
-        return self._STD
-
-    def dst(self, dt):
-        return _td(hours=1) if self.utcoffset(dt) == self._DST else _td(0)
-
-    def tzname(self, dt):
-        return "PDT" if self.dst(dt) else "PST"
-
-    def fromutc(self, dt):
-        naive = dt.replace(tzinfo=None)
-        start, end = self._dst_range(naive.year)
-        if start - self._STD <= naive < end - self._DST:
-            return (naive + self._DST).replace(tzinfo=self)
-        out = (naive + self._STD).replace(tzinfo=self)
-        if end - self._DST <= naive < end - self._STD:
-            out = out.replace(fold=1)
-        return out
+_VENDORED_TZ_DIR = Path(__file__).resolve().parent / "tzdata"
 
 
 def resolve_timezone(name: str):
-    """IANA zone via the host database; America/Los_Angeles (the
-    provisional default) falls back to built-in rules when the host has
-    no tz data. Any other missing zone raises (fail fast at startup)."""
+    """IANA zone via the host database. When the host has none (the AGT
+    Android phone ships no tz database) fall back to the vendored
+    maintained IANA TZif file for that exact key (see tzdata/README.md;
+    currently America/Los_Angeles only). Any zone with neither raises
+    (fail fast at startup). No hand-written calendar rules."""
     try:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:
-        if name == "America/Los_Angeles":
-            return _USPacific()
+        parts = name.split("/")
+        if (not name or name.startswith("/") or ".." in parts
+                or "" in parts):
+            raise
+        f = _VENDORED_TZ_DIR.joinpath(*parts)
+        if f.is_file():
+            with open(f, "rb") as fh:
+                return ZoneInfo.from_file(fh, key=name)
         raise
 
 
