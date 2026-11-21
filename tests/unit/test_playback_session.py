@@ -303,6 +303,37 @@ class Lifecycle(Base):
         self.assertTrue(w.finished)
         self.assertEqual(w.end_reason, "failed")
 
+    def test_double_external_cancel_does_not_abandon_live_writer(self):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        state = {"in": threading.Event(), "out": threading.Event()}
+        def cap(*a, should_stop=None, **k):
+            state["in"].set()
+            while not should_stop():
+                time.sleep(0.05)
+            time.sleep(2.0)
+            state["out"].set()
+            return mock.Mock(reason="stopped", segments=0, ffmpeg_rc=0)
+        w = PlaybackWorker(FakeBuf(self.sd), "streamerx", str(self.sd / "nova.db"), self.sd, "ffmpeg",
+                           initial_resolved=object(), capture_fn=cap, resolve_interval=0.0,
+                           auth_poll_seconds=0.0)
+        async def go():
+            t = asyncio.create_task(w.run(FakeCtx()))
+            while not state["in"].is_set():
+                await asyncio.sleep(0.05)
+            t.cancel(); await asyncio.sleep(0.3)
+            t.cancel(); await asyncio.sleep(0.3)
+            t.cancel()
+            early = (t.done(), w.capture_thread_active(), state["out"].is_set())
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            return early, state["out"].is_set(), w.capture_thread_active()
+        early, out, active = asyncio.run(go())
+        self.assertEqual(early, (False, True, False))   # still running, writer live, not abandoned
+        self.assertTrue(out)                            # run() returned only after the writer drained
+        self.assertFalse(active)
+
     def test_cancel_drains_capture_thread_before_finished(self):
         source_auth.set_scope(self.sd, "streamerx", "record", True)
         state = {"in": threading.Event(), "out": threading.Event()}
