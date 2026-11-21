@@ -98,16 +98,16 @@ class PlaybackWorker:
 
     async def _bg(self, fn):
         """Run a blocking helper in a thread that is counted as owned work."""
-        with self._active_lock:
-            self._active += 1
+        from ..core.owned import run_counted
 
-        def run():
-            try:
-                return fn()
-            finally:
-                with self._active_lock:
-                    self._active -= 1
-        return await asyncio.to_thread(run)
+        def inc():
+            with self._active_lock:
+                self._active += 1
+
+        def dec():
+            with self._active_lock:
+                self._active -= 1
+        return await run_counted(fn, inc, dec)
 
     def capture_thread_active(self) -> bool:
         with self._active_lock:

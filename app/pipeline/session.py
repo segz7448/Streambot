@@ -267,16 +267,16 @@ class ClipSession:
         """Run blocking work in a thread that is COUNTED thread-side: the
         count drops only when the thread function really returns, whatever
         happened to the awaiting coroutine (cancellation, repeated cancel)."""
-        with self._inflight_lock:
-            self._inflight += 1
+        from ..core.owned import run_counted
 
-        def run():
-            try:
-                return fn(*args)
-            finally:
-                with self._inflight_lock:
-                    self._inflight -= 1
-        return await asyncio.to_thread(run)
+        def inc():
+            with self._inflight_lock:
+                self._inflight += 1
+
+        def dec():
+            with self._inflight_lock:
+                self._inflight -= 1
+        return await run_counted(lambda: fn(*args), inc, dec)
 
     def _owner_drained(self, task=None) -> bool:
         """Positive attestation by every owner: the recorder task finished,

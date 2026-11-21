@@ -183,3 +183,85 @@ class DurableTerminal(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueuedBeforeStart(Base):
+    """Cancel while the work is still queued behind a busy executor: the
+    owner count must balance exactly once, never leak, never clear early."""
+
+    def _saturate(self):
+        import concurrent.futures
+        import os as _os
+        gate = threading.Event()
+        pool_size = min(32, (_os.cpu_count() or 1) + 4)
+        return gate, pool_size
+
+    def test_run_counted_cancel_while_queued_balances_and_completes(self):
+        from app.core.owned import run_counted
+        gate, n = self._saturate()
+        cnt = {"v": 0, "ran": 0}
+        lock = threading.Lock()
+
+        def inc():
+            with lock: cnt["v"] += 1
+
+        def dec():
+            with lock: cnt["v"] -= 1
+
+        def work():
+            with lock: cnt["ran"] += 1
+
+        async def go():
+            loop = asyncio.get_running_loop()
+            blockers = [loop.run_in_executor(None, gate.wait, 30) for _ in range(n + 2)]
+            await asyncio.sleep(0.2)
+            t = asyncio.create_task(run_counted(work, inc, dec))
+            await asyncio.sleep(0.2)
+            self.assertEqual(cnt["v"], 1)           # queued: owned
+            for _ in range(3):
+                t.cancel()
+                await asyncio.sleep(0.1)
+            self.assertFalse(t.done())               # still owned, not released early
+            self.assertEqual(cnt["v"], 1)
+            gate.set()
+            await asyncio.gather(*blockers)
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(t, 10)
+        asyncio.run(go())
+        self.assertEqual(cnt["v"], 0)                # balanced exactly once
+        self.assertEqual(cnt["ran"], 1)              # the work completed, never half-owned
+
+    def test_session_owned_and_playback_bg_balance_after_queued_cancel(self):
+        import types
+        from app.recording.playback_worker import PlaybackWorker
+        gate, n = self._saturate()
+        s = ClipSession("ffmpeg", "ffprobe", "", "streamerx", self.sd, playback={})
+        w = PlaybackWorker.__new__(PlaybackWorker)
+        w._active = 0
+        w._active_lock = threading.Lock()
+        ran = []
+
+        async def go():
+            loop = asyncio.get_running_loop()
+            blockers = [loop.run_in_executor(None, gate.wait, 30) for _ in range(n + 2)]
+            await asyncio.sleep(0.2)
+            t1 = asyncio.create_task(s._owned(lambda: ran.append("s")))
+            t2 = asyncio.create_task(w._bg(lambda: ran.append("w")))
+            await asyncio.sleep(0.2)
+            self.assertEqual(s._inflight, 1)
+            self.assertTrue(w.capture_thread_active())
+            self.assertFalse(w.drained())
+            for t in (t1, t2):
+                t.cancel(); await asyncio.sleep(0.05); t.cancel()
+            await asyncio.sleep(0.2)
+            self.assertEqual(s._inflight, 1)         # not cleared while queued
+            gate.set()
+            await asyncio.gather(*blockers)
+            for t in (t1, t2):
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(t, 10)
+        asyncio.run(go())
+        self.assertEqual(sorted(ran), ["s", "w"])
+        self.assertEqual(s._inflight, 0)
+        self.assertFalse(w.capture_thread_active())
+        self.assertTrue(w.drained())
