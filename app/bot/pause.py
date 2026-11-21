@@ -70,7 +70,8 @@ def set_paused(state_dir, paused: bool) -> None:
 
 def counts(state_dir) -> dict:
     """Truthful, uncapped: in-flight reservations and job-queue states."""
-    out = {"reserved": None, "queued": None, "running": None, "failed": None}
+    out = {"reserved": None, "queued": None, "running": None, "failed": None,
+           "admit_queued": None, "admit_running": None, "admit_failed": None}
     try:
         c = _db(state_dir, ro=True)
         try:
@@ -82,6 +83,9 @@ def counts(state_dir) -> dict:
                 out[key] = c.execute(
                     "SELECT COUNT(*) FROM job_queue WHERE kind="
                     "'clip_intake_handoff' AND state=?", (st,)).fetchone()[0]
+                out["admit_" + key] = c.execute(
+                    "SELECT COUNT(*) FROM job_queue WHERE kind="
+                    "'clip_intake_admit' AND state=?", (st,)).fetchone()[0]
         finally:
             c.close()
     except sqlite3.Error:
@@ -103,15 +107,19 @@ def autopublish_reply(state_dir, args: str) -> str:
             return ("Could NOT change the pause setting (database unavailable). "
                     "Uploads are not paused by this command. Try again.")
         if a == "resume":
-            return "Automatic upload resumed (still private only)."
+            return ("Automatic upload resumed (still private only)."
+                    + ("" if enabled() else " NOTE: automatic upload is "
+                       "DISABLED by the deploy gate, so nothing will upload "
+                       "until that is enabled."))
         n = counts(state_dir)["reserved"]
         if n is None:
             return ("Pause saved, but I could not read in-flight uploads. "
                     "Uploads that already started cannot be stopped by a pause.")
         return ("Automatic upload PAUSED: queued clips wait and no new upload "
                 "starts. "
-                + (f"{n} upload(s) already reserved will still finish "
-                   "(past the point a pause can stop). " if n else
+                + (f"{n} upload(s) are already reserved: they may still "
+                   "start or finish (a reservation can also be a crashed "
+                   "upload); pause cannot cancel them. " if n else
                    "No upload is in flight. ")
                 + "/autopublish resume undoes it.")
     st = state(state_dir)
@@ -121,6 +129,8 @@ def autopublish_reply(state_dir, args: str) -> str:
             + f", pause: {st.upper()}"
             + (" (setting unreadable, treated as paused)" if st == "unreadable" else "")
             + ", private only.\n"
-            f"queued {_fmt(c['queued'])}, running {_fmt(c['running'])}, "
-            f"reserved/in-flight {_fmt(c['reserved'])}, failed {_fmt(c['failed'])}.\n"
+            f"upload handoff: queued {_fmt(c['queued'])}, running {_fmt(c['running'])}, "
+            f"failed {_fmt(c['failed'])}. reserved/in-flight {_fmt(c['reserved'])}.\n"
+            f"intake admission: queued {_fmt(c['admit_queued'])}, running "
+            f"{_fmt(c['admit_running'])}, failed {_fmt(c['admit_failed'])}.\n"
             "Usage: /autopublish [pause|resume]")

@@ -104,7 +104,7 @@ async def main():
             if qc_ok and os.environ.get("NOVA_SMOKE_DELIVER") == "1":
                 from app.distribution.telegram_delivery import deliver_clip_sync  # noqa: E402
                 delivered_id = await asyncio.to_thread(
-                    deliver_clip_sync, os.environ["NOVA_TOKEN_FILE"],
+                    deliver_clip_sync, os.environ.get("NOVA_TOKEN_FILE", ""),
                     os.environ["NOVA_STATE_DIR"], edited_path,
                     "NOVA chained synthetic end-to-end test - not a real stream clip")
     conn = connect(db)

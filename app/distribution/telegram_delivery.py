@@ -60,7 +60,7 @@ if __name__ == "__main__":
     import os
     import sys
     message_id = deliver_clip_sync(
-        os.environ["NOVA_TOKEN_FILE"],
+        os.environ.get("NOVA_TOKEN_FILE", ""),
         os.environ.get("NOVA_STATE_DIR", os.path.expanduser("~/.nova-clip")),
         sys.argv[1],
         sys.argv[2] if len(sys.argv) > 2 else "")

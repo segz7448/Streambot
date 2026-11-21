@@ -30,7 +30,7 @@ class Base(unittest.TestCase):
 class ViewsTests(Base):
     def test_empty_and_read_only(self):
         before = (self.d / "nova.db").stat().st_mtime_ns
-        self.assertIn("empty", yv.publishqueue_reply(self.d))
+        self.assertIn("Nothing pending", yv.publishqueue_reply(self.d))
         self.assertIn("No confirmed", yv.publishhistory_reply(self.d))
         self.assertEqual(before, (self.d / "nova.db").stat().st_mtime_ns)
 
@@ -87,7 +87,10 @@ class ViewsTests(Base):
 
     def test_registered(self):
         import inspect
-        from app.bot.service import BotService
+        try:
+            from app.bot.service import BotService
+        except ImportError:
+            self.skipTest("telegram package unavailable or stubbed incompletely")
         src = inspect.getsource(BotService)
         for n in ("youtubestatus", "publishqueue", "publishhistory", "autopublish"):
             self.assertIn(f'"{n}"', src)
@@ -117,7 +120,7 @@ class PauseTests(Base):
         with pr.ClipLease(self.d, 6) as lease:
             pr.reserve(self.d, 6, "t", lease=lease, gate=pause.gate_in_tx)
             out = pause.autopublish_reply(self.d, "pause")
-            self.assertIn("1 upload(s) already reserved will still finish", out)
+            self.assertIn("1 upload(s) are already reserved", out)
         self.assertIn("reserved/in-flight 1", pause.autopublish_reply(self.d, ""))
 
     def test_pause_commits_serialize_with_reserve(self):
@@ -138,7 +141,7 @@ class PauseTests(Base):
         self.assertEqual(dec, "reserved")
         self.assertEqual(seen, [True])
         self.assertEqual(pause.state(self.d), "paused")
-        self.assertIn("1 upload(s) already reserved", pause.autopublish_reply(self.d, "pause"))
+        self.assertIn("1 upload(s) are already reserved", pause.autopublish_reply(self.d, "pause"))
 
     def test_native_upload_pause_before_claim_and_at_reserve(self):
         from app.bot import native_upload as nu
@@ -193,13 +196,25 @@ class TokenSourceTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 ts.read_token()
 
+    def test_no_consumer_indexes_token_file_directly(self):
+        import re
+        root = Path(__file__).resolve().parents[2] / "app"
+        bad = []
+        for f in root.rglob("*.py"):
+            if re.search(r'environ\[\s*["\']NOVA_TOKEN_FILE["\']\s*\]', f.read_text()):
+                bad.append(str(f.relative_to(root)))
+        self.assertEqual(bad, [])
+
     def test_status_never_shows_value(self):
-        from app.bot import service
+        from app.core import tokensrc
         with mock.patch.dict(os.environ, {"NOVA_TELEGRAM_TOKEN": "SECRETVALUE"}, clear=False):
-            self.assertEqual(service._tok_src(), "env")
+            self.assertEqual(tokensrc.source(), "env")
 
     def test_delivery_uses_env_token(self):
-        from app.distribution import telegram_delivery as td
+        try:
+            from app.distribution import telegram_delivery as td
+        except ImportError:
+            self.skipTest("telegram package unavailable or stubbed incompletely")
         got = {}
         async def fake(token, store, video, caption):
             got["t"] = token; return 1
@@ -207,6 +222,48 @@ class TokenSourceTests(unittest.TestCase):
              mock.patch.dict(os.environ, {"NOVA_TELEGRAM_TOKEN": "ENVT"}, clear=False):
             self.assertEqual(td.deliver_clip_sync("/nonexistent", str(tempfile.mkdtemp()), "v.mp4"), 1)
         self.assertEqual(got["t"], "ENVT")
+
+
+class AdmissionAndSizeTests(Base):
+    def _enq(self, kind, n, fail=False):
+        c = self.conn(); q = JobQueue(c)
+        for i in range(n):
+            q.enqueue(kind, {"clip_id": f"cliprow:{i}"})
+        c.commit(); c.close()
+
+    def test_admission_only_is_not_reported_empty(self):
+        self._enq("clip_intake_admit", 1)
+        out = yv.publishqueue_reply(self.d)
+        self.assertNotIn("Nothing pending", out)
+        self.assertIn("admit job", out)
+        self.assertIn("intake admission", yv.youtube_reply(self.d))
+        self.assertIn("intake admission: queued 1", pause.autopublish_reply(self.d, ""))
+
+    def test_full_view_is_bounded_and_chunker_respects_limit(self):
+        from app.bot.chunk import chunks
+        self._enq("clip_intake_handoff", 30)
+        c = self.conn()
+        for i in range(30):
+            c.execute("INSERT INTO publish_records (clip_id,state,attempts,last_error,created_at,updated_at)"
+                      " VALUES (?, 'UNCERTAIN',1,?,?,?)", (100 + i, "e" * 200, time.time(), time.time()))
+        c.commit(); c.close()
+        out = yv.publishqueue_reply(self.d)
+        self.assertLess(len(out), 4096)
+        long = "\n".join("x" * 90 for _ in range(200))
+        parts = chunks(long)
+        self.assertTrue(all(len(p) <= 4000 for p in parts))
+        self.assertEqual("\n".join(parts), long)
+
+    def test_pause_wording_and_resume_gate(self):
+        c = self.conn()
+        c.execute("INSERT INTO publish_records (clip_id,state,attempts,created_at,updated_at)"
+                  " VALUES (9,'RESERVED',1,?,?)", (time.time(), time.time()))
+        c.commit(); c.close()
+        out = pause.autopublish_reply(self.d, "pause")
+        self.assertIn("may still", out)
+        self.assertNotIn("will still finish", out)
+        with mock.patch.dict(os.environ, {"NOVA_NATIVE_UPLOAD": ""}, clear=False):
+            self.assertIn("DISABLED", pause.autopublish_reply(self.d, "resume"))
 
 
 if __name__ == "__main__":

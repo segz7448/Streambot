@@ -19,6 +19,7 @@ from . import pause as _pause
 _KEYS = ("NOVA_YOUTUBE_CLIENT_ID", "NOVA_YOUTUBE_CLIENT_SECRET",
          "NOVA_YOUTUBE_REFRESH_TOKEN")
 _HANDOFF = "clip_intake_handoff"
+_ADMIT = "clip_intake_admit"
 
 
 class Unavailable(Exception):
@@ -81,6 +82,8 @@ def youtube_reply(state_dir, _args="") -> str:
     unc = _num(state_dir, "SELECT COUNT(*) n FROM publish_records WHERE state IN ('RESERVED','UNCERTAIN')")
     pend = _num(state_dir, "SELECT COUNT(*) n FROM job_queue WHERE kind=? AND state IN ('PENDING','ANALYZING')", (_HANDOFF,))
     fail = _num(state_dir, "SELECT COUNT(*) n FROM job_queue WHERE kind=? AND state='FAILED'", (_HANDOFF,))
+    apend = _num(state_dir, "SELECT COUNT(*) n FROM job_queue WHERE kind=? AND state IN ('PENDING','ANALYZING')", (_ADMIT,))
+    afail = _num(state_dir, "SELECT COUNT(*) n FROM job_queue WHERE kind=? AND state='FAILED'", (_ADMIT,))
     return ("YouTube publishing\n"
             f"credentials: {_mode()}\n"
             f"automatic upload: {_auto_with_pause(state_dir)}\n"
@@ -88,6 +91,7 @@ def youtube_reply(state_dir, _args="") -> str:
             f"confirmed uploads: {conf}\n"
             f"queued or running: {pend}\n"
             f"failed jobs: {fail}\n"
+            f"intake admission (before upload): queued or running {apend}, failed {afail}\n"
             f"reserved/uncertain (need attention): {unc}\n"
             "Commands: /youtubestatus /publishqueue /publishhistory "
             "/autopublish /publish <id>")
@@ -104,30 +108,31 @@ def publishqueue_reply(state_dir, _args="") -> str:
     out = []
     try:
         jobs = _q(state_dir, "SELECT id,state,attempts,max_attempts,run_after,"
-                  "last_error,payload_json FROM job_queue WHERE kind=? AND state "
-                  "IN ('PENDING','ANALYZING','FAILED') ORDER BY id DESC LIMIT 15",
-                  (_HANDOFF,))
-        jtotal = _q(state_dir, "SELECT COUNT(*) n FROM job_queue WHERE kind=? "
+                  "last_error,payload_json,kind FROM job_queue WHERE kind IN (?,?) AND state "
+                  "IN ('PENDING','ANALYZING','FAILED') ORDER BY id DESC LIMIT 10",
+                  (_HANDOFF, _ADMIT))
+        jtotal = _q(state_dir, "SELECT COUNT(*) n FROM job_queue WHERE kind IN (?,?) "
                     "AND state IN ('PENDING','ANALYZING','FAILED')",
-                    (_HANDOFF,))[0]["n"]
+                    (_HANDOFF, _ADMIT))[0]["n"]
     except Unavailable:
         return "Publish queue unavailable (database unreadable)."
     try:
         recs = _q(state_dir, "SELECT clip_id,state,attempts,last_error,updated_at "
                   "FROM publish_records WHERE state IN ('RESERVED','UNCERTAIN','FAILED')"
-                  " ORDER BY updated_at DESC LIMIT 15")
+                  " ORDER BY updated_at DESC LIMIT 10")
         rtotal = _q(state_dir, "SELECT COUNT(*) n FROM publish_records WHERE state "
                     "IN ('RESERVED','UNCERTAIN','FAILED')")[0]["n"]
     except Unavailable:
         return "Publish records unavailable (database unreadable)."
     if not jobs and not recs:
-        return ("Publish queue is empty. (Automatic upload: "
+        return ("Nothing pending in intake admission or upload, and no uploads "
+                "need attention. (Automatic upload: "
                 f"{_auto_with_pause(state_dir)}.)")
     import json
     import time
     out.append(f"Automatic upload: {_auto_with_pause(state_dir)}")
     if jobs:
-        out.append(f"Upload jobs ({jtotal} total, newest {len(jobs)}):")
+        out.append(f"Pipeline jobs ({jtotal} total, newest {len(jobs)}):")
         for j in jobs:
             try:
                 cid = json.loads(j["payload_json"]).get("clip_id", "?")
@@ -137,7 +142,8 @@ def publishqueue_reply(state_dir, _args="") -> str:
             if j["state"] == "PENDING" and (j["run_after"] or 0) > time.time():
                 wait = f", retry after {_when(j['run_after'])}"
             err = f" ({j['last_error'][:60]})" if j["last_error"] else ""
-            out.append(f"job {j['id']} {cid} {j['state']} attempt "
+            stage = "admit" if j["kind"] == _ADMIT else "upload"
+            out.append(f"{stage} job {j['id']} {cid} {j['state']} attempt "
                        f"{j['attempts']}/{j['max_attempts']}{wait}{err}")
     if recs:
         out.append(f"Publish records needing attention ({rtotal} total, newest {len(recs)}):")

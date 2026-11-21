@@ -305,7 +305,9 @@ class BotService:
                 self.router.dispatch, message.text or "",
                 user_id=user.id, update_id=update.update_id)
             if reply:
-                await message.reply_text(reply)
+                from .chunk import chunks as _chunks
+                for _part in _chunks(reply):
+                    await message.reply_text(_part)
             self.inbox.remove(update.update_id)
         except Exception as exc:
             # entry STAYS in the inbox: redelivery is not guaranteed
