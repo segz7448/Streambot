@@ -9,11 +9,21 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _CONFIGURED = False
+
+
+# Telegram bot tokens look like <digits>:<35 url-safe chars>. Any such
+# string, and any /bot<token>/ URL segment, is masked before it is written.
+_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
+
+
+def redact(text: str) -> str:
+    return _TOKEN_RE.sub("[redacted-token]", text)
 
 
 class JsonFormatter(logging.Formatter):
@@ -26,6 +36,8 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
+        payload = {k: redact(v) if isinstance(v, str) else v
+                   for k, v in payload.items()}
         return json.dumps(payload, separators=(",", ":"))
 
 
@@ -55,3 +67,25 @@ def setup_logging(log_dir: str, level: str = "INFO") -> logging.Logger:
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"nova.{name}")
+
+
+def setup_service_logging(log_dir: str, level: str = "INFO") -> logging.Logger:
+    """Logging for the Telegram service entrypoint (app.bot.service).
+
+    Before this the service never installed handlers, so INFO records were
+    dropped and only WARNING+ reached a stderr pipe nobody can read. This
+    writes redacted JSON lines to <log_dir>/nova.log (rotating) and stderr,
+    and routes the framework's own "telegram" logger the same way so
+    polling start-up and failures are visible. httpx/httpcore are held at
+    WARNING because their INFO lines embed the request URL (bot token).
+    """
+    root = setup_logging(log_dir, level)
+    tg = logging.getLogger("telegram")
+    if not tg.handlers:
+        for h in root.handlers:
+            tg.addHandler(h)
+        tg.setLevel(getattr(logging, level, logging.INFO))
+        tg.propagate = False
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    return root

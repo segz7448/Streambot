@@ -553,6 +553,9 @@ def main() -> None:
     state_dir = os.environ.get(
         "NOVA_STATE_DIR", os.path.expanduser("~/.nova-clip"))
     token = read_token()
+    from ..core.logging import setup_service_logging
+    setup_service_logging(os.path.join(state_dir, "logs"))
+    log.info("service process starting pid=%d", os.getpid())
     BotService(token, PairingStore(os.path.join(state_dir, "admin.json"))).run()
 
 
