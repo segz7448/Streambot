@@ -103,11 +103,16 @@ def get(state_dir, clip_id):
         return dict(row) if row else None
 
 
-def reserve(state_dir, clip_id, reserved_by, *, lease):
+def reserve(state_dir, clip_id, reserved_by, *, lease, gate=None):
+    """gate(conn)->bool is evaluated inside BEGIN IMMEDIATE; False returns
+    ('gated', None) with nothing written."""
     lease.require(state_dir, clip_id)
     now, token = time.time(), secrets.token_hex(16)
     with closing(_connect(state_dir)) as conn:
         conn.execute('BEGIN IMMEDIATE')
+        if gate is not None and not gate(conn):
+            conn.rollback()
+            return 'gated', None
         row = conn.execute('SELECT * FROM publish_records WHERE clip_id=?',
                            (clip_id,)).fetchone()
         if row is not None and row['state'] != 'FAILED':

@@ -203,6 +203,9 @@ def _process_one_locked(conn, state_dir: Path, *,
                         probe_fn: Optional[Callable[[str], dict]] = None,
                         ffprobe: str = "ffprobe") -> bool:
     state_dir = Path(state_dir)
+    from .pause import is_paused
+    if is_paused(state_dir):
+        return False  # paused or pause unreadable: claim nothing
     queue = JobQueue(conn)
     job = queue.claim(WORKER_NAME, kinds=[HANDOFF_JOB_KIND])
     if job is None:
@@ -368,10 +371,26 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
     reserved_by = f"native-upload:{job_id}"
     from . import ops
     from .commands_full import record_error
+    from . import pause as _pause
     try:
         with publish_records.ClipLease(state_dir, row_id) as lease:
             decision, rec = publish_records.reserve(
-                state_dir, row_id, reserved_by, lease=lease)
+                state_dir, row_id, reserved_by, lease=lease,
+                gate=_pause.gate_in_tx)
+            if decision == "gated":
+                # Paused (or pause unreadable) at the committed boundary:
+                # nothing reserved, no provider call. The job goes back
+                # unspent.
+                with conn:
+                    conn.execute(
+                        "UPDATE job_queue SET state='PENDING', locked_by=NULL,"
+                        " locked_at=NULL, attempts=MAX(attempts-1,0),"
+                        " run_after=?, updated_at=? WHERE id=? AND"
+                        " state='ANALYZING'", (time.time() + 30, time.time(),
+                                               job_id))
+                log.info("native upload job %s: paused at reserve; returned "
+                         "to the queue unspent", job_id)
+                return True
             if decision == "blocked":
                 if rec["state"] == "CONFIRMED":
                     # Already uploaded: idempotent success, zero network.

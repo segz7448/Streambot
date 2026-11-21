@@ -509,8 +509,11 @@ def _deliver_one_clip_locked(state_dir: Path, clip_id: int,
         try:
             from ..distribution.telegram_delivery import (
                 deliver_clip_sync)
-            token_path = _os.environ["NOVA_TOKEN_FILE"]
-        except (KeyError, ImportError) as exc:
+            from ..core.tokensrc import source as _tsrc
+            if _tsrc() == "none":
+                raise KeyError("no Telegram token source")
+            token_path = _os.environ.get("NOVA_TOKEN_FILE", "")
+        except (KeyError, ImportError, RuntimeError) as exc:
             log.warning("delivery of clip %s unavailable before send:"
                         " %s", clip_id, exc)
             conn.close()

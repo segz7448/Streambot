@@ -49,8 +49,8 @@ async def deliver_clip(token: str, store: PairingStore, video_path: str,
 
 def deliver_clip_sync(token_path: str, state_dir: str, video_path: str,
                       caption: str = "") -> int:
-    with open(token_path) as fh:
-        token = fh.read().strip()
+    from ..core.tokensrc import read_token
+    token = read_token(token_path)
     import os
     store = PairingStore(os.path.join(state_dir, "admin.json"))
     return asyncio.run(deliver_clip(token, store, video_path, caption))

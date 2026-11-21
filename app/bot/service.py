@@ -37,6 +37,14 @@ from .rtmpfilter import install as install_rtmp_filter
 install_rtmp_filter()
 
 
+def _tok_src() -> str:
+    from ..core.tokensrc import source
+    try:
+        return source()
+    except Exception:
+        return "INVALID (empty vault value)"
+
+
 class BotService:
     def __init__(self, token: str, store: PairingStore,
                  watermark: UpdateWatermark | None = None):
@@ -132,6 +140,17 @@ class BotService:
         self.router.register("youtubeauth",
                              lambda c: cf.youtubeauth_reply(self._state_dir(), c.args),
                              "YouTube consent run: /youtubeauth [status]")
+        from . import pause as _pause_mod
+        from . import youtube_views as yv
+        for _n, _f, _d in (
+            ("youtube", yv.youtube_reply, "YouTube publishing overview (read-only)"),
+            ("youtubestatus", yv.youtubestatus_reply, "YouTube credential/auto-upload status (read-only)"),
+            ("publishqueue", yv.publishqueue_reply, "upload jobs and uncertain uploads (read-only)"),
+            ("publishhistory", yv.publishhistory_reply, "confirmed uploads (read-only)"),
+            ("autopublish", _pause_mod.autopublish_reply, "automatic upload status / pause / resume (private only)"),
+        ):
+            self.router.register(
+                _n, (lambda f: lambda c: f(self._state_dir(), c.args))(_f), _d)
         self.router.register("publish",
                              lambda c: cf.publish_reply(self._state_dir(), c.args, c.update_id),
                              "upload a clip to YouTube as PRIVATE: "
@@ -184,6 +203,7 @@ class BotService:
         return (f"NOVA Clip Engine status\n"
                 f"bot: running ({uptime}s uptime, {admin})\n"
                 f"updates handled: {handled}, failed pending: {len(failed)}\n"
+                f"token source: {_tok_src()}\n"
                 f"pipeline: capture idle - no Twitch source authorized yet")
 
     def _storage(self, _cmd) -> str:
@@ -405,11 +425,10 @@ class BotService:
 
 
 def main() -> None:
-    token_path = os.environ["NOVA_TOKEN_FILE"]
+    from ..core.tokensrc import read_token
     state_dir = os.environ.get(
         "NOVA_STATE_DIR", os.path.expanduser("~/.nova-clip"))
-    with open(token_path) as fh:
-        token = fh.read().strip()
+    token = read_token()
     BotService(token, PairingStore(os.path.join(state_dir, "admin.json"))).run()
 
 
