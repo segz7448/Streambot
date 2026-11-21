@@ -225,3 +225,33 @@ def publisher_from_state(state_dir: str) -> YouTubePublisher:
     return YouTubePublisher(read("youtube_client_id"),
                             read("youtube_refresh_token"),
                             read("youtube_client_secret"))
+
+
+ENV_CLIENT_ID = "NOVA_YOUTUBE_CLIENT_ID"
+ENV_CLIENT_SECRET = "NOVA_YOUTUBE_CLIENT_SECRET"
+ENV_REFRESH_TOKEN = "NOVA_YOUTUBE_REFRESH_TOKEN"
+
+
+def publisher_from_env_or_state(state_dir: str) -> YouTubePublisher:
+    """AGT Vault injection first, state-dir files as migration fallback.
+
+    When the deployment injects the NOVA_YOUTUBE_* variables (owner's
+    AGT Vault at deploy time, process env only, never a file), they win
+    as a COMPLETE set. A partial env set is refused instead of being
+    mixed with on-disk credentials, so a fresh refresh token can never
+    be paired with a stale client id/secret from a different consent
+    run. With no NOVA_YOUTUBE_* variables set, the state-dir files
+    remain the source (the pre-vault route) until the standalone copies
+    are retired after verified env consumption.
+    """
+    cid = os.environ.get(ENV_CLIENT_ID, "").strip()
+    sec = os.environ.get(ENV_CLIENT_SECRET, "").strip()
+    rtok = os.environ.get(ENV_REFRESH_TOKEN, "").strip()
+    if cid or sec or rtok:
+        if not (cid and rtok):
+            raise YouTubeNotConfigured(
+                "partial NOVA_YOUTUBE_* environment: client id and "
+                "refresh token must be injected together; refusing to "
+                "mix env credentials with state-dir files")
+        return YouTubePublisher(cid, rtok, sec)
+    return publisher_from_state(state_dir)

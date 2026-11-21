@@ -342,9 +342,9 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
                     "before issuing /publish again.")
     from ..distribution.youtube import (YouTubeNotConfigured,
                                         YouTubeUploadFailed,
-                                        publisher_from_state)
+                                        publisher_from_env_or_state)
     try:
-        pub = publisher_from_state(str(state_dir))
+        pub = publisher_from_env_or_state(str(state_dir))
     except YouTubeNotConfigured:
         return ("YouTube upload is not configured: OAuth consent is "
                 "still pending. Nothing was uploaded.")

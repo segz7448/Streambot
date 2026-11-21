@@ -145,3 +145,83 @@ class UploadStageTests(unittest.TestCase):
         # streamed: the file object itself, not a bytes copy in RAM
         self.assertTrue(hasattr(put.data, "read"))
         self.assertEqual(put.headers.get("Content-length"), "10000")
+
+
+class EnvFirstPublisherTests(unittest.TestCase):
+    """NOVA_YOUTUBE_* env injection wins as a complete set; partial env
+    is refused rather than mixed with state-dir files."""
+
+    def _state(self, tmp, cid="file-cid", rtok="file-rtok", sec="file-sec"):
+        import pathlib
+        base = pathlib.Path(tmp)
+        if cid is not None:
+            (base / "youtube_client_id").write_text(cid)
+        if rtok is not None:
+            (base / "youtube_refresh_token").write_text(rtok)
+        if sec is not None:
+            (base / "youtube_client_secret").write_text(sec)
+        return str(base)
+
+    def test_complete_env_wins_over_files(self):
+        import tempfile
+        from app.distribution.youtube import publisher_from_env_or_state
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = self._state(tmp)
+            env = {"NOVA_YOUTUBE_CLIENT_ID": "env-cid",
+                   "NOVA_YOUTUBE_CLIENT_SECRET": "env-sec",
+                   "NOVA_YOUTUBE_REFRESH_TOKEN": "env-rtok"}
+            with mock.patch.dict("os.environ", env):
+                pub = publisher_from_env_or_state(state_dir)
+        self.assertEqual(pub.client_id, "env-cid")
+        self.assertEqual(pub.refresh_token, "env-rtok")
+        self.assertEqual(pub.client_secret, "env-sec")
+
+    def test_partial_env_refused_not_mixed(self):
+        import tempfile
+        from app.distribution.youtube import publisher_from_env_or_state
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = self._state(tmp)
+            # only client id injected: refresh token must NOT be read
+            # from the state file to complete the set
+            with mock.patch.dict("os.environ",
+                                 {"NOVA_YOUTUBE_CLIENT_ID": "env-cid"},
+                                 clear=False):
+                import os
+                os.environ.pop("NOVA_YOUTUBE_REFRESH_TOKEN", None)
+                os.environ.pop("NOVA_YOUTUBE_CLIENT_SECRET", None)
+                with self.assertRaises(YouTubeNotConfigured):
+                    publisher_from_env_or_state(state_dir)
+
+    def test_no_env_falls_back_to_files(self):
+        import os
+        import tempfile
+        from app.distribution.youtube import publisher_from_env_or_state
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = self._state(tmp)
+            saved = {k: os.environ.pop(k, None) for k in (
+                "NOVA_YOUTUBE_CLIENT_ID", "NOVA_YOUTUBE_CLIENT_SECRET",
+                "NOVA_YOUTUBE_REFRESH_TOKEN")}
+            try:
+                pub = publisher_from_env_or_state(state_dir)
+            finally:
+                for k, v in saved.items():
+                    if v is not None:
+                        os.environ[k] = v
+        self.assertEqual(pub.client_id, "file-cid")
+        self.assertEqual(pub.refresh_token, "file-rtok")
+
+    def test_no_env_no_files_is_unconfigured(self):
+        import os
+        import tempfile
+        from app.distribution.youtube import publisher_from_env_or_state
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = {k: os.environ.pop(k, None) for k in (
+                "NOVA_YOUTUBE_CLIENT_ID", "NOVA_YOUTUBE_CLIENT_SECRET",
+                "NOVA_YOUTUBE_REFRESH_TOKEN")}
+            try:
+                with self.assertRaises(YouTubeNotConfigured):
+                    publisher_from_env_or_state(tmp)
+            finally:
+                for k, v in saved.items():
+                    if v is not None:
+                        os.environ[k] = v
