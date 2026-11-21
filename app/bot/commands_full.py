@@ -79,8 +79,8 @@ def _public_status_reply(username: str, status_fn=None) -> str:
             "invalid": "INVALID channel name"}.get(status, "UNKNOWN")
     return (f"{username}: {head}. {detail}. Unofficial check of Twitch's "
             "public player route: live/offline only, no title, game or "
-            "viewer count, and Twitch can change or block it. Nothing was "
-            "recorded or downloaded.")
+            "viewer count, and Twitch can change or block it. No video or media "
+            "was downloaded and nothing was recorded.")
 
 
 def checklive_reply(state_dir: Path, username: str, status_fn=None) -> str:
