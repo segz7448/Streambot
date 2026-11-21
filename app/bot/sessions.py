@@ -88,28 +88,65 @@ def start_scheduled(state_dir: Path, username: str, ffmpeg: str,
         _tl.attempt, _tl.started, _tl.refusal = None, False, None
 
 
-def writer_active(state_dir: Path, username: str, quiet_s: float = 90.0) -> bool:
-    """Best effort check that nothing is still writing for this streamer:
-    True if a file in its session directory changed within quiet_s, or a
-    process (not this one) has that directory in its command line (an
-    orphan recorder from an earlier run). Unreadable /proc falls back to
-    modification times only."""
+def session_terminated(state_dir: Path, username: str, attempt_id) -> bool:
+    """POSITIVE proof only. True when the exact attempt's session object is
+    registered and finished, or its durable stream_sessions row (matched by
+    notes.sched_attempt) carries notes.drained=true, written by the session's own
+    finalizer after its children were drained (crash recovery marking a row
+    INTERRUPTED is NOT proof). Everything else is not proof."""
+    with _lock:
+        s = _match(username, attempt_id)
+    if s is not None:
+        try:
+            return (not s.alive()) and bool(getattr(s, "_finalized", False))
+        except Exception:
+            return False
+    try:
+        import sqlite3
+        from ..core import schedule as _sc
+        sid = _sc.find_session_id(state_dir, attempt_id)
+        if sid is None:
+            return False
+        c = sqlite3.connect(f"file:{Path(state_dir) / 'nova.db'}?mode=ro", uri=True, timeout=5)
+        try:
+            r = c.execute("SELECT notes FROM stream_sessions WHERE id=?",
+                          (sid,)).fetchone()
+        finally:
+            c.close()
+        import json as _j
+        return bool(r and r[0] and _j.loads(r[0]).get("drained") is True)
+    except Exception:
+        return False
+
+
+def writer_active(state_dir: Path, username: str, quiet_s: float = 300.0) -> bool:
+    """Fail-closed check for a possibly orphaned writer. True (treat as
+    owned/ambiguous) if a file in the streamer's session directory changed
+    within quiet_s, if a process other than this one has that directory in
+    its command line, or if anything could not be inspected (unreadable
+    directory, /proc missing, a process whose command line is denied).
+    False only when everything was inspected and nothing matched. It is
+    evidence of quiet, not proof: a stalled writer older than quiet_s with a
+    command line that does not name the directory is not detectable."""
     import os
     import time
     work = Path(state_dir) / "sessions" / username
     now = time.time()
-    for root, _dirs, files in os.walk(work):
-        for f in files:
-            try:
-                if now - os.stat(os.path.join(root, f)).st_mtime < quiet_s:
-                    return True
-            except OSError:
-                continue
+    if work.exists():
+        def _err(_e):
+            raise OSError("unreadable session directory")
+        try:
+            for root, _dirs, files in os.walk(work, onerror=_err):
+                for f in files:
+                    if now - os.stat(os.path.join(root, f)).st_mtime < quiet_s:
+                        return True
+        except OSError:
+            return True
     me = str(os.getpid())
     try:
         pids = os.listdir("/proc")
     except OSError:
-        return False
+        return True
     needle = str(work).encode()
     for pid in pids:
         if not pid.isdigit() or pid == me:
@@ -118,8 +155,10 @@ def writer_active(state_dir: Path, username: str, quiet_s: float = 90.0) -> bool
             with open(f"/proc/{pid}/cmdline", "rb") as fh:
                 if needle in fh.read():
                     return True
+        except (FileNotFoundError, ProcessLookupError):
+            continue                      # exited while scanning
         except OSError:
-            continue
+            return True                   # cannot inspect: not verified quiet
     return False
 
 

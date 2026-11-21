@@ -101,6 +101,8 @@ class LoopTests(Base):
                          day_end=now + 86400)
 
     def _run_loop_once(self, send):
+        if getattr(self, "qualified", True):
+            self.svc._content_qualified_fn = lambda u: True
         self.svc.app = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=send))
 
         async def stop(_s):
@@ -201,7 +203,8 @@ class StopclipHookTests(Base):
             start=lambda u, a: (seen.setdefault("aid", a), ss._sessions.__setitem__(u, _Fake(a)),
                                 ("started", "ok"))[2],
             stop=ss.stop_session, running=ss.session_running, alive=ss.session_alive,
-            stopping=ss.session_stopping, confirm=lambda a: False, error=ss.session_error)
+            stopping=ss.session_stopping, confirm=lambda a: False, error=ss.session_error,
+            content_qualified=lambda u: True)
         sched.tick(self.dir, ops)
         self.assertEqual(self.rows("SELECT state FROM clip_schedules")[0][0], "ACTIVE")
         reply = ss.stopclip_reply(self.dir)
@@ -316,7 +319,7 @@ class OwnershipRegistryTests(Base):
             start=lambda u, a: ss.start_scheduled(self.dir, u, "ff", "fp", a, resolve_fn=resolve),
             stop=ss.stop_session, running=ss.session_running, alive=ss.session_alive,
             stopping=ss.session_stopping, confirm=lambda a: False, error=ss.session_error,
-            terminal=ss.session_terminal)
+            terminal=ss.session_terminal, content_qualified=lambda u: True)
         sched.tick(self.dir, ops, now=now)
         self.assertEqual(self.rows("SELECT state FROM clip_schedules")[0][0], "CANCELLED")
         for k in range(1, 6):
@@ -350,7 +353,44 @@ class OwnershipRegistryTests(Base):
         self.assertEqual(ss.session_terminal("ishowspeed", "u" * 32), "")
 
 
+class TerminationProofTests(Base):
+    def test_only_drained_session_is_proof(self):
+        import json
+        from app.core.database import connect
+        c = connect(str(self.dir / "nova.db"))
+        src = c.execute("SELECT id FROM twitch_sources LIMIT 1").fetchone()
+        if src is None:
+            c.execute("INSERT INTO twitch_sources (username,created_at) VALUES ('ishowspeed',0)")
+            src = c.execute("SELECT id FROM twitch_sources LIMIT 1").fetchone()
+        aid = "c" * 32
+        note = lambda **k: json.dumps({"mode": "feed", "sched_attempt": aid, **k})
+        c.execute("INSERT INTO stream_sessions (source_id,state,notes) VALUES (?,?,?)",
+                  (src[0], "INTERRUPTED", note()))
+        c.commit()
+        self.assertFalse(ss.session_terminated(self.dir, "ishowspeed", aid))   # crash marker is no proof
+        c.execute("UPDATE stream_sessions SET notes=?", (note(drained=True),))
+        c.commit(); c.close()
+        self.assertTrue(ss.session_terminated(self.dir, "ishowspeed", aid))
+        self.assertFalse(ss.session_terminated(self.dir, "ishowspeed", "d" * 32))
+        # silence and an empty process scan are not proof either
+        self.assertFalse(ss.session_terminated(self.dir, "ishowspeed", "e" * 32))
+
+
 class WriterActiveTests(Base):
+    def test_unverifiable_inspection_fails_closed(self):
+        work = self.dir / "sessions" / "ishowspeed"
+        work.mkdir(parents=True)
+        with mock.patch("os.listdir", side_effect=OSError("no proc")):
+            self.assertTrue(ss.writer_active(self.dir, "ishowspeed"))
+        real_open = open
+
+        def deny(path, *a, **k):
+            if str(path).startswith("/proc/") and str(path).endswith("/cmdline"):
+                raise PermissionError("denied")
+            return real_open(path, *a, **k)
+        with mock.patch("builtins.open", deny):
+            self.assertTrue(ss.writer_active(self.dir, "ishowspeed"))
+
     def test_recent_file_and_orphan_process_both_count(self):
         import os, subprocess, sys
         work = self.dir / "sessions" / "ishowspeed"
@@ -369,6 +409,27 @@ class WriterActiveTests(Base):
         finally:
             p.kill(); p.wait()
         self.assertFalse(ss.writer_active(self.dir, "ishowspeed"))
+
+
+class ContentGateServiceTests(LoopTests):
+    """The real service has no GTA6 verifier: automatic capture never starts."""
+    qualified = False
+
+    def test_default_service_gate_is_closed(self):
+        self._plan()
+        sent = []
+
+        async def send(chat, text):
+            sent.append((chat, text))
+        self._run_loop_once(send)
+        self._run_loop_once(send)
+        self.assertEqual(ss._sessions, {})
+        self.assertEqual(self.rows("SELECT state FROM clip_schedules")[0][0],
+                         "AWAITING_QUALIFICATION")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("GTA6", sent[0][1])
+
+    test_unauthorized_day_mark_starts_nothing_and_notifies_once = None
 
 
 if __name__ == "__main__":

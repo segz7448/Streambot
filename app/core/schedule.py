@@ -91,9 +91,13 @@ MAX_OPEN = 50
 GRACE_S = 15 * 60          # a fixed window never started this long after its start is MISSED
 CONFIRM_TIMEOUT_S = 180    # launched but no valid segment yet
 STOP_WARN_S = 300
-PLAN_OPEN = ("SCHEDULED", "ACTIVE", "UNCERTAIN", "AWAITING_AUTH")
+PLAN_OPEN = ("SCHEDULED", "ACTIVE", "UNCERTAIN", "AWAITING_AUTH", "AWAITING_QUALIFICATION")
 BLOCKING_KINDS = ("restricted", "challenge", "blocked", "quality", "invalid")
 ATTEMPT_OPEN = ("INTENT", "LAUNCHED", "RECORDING", "STOPPING", "UNCERTAIN", "UNRESOLVED")
+_Q = lambda t: "(" + ",".join(f"'{x}'" for x in t) + ")"
+_OPEN_SQL = _Q(PLAN_OPEN)
+_VISIBLE_SQL = _Q(PLAN_OPEN + ("BLOCKED",))
+_ATTEMPT_OPEN_SQL = _Q(ATTEMPT_OPEN)
 _USER = re.compile(r"^[a-z0-9_]{3,25}$")
 
 
@@ -203,10 +207,10 @@ def add(state_dir, username: str, start_at: float, duration_s: int | None = None
                          (username,)).fetchone():
             raise ValueError(f"{username} is not registered (use /addsource)")
         if c.execute("SELECT COUNT(*) FROM clip_schedules WHERE state IN "
-                     "('SCHEDULED','ACTIVE','UNCERTAIN')").fetchone()[0] >= MAX_OPEN:
+                     + _OPEN_SQL).fetchone()[0] >= MAX_OPEN:
             raise ValueError("too many open schedules")
         if c.execute("SELECT 1 FROM clip_schedules WHERE username=? AND state IN "
-                     "('SCHEDULED','ACTIVE','UNCERTAIN') AND start_at<? AND end_at>?",
+                     + _OPEN_SQL + " AND start_at<? AND end_at>?",
                      (username, end_at, start_at)).fetchone():
             raise ValueError("overlaps another schedule for that streamer")
         cur = c.execute(
@@ -219,7 +223,7 @@ def add(state_dir, username: str, start_at: float, duration_s: int | None = None
 def list_open(state_dir) -> list[dict]:
     return _read(state_dir,
                  "SELECT * FROM clip_schedules WHERE state IN "
-                 "('SCHEDULED','ACTIVE','UNCERTAIN') ORDER BY start_at")
+                 + _OPEN_SQL + " ORDER BY start_at")
 
 
 def list_visible(state_dir) -> list[dict]:
@@ -227,7 +231,14 @@ def list_visible(state_dir) -> list[dict]:
     never invisible."""
     return _read(state_dir,
                  "SELECT * FROM clip_schedules WHERE state IN "
-                 "('SCHEDULED','ACTIVE','UNCERTAIN','BLOCKED') ORDER BY start_at")
+                 + _VISIBLE_SQL + " ORDER BY start_at")
+
+
+def quarantined(state_dir) -> list[dict]:
+    """Streamers fenced by unresolved ownership, whatever happened to the
+    plan that launched them (cancelling a plan never frees them)."""
+    return _read(state_dir, "SELECT DISTINCT username FROM schedule_attempts WHERE state IN "
+                 "('UNCERTAIN','UNRESOLVED')")
 
 
 def cancel(state_dir, sid: int, now: float | None = None) -> str:
@@ -237,8 +248,8 @@ def cancel(state_dir, sid: int, now: float | None = None) -> str:
     now = now if now is not None else time.time()
     with txn(state_dir) as c:
         p = c.execute("SELECT * FROM clip_schedules WHERE id=?", (sid,)).fetchone()
-        if p is None or p["state"] not in PLAN_OPEN:
-            return "none"
+        if p is None or p["state"] not in PLAN_OPEN + ("BLOCKED",):
+            return "none"          # BLOCKED can be dismissed here
         running = c.execute(
             "SELECT 1 FROM schedule_attempts WHERE schedule_id=? AND state IN "
             "('INTENT','LAUNCHED','RECORDING','STOPPING','UNCERTAIN','UNRESOLVED')",
@@ -261,8 +272,7 @@ def user_stopped(state_dir, attempt_id: str, now: float | None = None) -> bool:
         c.execute("UPDATE schedule_attempts SET stop_by=COALESCE(stop_by,'user'),"
                   "updated_at=? WHERE id=?", (now, attempt_id))
         n = c.execute("UPDATE clip_schedules SET state='CANCELLED',note=?,"
-                      "updated_at=? WHERE id=? AND state IN ('SCHEDULED','ACTIVE',"
-                      "'UNCERTAIN')", ("stopped with /stopclip: schedule cancelled",
+                      "updated_at=? WHERE id=? AND state IN " + _OPEN_SQL, ("stopped with /stopclip: schedule cancelled",
                                        now, a["schedule_id"])).rowcount
         if n:
             _notice(c, a["schedule_id"], f"Schedule #{a['schedule_id']} for "
@@ -360,19 +370,28 @@ class Ops:
     stopping(user, aid) -> bool; confirm(aid) -> bool; error(user, aid) -> str."""
 
     def __init__(self, start, stop, running, alive, stopping, confirm, error,
-                 writer_active=None, terminal=None, record_allowed=None):
+                 writer_active=None, terminal=None, record_allowed=None,
+                 content_qualified=None, terminated=None):
         self.start, self.stop, self.running = start, stop, running
         self.alive, self.stopping, self.confirm, self.error = alive, stopping, confirm, error
         # writer_active(username) -> True while anything may still be writing
         # for that streamer (best effort, errs toward True when unsure)
-        self.writer_active = writer_active or (lambda user: False)
+        self.writer_active = writer_active or (lambda user: False)   # advisory only
+        # terminated(user, aid) -> POSITIVE proof the exact attempt's work is over
+        # (its session object finished, or its durable row is finalized). Silence,
+        # stale mtimes and process scans are never proof.
+        self.terminated = terminated or (lambda user, aid: False)
         # terminal(user, aid) -> typed reason the exact session stopped for good ('' if none)
         self.terminal = terminal or (lambda user, aid: "")
         # record_allowed(user) -> the owner's record grant is currently ON
         self.record_allowed = record_allowed or (lambda user: False)
+        # content_qualified(user) -> the required content (GTA6 only) can be
+        # VERIFIED for this source. No verifier exists yet, so the default
+        # is False and automatic operation never launches.
+        self.content_qualified = content_qualified or (lambda user: False)
 
 
-def reconcile(state_dir, now: float | None = None, writer_active=None) -> int:
+def reconcile(state_dir, now: float | None = None, terminated=None) -> int:
     """Startup, one transaction. The old sessions' threads died with the
     process, but their recorder children may not have: an open attempt
     whose streamer still shows a live writer becomes UNRESOLVED and its
@@ -381,7 +400,7 @@ def reconcile(state_dir, now: float | None = None, writer_active=None) -> int:
     window is eligible again. Notices caught mid-send are flagged as
     possible repeats."""
     now = now if now is not None else time.time()
-    writer_active = writer_active or (lambda user: False)
+    terminated = terminated or (lambda user, aid: False)
     n = 0
     with txn(state_dir) as c:
         c.execute("UPDATE schedule_notices SET sending_at=NULL,repeat=1 WHERE "
@@ -391,10 +410,10 @@ def reconcile(state_dir, now: float | None = None, writer_active=None) -> int:
                            "('INTENT','LAUNCHED','RECORDING','STOPPING','UNCERTAIN',"
                            "'UNRESOLVED')").fetchall():
             n += 1
-            if writer_active(a["username"]):
+            if not terminated(a["username"], a["id"]):
                 c.execute("UPDATE schedule_attempts SET state='UNRESOLVED',note=?,"
                           "updated_at=? WHERE id=?",
-                          ("restart: a writer may still be running", now, a["id"]))
+                          ("restart: termination of the owned work is not proven", now, a["id"]))
                 held.add(a["schedule_id"])
             else:
                 c.execute("UPDATE schedule_attempts SET state='INTERRUPTED',note=?,"
@@ -445,10 +464,10 @@ def tick(state_dir, ops: Ops, now: float | None = None) -> None:
         _step_attempt(state_dir, ops, a, now)
     # 2. expired plans
     for p in _read(state_dir, "SELECT * FROM clip_schedules WHERE state IN "
-                   "('SCHEDULED','UNCERTAIN','AWAITING_AUTH') AND end_at<=?", (now,)):
+                   "('SCHEDULED','UNCERTAIN','AWAITING_AUTH','AWAITING_QUALIFICATION') AND end_at<=?", (now,)):
         with txn(state_dir) as c:
             cur = c.execute("SELECT * FROM clip_schedules WHERE id=? AND state IN "
-                            "('SCHEDULED','UNCERTAIN','AWAITING_AUTH')", (p["id"],)).fetchone()
+                            "('SCHEDULED','UNCERTAIN','AWAITING_AUTH','AWAITING_QUALIFICATION')", (p["id"],)).fetchone()
             if cur is not None:
                 for t in _finish(c, cur, now):
                     _notice(c, p["id"], t, now)
@@ -462,10 +481,29 @@ def tick(state_dir, ops: Ops, now: float | None = None) -> None:
                              ("recording authorization turned on", now, p["id"])).rowcount:
                     _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: recording "
                             "is now authorized; resuming.", now)
+    # 2c. content gate: the user asked for GTA6 only; until that can be
+    # verified for the source nothing launches automatically
+    for p in _read(state_dir, "SELECT * FROM clip_schedules WHERE state='AWAITING_QUALIFICATION'"
+                   " AND end_at>?", (now,)):
+        if ops.content_qualified(p["username"]):
+            with txn(state_dir) as c:
+                c.execute("UPDATE clip_schedules SET state='SCHEDULED',next_try_at=NULL,"
+                          "note=?,updated_at=? WHERE id=? AND state='AWAITING_QUALIFICATION'",
+                          ("content qualification verified", now, p["id"]))
     # 3. due plans
     for p in _read(state_dir, "SELECT * FROM clip_schedules WHERE state='SCHEDULED'"
                    " AND start_at<=? AND end_at>? ORDER BY start_at", (now, now)):
         if p["next_try_at"] and now < p["next_try_at"]:
+            continue
+        if not ops.content_qualified(p["username"]):
+            with txn(state_dir) as c:
+                if c.execute("UPDATE clip_schedules SET state='AWAITING_QUALIFICATION',note=?,"
+                             "updated_at=? WHERE id=? AND state='SCHEDULED'",
+                             ("cannot verify the content is GTA6", now, p["id"])).rowcount:
+                    _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: you asked "
+                            "for GTA6 only and I cannot verify what this streamer is playing, "
+                            "so I am not recording automatically. Nothing started. The "
+                            "schedule stays on file and I will not record anything else.", now)
             continue
         _launch(state_dir, ops, p, now)
 
@@ -484,7 +522,7 @@ def _launch(state_dir, ops: Ops, p, now) -> None:
                     "(service was not running at its start time). Nothing recorded.", now)
             return
         if c.execute("SELECT 1 FROM schedule_attempts WHERE username=? AND state IN "
-                     "('INTENT','LAUNCHED','RECORDING','STOPPING','UNCERTAIN')",
+                     + _ATTEMPT_OPEN_SQL,
                      (p["username"],)).fetchone():
             c.execute("UPDATE clip_schedules SET next_try_at=?,updated_at=? WHERE id=?",
                       (now + 60, now, p["id"]))
@@ -521,16 +559,14 @@ def _launch(state_dir, ops: Ops, p, now) -> None:
                              stop_by=why, stopping_at=now)
                 stop_after = aid
         elif raised:
-            if ops.writer_active(p["username"]):
-                _set_attempt(c, aid, ("INTENT",), "UNCERTAIN", now, f"launch raised {reply}")
-                c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,updated_at=? "
-                          "WHERE id=? AND state='ACTIVE'", (f"launch raised {reply}", now, p["id"]))
-                _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: the launch "
-                        f"failed with {reply} and something may still be writing for that "
-                        "streamer. On hold until it has been quiet. /unschedule cancels.", now)
-            else:       # verified: nothing registered, nothing writing
-                _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, f"launch raised {reply}")
-                _retry_later(c, p, cur, now, f"launch failed ({reply})", 300.0, eligible)
+            # an exception means unknown: fenced until termination is proven
+            _set_attempt(c, aid, ("INTENT",), "UNCERTAIN", now, f"launch raised {reply}")
+            c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,updated_at=? "
+                      "WHERE id=? AND state='ACTIVE'", (f"launch raised {reply}", now, p["id"]))
+            _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: the launch "
+                    f"failed with {reply} and I cannot prove nothing was started. That "
+                    "streamer is fenced until the exact session is verified finished. "
+                    "/unschedule cancels the plan but does not lift the fence.", now)
         elif kind == "blocked":
             _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, reply)
             c.execute("UPDATE clip_schedules SET state='BLOCKED',note=?,updated_at=? "
@@ -588,20 +624,21 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
                     _notice(c, a["schedule_id"], f"Schedule #{a['schedule_id']}: {user} "
                             "launched; waiting for the first recorded segment.", now)
                 return
-            if ops.writer_active(user):
+            if not ops.terminated(user, aid):
+                # no proof the exact owned work ended: fenced, never cleared by silence
                 if st == "INTENT" and _set_attempt(c, aid, ("INTENT",), "UNCERTAIN", now,
-                                                   "launch outcome lost; a writer is active"):
+                                                   "launch outcome lost; termination not proven"):
                     c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,"
                               "updated_at=? WHERE id=? AND state='ACTIVE'",
-                              ("launch outcome lost; a writer is active", now,
+                              ("launch outcome lost; termination not proven", now,
                                a["schedule_id"]))
                     _notice(c, a["schedule_id"], f"Schedule #{a['schedule_id']} for {user}: "
                             "I could not record whether a launch happened and something "
                             "may be writing. On hold until it has been quiet.", now)
                 return
-            # nothing registered and nothing writing: ownership verified gone
+            # positive proof: the exact session finished (drained) or never started
             _set_attempt(c, aid, ("INTENT", "UNCERTAIN", "UNRESOLVED"), "INTERRUPTED", now,
-                         "verified: no owned session and no active writer")
+                         "verified: exact session finalized")
             for t in _after_attempt(c, a["schedule_id"], now, "verified idle after a lost launch"):
                 _notice(c, a["schedule_id"], t, now)
         return

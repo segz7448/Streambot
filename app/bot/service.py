@@ -181,6 +181,12 @@ class BotService:
         from . import ops
         return ops.stoprelay_reply(self._state_dir())
 
+    _content_qualified_fn = None   # no GTA6 verifier exists: gate stays closed
+
+    def _content_qualified(self, user):
+        fn = self._content_qualified_fn
+        return bool(fn(user)) if fn else False
+
     def _state_dir(self) -> Path:
         return Path(os.environ.get("NOVA_STATE_DIR",
                                    os.path.expanduser("~/.nova-clip")))
@@ -444,7 +450,9 @@ class BotService:
             confirm=lambda a: _sched.confirm_recording(sd, a, valid),
             error=_sess.session_error,
             writer_active=lambda u: _sess.writer_active(sd, u),
+            terminated=lambda u, a: _sess.session_terminated(sd, u, a),
             terminal=_sess.session_terminal,
+            content_qualified=lambda u: self._content_qualified(u),
             record_allowed=lambda u: _auth.allowed(sd, u, "record"))
         while True:
             try:
@@ -521,7 +529,7 @@ class BotService:
         from . import sessions as _s2
         _n = _schedmod.reconcile(
             self._state_dir(),
-            writer_active=lambda u: _s2.writer_active(self._state_dir(), u))
+            terminated=lambda u, a: _s2.session_terminated(self._state_dir(), u, a))
         if _n:
             log.warning("ended %d interrupted schedule window(s) MISSED", _n)
         from . import handoff as _handoff

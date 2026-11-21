@@ -248,6 +248,33 @@ class ClipSession:
                     log.exception("could not mark failed session interrupted")
             if not isinstance(exc, Exception):
                 raise
+        finally:
+            # every owned child and thread was drained before _run_inner
+            # returned (a timed-out drain keeps the thread alive instead).
+            # This is the only positive proof of termination.
+            self._mark_drained()
+
+    def _mark_drained(self) -> None:
+        sid = getattr(self, "_session_id", None)
+        if sid is not None:
+            try:
+                c = connect(str(self.state_dir / "nova.db"))
+                try:
+                    row = c.execute("SELECT notes FROM stream_sessions WHERE id=?",
+                                    (sid,)).fetchone()
+                    try:
+                        n = json.loads(row[0]) if row and row[0] else {}
+                    except Exception:
+                        n = {}
+                    n["drained"] = True
+                    c.execute("UPDATE stream_sessions SET notes=? WHERE id=?",
+                              (json.dumps(n), sid))
+                    c.commit()
+                finally:
+                    c.close()
+            except Exception:
+                log.exception("could not record drained session")
+        self._finalized = True
 
     @staticmethod
     def _mark_state(db_path, session_id, state, error=None) -> None:

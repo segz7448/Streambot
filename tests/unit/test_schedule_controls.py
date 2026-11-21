@@ -40,6 +40,8 @@ class World:
         self.writer = False
         self.terminal = {}
         self.record_ok = False
+        self.qualified = True
+        self.proven = set()      # attempt ids with positive termination proof
 
     def start(self, user, aid):
         self.starts.append((user, aid))
@@ -83,7 +85,9 @@ class World:
             error=lambda u, a: self.s.get(a, {}).get("error", ""),
             writer_active=lambda u: self.writer,
             terminal=lambda u, a: self.terminal.get(a, ""),
-            record_allowed=lambda u: self.record_ok)
+            record_allowed=lambda u: self.record_ok,
+            content_qualified=lambda u: self.qualified,
+            terminated=lambda u, a: a in self.proven or (a in self.s and not self.s[a]["running"] and self.s[a].get("drained", True)))
 
 
 class Base(unittest.TestCase):
@@ -146,37 +150,32 @@ class OwnershipTests(Base):
         self.assertEqual(len(self.w.starts), 1)              # no duplicate launch
         self.assertFalse(any("secret-looking" in n for n in self.notices()))
 
-    def test_exception_with_active_writer_holds_until_verified_quiet(self):
-        sid, _, _ = self.day()
-        self.w.mode, self.w.writer = "raise_ghost", True
-        self.tick(self.now)
-        self.assertEqual(self.plan(sid)[0], "UNCERTAIN")
-        self.assertEqual(self.attempts(sid)[0][1], "UNCERTAIN")
-        for k in range(1, 10):
-            self.tick(self.now + 300 * k)               # writer still active: never rearmed
-        self.assertEqual(len(self.w.starts), 1)
-        self.assertEqual(self.plan(sid)[0], "UNCERTAIN")
-        self.assertEqual(sched.cancel(self.d, sid, now=self.now + 3000), "cancelled_running")
-        self.tick(self.now + 3100)
-        self.assertEqual(self.attempts(sid)[0][1], "UNCERTAIN")   # cancel does not free the writer
-        sid2 = None
-        t0, t1 = sched.parse_day("2026-11-21", tzname="America/Los_Angeles")
-        sid2 = sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
-        self.w.mode = "start"
-        self.tick(self.now + 3200)
-        self.assertEqual(len(self.w.starts), 1)           # blocked: open attempt still owns the streamer
-        self.w.writer = False                              # actual cleanup verified
-        self.tick(self.now + 3300)
-        self.assertEqual(self.attempts(sid)[0][1], "INTERRUPTED")
-        self.tick(self.now + 3400)
-        self.assertEqual(len(self.w.starts), 2)
-
-    def test_exception_with_nothing_running_or_writing_retries_not_uncertain(self):
+    def test_raised_start_is_fenced_until_termination_is_proven(self):
         sid, _, _ = self.day()
         self.w.mode = "raise_ghost"
         self.tick(self.now)
-        self.assertEqual(self.attempts(sid)[0][1], "NOT_STARTED")
-        self.assertEqual(self.plan(sid)[0], "SCHEDULED")
+        self.assertEqual(self.plan(sid)[0], "UNCERTAIN")
+        self.assertEqual(self.attempts(sid)[0][1], "UNCERTAIN")
+        self.w.writer = False                      # silence / no writer is NOT proof
+        for k in range(1, 40):
+            self.tick(self.now + 300 * k)
+        self.assertEqual(len(self.w.starts), 1)
+        # owner cancels the plan: the fence stays; a replacement plan cannot launch
+        self.assertEqual(sched.cancel(self.d, sid, now=self.now + 12000), "cancelled_running")
+        self.assertEqual(sched.quarantined(self.d)[0]["username"], "kaicenat")
+        t0, t1 = sched.parse_day("2026-11-21", tzname="America/Los_Angeles")
+        sid2 = sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
+        self.w.mode = "start"
+        for k in range(1, 20):
+            self.tick(self.now + 12100 + 100 * k)
+        self.assertEqual(len(self.w.starts), 1)
+        self.assertEqual(self.attempts(sid)[0][1], "UNCERTAIN")
+        self.w.proven.add(self.attempts(sid)[0][0])   # positive proof of termination
+        self.tick(self.now + 15000)
+        self.assertEqual(self.attempts(sid)[0][1], "INTERRUPTED")
+        self.tick(self.now + 15100)
+        self.assertEqual(self.plan(sid2)[0], "ACTIVE")
+        self.assertEqual(len(self.w.starts), 2)
 
     def test_definitive_not_started_retries_with_backoff_inside_end(self):
         sid, t0, t1 = self.day()
@@ -380,6 +379,71 @@ class PolicyTests(Base):
                 self.tick(self.now + 60 + 120 * k)
             self.assertEqual(len(self.w.starts), 1, kind)  # no fresh session after 60 s
 
+    def test_unverified_game_never_launches_automatically(self):
+        sid, _, t1 = self.day()
+        self.w.qualified = False
+        t = self.now
+        while t < self.now + 6 * 3600:
+            self.tick(t)
+            t += 300
+        self.assertEqual(self.w.starts, [])
+        self.assertEqual(self.plan(sid)[0], "AWAITING_QUALIFICATION")
+        self.assertEqual(sum("GTA6" in n for n in self.notices()), 1)
+        self.assertIn(sid, [r["id"] for r in sched.list_visible(self.d)])
+        self.w.qualified = True                  # only a real verifier can do this
+        self.tick(t)
+        self.tick(t + 30)
+        self.assertEqual(len(self.w.starts), 1)
+
+    def test_unverified_game_plan_ends_missed_not_recorded(self):
+        sid, _, t1 = self.day()
+        self.w.qualified = False
+        self.tick(self.now)
+        self.tick(t1 + 10)
+        self.assertEqual(self.w.starts, [])
+        self.assertEqual(self.plan(sid)[0], "MISSED")
+
+    def test_grant_wait_plan_is_open_visible_cancellable_and_blocks_overlap(self):
+        sid, t0, t1 = self.day()
+        self.w.mode = "unauthorized"
+        self.tick(self.now)
+        self.assertEqual(self.plan(sid)[0], "AWAITING_AUTH")
+        self.assertIn(sid, [r["id"] for r in sched.list_open(self.d)])
+        with self.assertRaises(ValueError):
+            sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
+        self.assertEqual(sched.cancel(self.d, sid, now=self.now + 5), "cancelled")
+        self.assertEqual(self.plan(sid)[0], "CANCELLED")
+
+    def test_qualification_wait_plan_is_open_visible_cancellable_and_blocks_overlap(self):
+        sid, t0, t1 = self.day()
+        self.w.qualified = False
+        self.tick(self.now)
+        self.assertEqual(self.plan(sid)[0], "AWAITING_QUALIFICATION")
+        self.assertIn(sid, [r["id"] for r in sched.list_open(self.d)])
+        with self.assertRaises(ValueError):
+            sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
+        self.assertEqual(sched.cancel(self.d, sid, now=self.now + 5), "cancelled")
+
+    def test_blocked_plan_can_be_dismissed(self):
+        sid, _, _ = self.day()
+        self.w.mode = "blocked"
+        self.tick(self.now)
+        self.assertEqual(self.plan(sid)[0], "BLOCKED")
+        self.assertEqual(sched.cancel(self.d, sid, now=self.now + 5), "cancelled")
+        self.assertEqual(self.plan(sid)[0], "CANCELLED")
+        self.assertNotIn(sid, [r["id"] for r in sched.list_visible(self.d)])
+
+    def test_max_open_counts_waiting_plans(self):
+        t0, t1 = sched.parse_day("2026-11-21", tzname="America/Los_Angeles")
+        with sched.txn(self.d) as c:
+            for i in range(sched.MAX_OPEN):
+                c.execute("INSERT INTO clip_schedules (username,mode,start_at,end_at,created_at,"
+                          "updated_at,state) VALUES (?,?,?,?,?,?,?)",
+                          (f"zz{i:03d}", "day", t0, t1, 0, 0,
+                           ("AWAITING_AUTH", "AWAITING_QUALIFICATION")[i % 2]))
+        with self.assertRaises(ValueError):
+            sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
+
     def test_ordinary_early_end_still_retries(self):
         sid, _, _ = self.day()
         self.tick(self.now)
@@ -394,7 +458,9 @@ class RestartAndNoticeTests(Base):
     def test_restart_interrupts_attempt_keeps_day_eligible_and_notifies(self):
         sid, t0, t1 = self.day()
         self.tick(self.now)
-        self.assertEqual(sched.reconcile(self.d, now=self.now + 50), 1)
+        self.w.s[self.w.starts[0][1]]["running"] = False     # session finalized (drained)
+        self.assertEqual(sched.reconcile(self.d, now=self.now + 50,
+                                         terminated=lambda u, a: True), 1)
         self.assertEqual(self.attempts(sid)[0][1], "INTERRUPTED")
         self.assertEqual(self.plan(sid)[0], "SCHEDULED")
         self.assertTrue(any("restarted" in n for n in self.notices()))
@@ -403,14 +469,14 @@ class RestartAndNoticeTests(Base):
         # past the end: a restart finishes it, never relaunches
         sid2 = sched.add(self.d, "ishowspeed", t0, None, now=self.now, day_end=t1)
         self.tick(self.now + 70)
-        sched.reconcile(self.d, now=t1 + 5)
+        sched.reconcile(self.d, now=t1 + 5, terminated=lambda u, a: True)
         self.assertEqual(self.plan(sid2)[0], "MISSED")
 
     def test_restart_with_live_writer_holds_until_verified(self):
         sid, t0, t1 = self.day()
         self.tick(self.now)
         self.w.s.clear()                                   # process restarted: registry is empty
-        n = sched.reconcile(self.d, now=self.now + 50, writer_active=lambda u: True)
+        n = sched.reconcile(self.d, now=self.now + 50, terminated=lambda u, a: False)
         self.assertEqual(n, 1)
         self.assertEqual(self.attempts(sid)[0][1], "UNRESOLVED")
         self.assertEqual(self.plan(sid)[0], "UNCERTAIN")
@@ -418,11 +484,15 @@ class RestartAndNoticeTests(Base):
         for k in range(1, 6):
             self.tick(self.now + 100 * k)
         self.assertEqual(len(self.w.starts), 1)
-        self.w.writer = False
-        self.tick(self.now + 700)
+        self.w.writer = False                     # silence alone never clears it
+        for k in range(7, 12):
+            self.tick(self.now + 100 * k)
+        self.assertEqual(len(self.w.starts), 1)
+        self.w.proven.add(self.attempts(sid)[0][0])
+        self.tick(self.now + 1300)
         self.assertEqual(self.attempts(sid)[0][1], "INTERRUPTED")
         self.assertEqual(self.plan(sid)[0], "SCHEDULED")
-        self.tick(self.now + 800)
+        self.tick(self.now + 1400)
         self.assertEqual(len(self.w.starts), 2)
 
     def test_state_and_notice_commit_together(self):
