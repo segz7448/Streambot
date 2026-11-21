@@ -46,7 +46,9 @@ class BotService:
         self.inbox = PreAckInbox(str(store.path.parent / "inbox.json"))
         self.router = CommandRouter(admin_ids=[])
         self.started_at = time.time()
-        self.app = Application.builder().token(token).build()
+        self.app = Application.builder().token(token) \
+            .post_init(self._start_handoff_consumer) \
+            .post_shutdown(self._stop_handoff_consumer).build()
         self.app.add_handler(CommandHandler("pair", self._pair))
         self.app.add_handler(
             MessageHandler(filters.TEXT & filters.COMMAND, self._command))
@@ -338,6 +340,20 @@ class BotService:
             raise
         self.watermark.mark_handled(update.update_id)
 
+    async def _start_handoff_consumer(self, _app) -> None:
+        from . import handoff
+        self._handoff_task = asyncio.create_task(
+            handoff.run_consumer(self._state_dir()))
+
+    async def _stop_handoff_consumer(self, _app) -> None:
+        task = getattr(self, "_handoff_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     def drain_inbox(self, reply=None) -> dict:
         from . import ops
         if reply is None:
@@ -367,6 +383,10 @@ class BotService:
         if recovered:
             log.warning("marked %d crashed session(s) INTERRUPTED",
                         recovered)
+        from . import handoff as _handoff
+        requeued = _handoff.recover(self._state_dir())
+        if requeued:
+            log.warning("requeued %d interrupted handoff job(s)", requeued)
         self.drain_inbox()
         # keep the pending backlog: commands sent during a restart must be
         # processed, not discarded; the watermark makes replays idempotent

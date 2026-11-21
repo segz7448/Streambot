@@ -449,3 +449,46 @@ Known minor limitation (accepted): NOVA_TOKEN_FILE set but the file
 itself missing/unreadable raises inside the send attempt and is
 classified UNCERTAIN rather than UNAVAILABLE; the clip is then held
 for reconciliation and never blind-resent, which is the safe side.
+
+## Intake authority + n8n handoff consumer (2026-11-21, local candidate)
+
+STATUS: LOCAL CANDIDATE UNDER INDEPENDENT REVIEW. NOT pushed, NOT
+deployed, NOT live on AGT. No external effects exist yet beyond a
+webhook POST that has never been sent to a real endpoint.
+
+What the candidate does (all verified only by local synthetic tests):
+- app/core/intake.py: local authoritative admission for bot-produced
+  QC-HELD clips. Idempotent (clip_id 'cliprow:<id>'), daily cap 8,
+  >180s refused, pre-existing HELD clips are never touched. Writes the
+  durable handoff job in the same commit as the admission record.
+- app/pipeline/session.py: each newly QC-HELD clip gets its own durable
+  admission job (per-clip isolated; one clip's failure cannot skip the
+  others). Admission itself happens in the consumer, so it survives a
+  crash and retries with bounded backoff instead of being lost.
+- app/bot/handoff.py: consumer claims admission jobs (local-only, no
+  config needed), then posts an admission notice
+  {handoff_job_id, clip_id, intake_date} to the n8n webhook. No media
+  upload: YouTube authorization is on owner hold and the media
+  transport route is unresolved.
+- Webhook credentials come ONLY from NOVA_N8N_WEBHOOK_URL /
+  NOVA_N8N_WEBHOOK_SECRET env injection (intended: AGT Vault at deploy
+  time); never from the database, settings, job payloads or files.
+  Unconfigured = consumer fails closed, jobs stay pending.
+- The POST is HTTPS-only and never follows redirects, so the Bearer
+  secret cannot be forwarded to a cleartext or redirected host. Errors
+  are recorded redacted (class name only; never URL or response body).
+- Retry: JobQueue.fail gives bounded scheduled retry (backoff, 3
+  attempts). Terminal failure is appended to the errors ring that
+  /logs reads AND the FAILED row stays in job_queue: nothing drops
+  silently, reconciliation is possible.
+- Crash between POST and completion re-POSTs with the SAME
+  X-Handoff-Id. Exactly-once external effect is NOT claimed; the n8n
+  receiver must dedupe on that key. No integrated receiver exists yet.
+
+Known limits, honestly:
+- The n8n workflow exists only as an unpublished draft; nothing has
+  called it end-to-end.
+- Admission timezone (America/Los_Angeles) is provisional, a deploy-time
+  decision.
+- Vault-to-process env injection route is not yet provisioned; until
+  then the consumer is intentionally inert for handoff POSTs.

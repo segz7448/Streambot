@@ -20,6 +20,12 @@ def _stub_telegram():
         def token(self, _t):
             return self
 
+        def post_init(self, _cb):
+            return self
+
+        def post_shutdown(self, _cb):
+            return self
+
         def build(self):
             return types.SimpleNamespace(
                 add_handler=lambda *a, **k: None,

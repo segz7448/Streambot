@@ -126,6 +126,29 @@ class ClipSession:
                     (clip_id,))
         conn.commit()
         if held_ids:
+            # Authoritative intake admission: each newly HELD clip gets
+            # its own durable admission job (kind 'clip_intake_admit').
+            # The handoff consumer performs the admission itself with
+            # bounded scheduled retry and owner-visible terminal
+            # failure, so an admission problem can never fail the
+            # finish or silently drop the clip. Per-clip isolation: one
+            # clip's enqueue failure is logged and never skips the
+            # others; the durable job makes a missed admission
+            # recoverable.
+            from ..bot.handoff import ADMIT_JOB_KIND
+            from ..core.jobs import JobQueue
+            for cid in held_ids:
+                try:
+                    aconn = connect(str(self.state_dir / "nova.db"))
+                    try:
+                        JobQueue(aconn).enqueue(
+                            ADMIT_JOB_KIND, {"clip_row_id": int(cid)})
+                    finally:
+                        aconn.close()
+                except Exception as exc:
+                    log.warning("admission enqueue failed for clip %s "
+                                "in session %s: %s", cid, session_id,
+                                exc)
             # automatic delivery ergonomics: when the owner preference
             # is on (default), QC-passed clips go to the paired admin
             # right away instead of waiting for /deliveries flush.
