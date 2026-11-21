@@ -7,6 +7,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -646,48 +647,101 @@ class NativeUploadV3Tests(NativeUploadTests):
         # after the live consumer is gone, recovery proceeds
         self.assertEqual(handoff.recover(self.state_dir), 1)
 
-    def test_prepare_reruns_when_owner_token_is_foreign(self):
-        cid = self._add_held_clip()
-        with publish_records.ClipLease(self.state_dir, cid) as lease:
-            publish_records.reserve(self.state_dir, cid, "dead-worker",
-                                    lease=lease)
-        # a previous owner died; even a reused pid with a stale nonce
-        # must NOT skip preparation
-        (self.state_dir / native_upload.OWNER_NAME).write_text(
-            json.dumps({"pid": os.getpid(), "nonce": "stale-nonce"}))
+    def _cycle(self):
         conn = database.connect(self.db)
         try:
-            native_upload.process_one(
+            return native_upload.process_one(
                 conn, self.state_dir, probe_fn=self.probe_fn,
                 publisher_factory=lambda: self.publisher)
         finally:
             conn.close()
-        rec = publish_records.get(self.state_dir, cid)
-        self.assertEqual(rec["state"], "UNCERTAIN")
-        token = json.loads(
-            (self.state_dir / native_upload.OWNER_NAME).read_text())
-        self.assertEqual(token["nonce"], native_upload._PROC_NONCE)
 
-    def test_prepare_defers_reservation_recovery_with_live_lease(self):
-        cid = self._add_held_clip()
+    def _reserve_stranded(self, cid):
         with publish_records.ClipLease(self.state_dir, cid) as lease:
             publish_records.reserve(self.state_dir, cid, "dead-worker",
                                     lease=lease)
+
+    def test_deferred_recovery_runs_on_a_later_cycle_same_process(self):
+        # Cycle 1: a live publisher lease defers the stranded reservation.
+        # Cycle 2 (same process, same owner): lease gone -> it MUST recover
+        # (the old owner-token bookkeeping marked prep done and skipped it).
+        cid = self._add_held_clip()
+        self._reserve_stranded(cid)
         live = publish_records.ClipLease(self.state_dir, cid)
-        live.__enter__()  # a live publisher owns the clip
+        live.__enter__()
         try:
-            conn = database.connect(self.db)
-            try:
-                native_upload.process_one(
-                    conn, self.state_dir, probe_fn=self.probe_fn,
-                    publisher_factory=lambda: self.publisher)
-            finally:
-                conn.close()
-            rec = publish_records.get(self.state_dir, cid)
-            # NOT flipped to UNCERTAIN while a live lease exists
-            self.assertEqual(rec["state"], "RESERVED")
+            self._cycle()
+            self.assertEqual(
+                publish_records.get(self.state_dir, cid)["state"],
+                "RESERVED")
         finally:
             live.__exit__()
+        self._cycle()
+        self.assertEqual(
+            publish_records.get(self.state_dir, cid)["state"], "UNCERTAIN")
+
+    def test_same_owner_transient_analyzing_job_is_requeued_next_cycle(self):
+        # A job left ANALYZING by a same-process transient failure after a
+        # successful earlier prepare must be requeued, not stranded.
+        cid = self._add_held_clip()
+        self._admit(cid)
+        self._cycle()  # prepare ran; job handled
+        conn = database.connect(self.db)
+        with conn:
+            conn.execute("INSERT INTO job_queue (kind, payload_json, state,"
+                         " max_attempts, run_after, created_at, updated_at)"
+                         " SELECT kind, payload_json, 'ANALYZING', 3, 0,"
+                         " created_at, updated_at FROM job_queue WHERE kind=?"
+                         " LIMIT 1", (HANDOFF_JOB_KIND,))
+        conn.close()
+        self.assertTrue(any(r["state"] == "ANALYZING"
+                            for r in self._jobs()))
+        self._cycle()
+        self.assertFalse(any(r["state"] == "ANALYZING"
+                             for r in self._jobs()))
+
+    def test_analyzing_requeued_even_with_live_lease_elsewhere(self):
+        cid = self._add_held_clip()
+        self._admit(cid)
+        other = self._add_held_clip()
+        job = self._jobs()[0]
+        conn = database.connect(self.db)
+        with conn:
+            conn.execute("UPDATE job_queue SET state='ANALYZING' WHERE id=?",
+                         (job["id"],))
+        conn.close()
+        live = publish_records.ClipLease(self.state_dir, other)
+        live.__enter__()
+        try:
+            native_upload._prepare(self.state_dir, database.connect(self.db))
+        finally:
+            live.__exit__()
+        self.assertEqual(self._jobs()[0]["state"], "PENDING")
+
+    def test_prepare_failure_skips_cycle_without_claim_and_retries(self):
+        cid = self._add_held_clip()
+        self._admit(cid)
+        with mock.patch.object(publish_records, "recover_interrupted",
+                               side_effect=OSError("transient")):
+            self.assertFalse(self._cycle())
+        self.assertEqual([r["state"] for r in self._jobs()], ["PENDING"])
+        self.assertEqual(self.publisher.calls, [])
+        self.assertTrue(self._cycle())  # next cycle proceeds normally
+
+    def test_legacy_promotion_not_marked_done_on_failure(self):
+        native_upload._LEGACY_PROMOTED.discard(
+            str(self.state_dir.resolve()))
+        conn = database.connect(self.db)
+        with mock.patch.object(publish_records, "promote_legacy",
+                               side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                native_upload._prepare(self.state_dir, conn)
+        self.assertNotIn(str(self.state_dir.resolve()),
+                         native_upload._LEGACY_PROMOTED)
+        native_upload._prepare(self.state_dir, conn)
+        self.assertIn(str(self.state_dir.resolve()),
+                      native_upload._LEGACY_PROMOTED)
+        conn.close()
 
 
 # Keep only the v3 tests in the subclass: unittest discovers inherited

@@ -83,9 +83,7 @@ def _fail_permanent(queue: JobQueue, job_id: int, error: str) -> None:
             " WHERE id = ?", (error[:2000], time.time(), job_id))
 
 
-_PROC_NONCE = __import__("uuid").uuid4().hex
 LOCK_NAME = "native-upload.lock"
-OWNER_NAME = "native-upload.owner.json"
 
 
 def _any_live_lease(state_dir: Path) -> bool:
@@ -113,34 +111,36 @@ def _any_live_lease(state_dir: Path) -> bool:
     return False
 
 
+_LEGACY_PROMOTED: set = set()
+
+
 def _prepare(state_dir: Path, conn) -> None:
-    """Chosen-entry preparation, once per OWNERSHIP ACQUISITION (not
-    once per process): a durable owner token (pid + per-process nonce)
-    records who last prepared. A new process - including one reusing a
-    dead owner's pid - always re-prepares on acquisition, so recovery
-    after replacement is never skipped. Runs under the singleton lock
-    and before the first claim: surviving legacy publication evidence
-    is promoted, stranded publish reservations recover to UNCERTAIN
-    (skipped while any live publisher lease exists, a real liveness
-    check), and crash-leftover ANALYZING handoff jobs are requeued."""
-    token_path = Path(state_dir) / OWNER_NAME
-    expected = {"pid": os.getpid(), "nonce": _PROC_NONCE}
-    try:
-        token = json.loads(token_path.read_text())
-    except Exception:
-        token = None
-    if token == expected:
-        return
+    """Per-cycle preparation, run under the exclusive consumer lock and
+    before the first claim. There is NO owner-token shortcut: every
+    step is idempotent and cheap, and a step that was deferred or failed
+    simply runs again next cycle, so recovery can never be silently
+    skipped or marked done without having happened.
+
+    - Legacy publication evidence is promoted (insert-only) once per
+      process per state dir, marked done ONLY after it succeeded.
+    - Stranded RESERVED publish records recover to UNCERTAIN every
+      cycle; a record whose clip lease is held by a live publisher is
+      skipped by recover_interrupted itself (PublishBusy), never
+      invalidated, and is retried next cycle.
+    - Under the consumer lock no handoff job can legitimately be
+      ANALYZING at cycle start (claim + handling are synchronous in the
+      lock), so any such job is crash-leftover and is requeued every
+      cycle, independent of live publisher leases.
+    Exceptions propagate: the caller skips the cycle without claiming."""
     from ..distribution import publish_records
-    publish_records.promote_legacy(state_dir)
-    if _any_live_lease(state_dir):
-        log.warning("native upload: a live publisher lease exists; "
-                    "deferring stranded-reservation recovery")
-    else:
-        stranded = publish_records.recover_interrupted(state_dir)
-        if stranded:
-            log.warning("native upload: marked %d stranded publish "
-                        "reservation(s) UNCERTAIN", stranded)
+    key = str(Path(state_dir).resolve())
+    if key not in _LEGACY_PROMOTED:
+        publish_records.promote_legacy(state_dir)
+        _LEGACY_PROMOTED.add(key)
+    stranded = publish_records.recover_interrupted(state_dir)
+    if stranded:
+        log.warning("native upload: marked %d stranded publish "
+                    "reservation(s) UNCERTAIN", stranded)
     with conn:
         cur = conn.execute(
             "UPDATE job_queue SET state = 'PENDING', locked_by = NULL,"
@@ -150,7 +150,6 @@ def _prepare(state_dir: Path, conn) -> None:
     if cur.rowcount:
         log.warning("native upload: requeued %d crash-leftover handoff "
                     "job(s)", cur.rowcount)
-    token_path.write_text(json.dumps(expected))
 
 
 def process_one(conn, state_dir: Path, *,
@@ -188,7 +187,12 @@ def process_one_locked(conn, state_dir: Path, *,
     public process_one takes it). Crash recovery runs here, under that
     lock, so it can never requeue a job a live worker is processing."""
     state_dir = Path(state_dir)
-    _prepare(state_dir, conn)
+    try:
+        _prepare(state_dir, conn)
+    except Exception:
+        log.exception("native upload: preparation failed; skipping the "
+                      "cycle without claiming (retried next cycle)")
+        return False
     return _process_one_locked(
         conn, state_dir, publisher_factory=publisher_factory,
         probe_fn=probe_fn, ffprobe=ffprobe)

@@ -18,6 +18,9 @@ http = ["httpx>=0.27"]
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[tool.setuptools.package-data]
+"app.core" = ["tzdata/*", "tzdata/*/*"]
+
 [tool.pytest.ini_options]
 filterwarnings = [
     "error::ResourceWarning",

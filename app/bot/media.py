@@ -47,11 +47,16 @@ def _prefix_bin_candidates() -> list[Path]:
     location (<root>/<tree>/app/bot/media.py -> <root>/prefix/...),
     from the working directory's ancestors, and last from HOME."""
     cands: list[Path] = []
+    explicit = os.environ.get("NOVA_TOOL_BIN_DIR")
+    if explicit and os.path.isabs(explicit):
+        cands.append(Path(explicit))  # supported explicit absolute dir
     roots = list(Path(__file__).resolve().parents)
     roots += list(Path.cwd().resolve().parents)
     roots.append(Path.cwd().resolve())
     for r in roots:
-        for base in (r, r / "instinct-clip"):
+        # production topology: code under files/agt/deployments/<id>,
+        # install root under the SIBLING files/home/instinct-clip
+        for base in (r, r / "instinct-clip", r / "home" / "instinct-clip"):
             c = base / _PREFIX_REL
             if c not in cands:
                 cands.append(c)

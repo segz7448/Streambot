@@ -36,6 +36,60 @@ class FfmpegPathsHomeIndependent(unittest.TestCase):
             self.assertEqual(ff, str(bindir / "ffmpeg"))
             self.assertEqual(fp, str(bindir / "ffprobe"))
 
+    def _prod_layout(self, d):
+        files = Path(d).resolve() / "files"
+        bindir = files / "home" / "instinct-clip" / media._PREFIX_REL
+        bindir.mkdir(parents=True)
+        for n in ("ffmpeg", "ffprobe"):
+            (bindir / n).write_text("x")
+        dep = files / "agt" / "deployments" / "abc"
+        (dep / "app" / "bot").mkdir(parents=True)
+        return bindir, dep
+
+    def _clean_env(self, **extra):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("NOVA_")}
+        env.update(extra)
+        return env
+
+    def test_production_topology_sibling_install_root(self):
+        # code, cwd and HOME all under files/agt/deployments/<id>; the
+        # install root is the SIBLING files/home/instinct-clip.
+        with tempfile.TemporaryDirectory() as d:
+            bindir, dep = self._prod_layout(d)
+            env = self._clean_env(HOME=str(dep))
+            cwd = os.getcwd()
+            os.chdir(dep)
+            try:
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(media, "__file__",
+                                          str(dep / "app/bot/media.py")), \
+                        mock.patch("shutil.which", return_value=None):
+                    ff, fp = media.ffmpeg_paths()
+            finally:
+                os.chdir(cwd)
+            self.assertEqual((ff, fp), (str(bindir / "ffmpeg"),
+                                        str(bindir / "ffprobe")))
+
+    def test_explicit_absolute_tool_dir_wins_over_discovery(self):
+        with tempfile.TemporaryDirectory() as d:
+            bindir, dep = self._prod_layout(d)
+            alt = Path(d).resolve() / "alt"
+            alt.mkdir()
+            for n in ("ffmpeg", "ffprobe"):
+                (alt / n).write_text("x")
+            env = self._clean_env(HOME=str(dep), NOVA_TOOL_BIN_DIR=str(alt))
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch("shutil.which", return_value=None):
+                self.assertEqual(media.ffmpeg_paths()[0], str(alt / "ffmpeg"))
+            env["NOVA_TOOL_BIN_DIR"] = "relative/dir"  # ignored: not absolute
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(media, "__file__",
+                                      str(dep / "app/bot/media.py")), \
+                    mock.patch("shutil.which", return_value=None):
+                self.assertEqual(media.ffmpeg_paths()[0],
+                                 str(bindir / "ffmpeg"))
+
     def test_env_override_wins_and_bare_fallback(self):
         env = {"NOVA_FFMPEG": "/x/ff", "NOVA_FFPROBE": "/x/fp"}
         with mock.patch.dict(os.environ, env):
