@@ -7,15 +7,15 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from app.core import database, intake
-from app.core.intake import ClipIntakeAuthority
+from app.core.intake import ClipIntakeAuthority, resolve_timezone
 from app.core.jobs import JobQueue
 
-TZ = ZoneInfo("America/Los_Angeles")
+TZ = resolve_timezone("America/Los_Angeles")
 # 2026-11-21 12:00:00 in the authority's provisional timezone.
 FIXED_EPOCH = datetime(2026, 11, 21, 12, 0, 0, tzinfo=TZ).timestamp()
 DATE = "2026-11-21"
@@ -186,7 +186,7 @@ class ClipIntakeAuthorityTests(unittest.TestCase):
     def test_day_boundary_from_authority_clock(self):
         # 2026-11-21 07:59:59 UTC is still 2026-11-20 in Los_Angeles.
         self.clock[0] = datetime(2026, 11, 21, 7, 59, 59,
-                                 tzinfo=ZoneInfo("UTC")).timestamp()
+                                 tzinfo=timezone.utc).timestamp()
         v1 = self.auth.admit("C-1")
         self.assertEqual(v1["intake_date"], "2026-11-20")
         self.clock[0] += 2  # one second past midnight LA

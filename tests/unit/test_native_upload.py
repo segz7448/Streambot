@@ -14,13 +14,14 @@ from zoneinfo import ZoneInfo
 
 from app.core import database
 from tests.unit import _prov
-from app.core.intake import ClipIntakeAuthority, HANDOFF_JOB_KIND
+from app.core.intake import (ClipIntakeAuthority, HANDOFF_JOB_KIND,
+                             resolve_timezone)
 from app.bot import handoff, native_upload
 from app.distribution import publish_records
 from app.distribution.youtube import (YouTubeNotConfigured,
                                       YouTubeUploadFailed)
 
-TZ = ZoneInfo("America/Los_Angeles")
+TZ = resolve_timezone("America/Los_Angeles")
 FIXED_EPOCH = datetime(2026, 11, 21, 12, 0, 0, tzinfo=TZ).timestamp()
 
 
