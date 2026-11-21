@@ -47,6 +47,52 @@ class Base(unittest.TestCase):
         return tp.resolve("SomeChannel", **kw)
 
 
+class LiveStatusTests(Base):
+    def st(self, **kw):
+        kw.setdefault("min_interval", 0)
+        return tp.live_status("ishowspeed", **kw)
+
+    def test_live_is_status_only_and_makes_only_token_and_playlist_calls(self):
+        calls = []
+        status, detail = self.st(opener=fake(calls=calls))
+        self.assertEqual(status, "live")
+        self.assertEqual(len(calls), 2)                       # token + master playlist, nothing else
+        self.assertTrue(calls[0].startswith(tp.GQL_URL))
+        self.assertIn("/api/channel/hls/ishowspeed.m3u8", calls[1])
+        self.assertFalse(any(".ts" in c.split("?")[0] or "a720" in c for c in calls))   # no variant/segment fetch
+        self.assertNotIn("SECRET", detail)
+
+    def test_status_mapping_keeps_offline_restricted_blocked_unknown_distinct(self):
+        cases = [
+            (dict(usher=(404, b"[]")), "offline"),
+            (dict(gql=(200, json.dumps({"data": {"streamPlaybackAccessToken": None}}).encode())), "offline"),
+            (dict(usher=(403, b"")), "restricted"),
+            (dict(usher=(429, b"")), "blocked"),
+            (dict(gql=(200, json.dumps({"errors": [{"message": "failed integrity check"}]}).encode())), "blocked"),
+            (dict(usher=(500, b"")), "unknown"),
+            (dict(usher=(200, b"#EXTM3U\n")), "unknown"),
+        ]
+        for kw, want in cases:
+            tp._last.clear()
+            self.assertEqual(self.st(opener=fake(**kw))[0], want, kw)
+
+    def test_invalid_name_never_touches_network(self):
+        calls = []
+        self.assertEqual(tp.live_status("a b;", opener=fake(calls=calls), min_interval=0)[0], "invalid")
+        self.assertEqual(calls, [])
+
+    def test_rate_limit_is_local_unknown_and_separate_from_playback_bucket(self):
+        calls = []
+        self.assertEqual(tp.live_status("ishowspeed", opener=fake(calls=calls), clock=lambda: 100.0)[0], "live")
+        status, detail = tp.live_status("ishowspeed", opener=fake(calls=calls), clock=lambda: 105.0)
+        self.assertEqual(status, "unknown")
+        self.assertIn("try again", detail)
+        self.assertEqual(len(calls), 2)                       # second check made no request
+        # a playback resolve right after a status check is NOT delayed by it
+        r = tp.resolve("ishowspeed", authorized=True, opener=fake(), clock=lambda: 106.0)
+        self.assertEqual(r.channel, "ishowspeed")
+
+
 class ResolveTests(Base):
     def test_default_is_unauthorized_and_makes_no_network_call(self):
         calls = []

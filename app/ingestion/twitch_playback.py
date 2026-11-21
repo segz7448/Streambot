@@ -56,6 +56,7 @@ class PlaybackRefused(Exception):
     def __init__(self, kind: str, detail: str = ""):
         super().__init__(f"{kind}: {detail}" if detail else kind)
         self.kind = kind
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -289,11 +290,47 @@ def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
     caller that holds the owner's per-source decision."""
     if authorized is not True:
         raise PlaybackRefused("unauthorized", "no source authorization")
+    return _resolve_impl(channel, max_height, opener, host_ok, clock, timeout,
+                         min_interval, should_stop, rate_prefix="")
+
+
+def live_status(channel: str, *, opener=None, host_ok=None, clock=time.time,
+                timeout: float = 15.0, min_interval: float = MIN_INTERVAL_SEC,
+                should_stop=None) -> tuple[str, str]:
+    """Read-only, UNOFFICIAL live/offline status from the public player
+    endpoints (playback token + master playlist only; no media segment is
+    ever requested). Returns (status, detail), status in: live, offline,
+    restricted, blocked, unknown, invalid. Gives no title, category or viewer
+    count. Needs no record/repost authorization because nothing is captured.
+    Uses its own rate bucket so it never delays a later playback resolve."""
+    try:
+        r = _resolve_impl(channel, 10**6, opener, host_ok, clock, timeout,
+                          min_interval, should_stop, rate_prefix="status:")
+        return "live", f"{len(r.variants)} playback variant(s) offered"
+    except PlaybackRefused as exc:
+        k = exc.kind
+        if k == "offline":
+            return "offline", ("no live playlist (the channel is offline, or "
+                               "the name does not exist: this route cannot tell which)")
+        if k == "restricted":
+            return "restricted", "Twitch restricted access to the stream"
+        if k == "blocked" and "too soon" in (exc.detail or ""):
+            return "unknown", "checked less than 30 seconds ago; try again shortly"
+        if k in ("blocked", "challenge"):
+            return "blocked", ("rate limited or challenged by Twitch; not "
+                               "retried, not bypassed")
+        if k == "invalid":
+            return "invalid", "not a valid Twitch channel name"
+        return "unknown", "the public player route gave no usable answer"
+
+
+def _resolve_impl(channel, max_height, opener, host_ok, clock, timeout,
+                  min_interval, should_stop, rate_prefix="") -> Resolved:
     login = (channel or "").strip().lstrip("@").lower()
     if not _LOGIN.match(login):
         raise PlaybackRefused("invalid", "channel name")
     now = clock()
-    if not _rate_ok(login, now, min_interval):
+    if not _rate_ok(rate_prefix + login, now, min_interval):
         raise PlaybackRefused("blocked", "too soon since last resolve")
     op = opener or default_opener
     dl = time.monotonic() + max(timeout * 3, 1.0)   # whole-resolve deadline

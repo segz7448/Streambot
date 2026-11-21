@@ -26,8 +26,36 @@ class CommandsFullTests(unittest.TestCase):
         self.assertIn("removed", cf.removesource_reply(self.dir, "someuser"))
         self.assertIn("No source", cf.removesource_reply(self.dir, "someuser"))
 
-    def test_checklive_unconfigured_fails_loudly(self):
-        self.assertIn("not configured", cf.checklive_reply(self.dir, "x"))
+    def test_checklive_unconfigured_uses_labelled_public_status_not_a_refusal(self):
+        for status, detail, head in (("live", "2 playback variant(s) offered", "LIVE"),
+                                     ("offline", "no live playlist", "OFFLINE or not found"),
+                                     ("restricted", "r", "RESTRICTED"), ("blocked", "b", "BLOCKED"),
+                                     ("unknown", "u", "UNKNOWN")):
+            out = cf.checklive_reply(self.dir, "@IShowSpeed", status_fn=lambda u, s=status, d=detail: (s, d))
+            self.assertIn("ishowspeed: " + head, out)
+            self.assertIn("Unofficial", out)
+            self.assertIn("no title, game or viewer count", out)
+            self.assertIn("Nothing was recorded or downloaded", out)
+            self.assertNotIn("developer application", out)
+
+    def test_checklive_status_function_crash_is_unknown_not_a_traceback_or_secret(self):
+        def boom(u): raise OSError("https://x.ttvnw.net/a?sig=SECRETSIG")
+        out = cf.checklive_reply(self.dir, "ishowspeed", status_fn=boom)
+        self.assertIn("UNKNOWN", out)
+        self.assertNotIn("SECRET", out)
+
+    def test_checklive_real_default_path_goes_through_live_status_only(self):
+        from unittest import mock
+        with mock.patch("app.ingestion.twitch_playback.live_status", return_value=("offline", "x")) as m:
+            out = cf.checklive_reply(self.dir, "ishowspeed")
+        m.assert_called_once_with("ishowspeed")
+        self.assertIn("OFFLINE", out)
+
+    def test_checklive_does_not_require_record_or_repost_authorization(self):
+        from app.bot import source_auth
+        self.assertFalse(source_auth.allowed(self.dir, "ishowspeed", "record"))
+        out = cf.checklive_reply(self.dir, "ishowspeed", status_fn=lambda u: ("live", "ok"))
+        self.assertIn("LIVE", out)
 
     def test_startclip_requires_source_then_input(self):
         self.assertIn("/addsource", cf.startclip_reply(self.dir, "ghost"))

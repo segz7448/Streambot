@@ -67,14 +67,30 @@ def _twitch_configured(state_dir: Path) -> bool:
             and (state_dir / "twitch_client_id").exists())
 
 
-def checklive_reply(state_dir: Path, username: str) -> str:
+def _public_status_reply(username: str, status_fn=None) -> str:
+    from ..ingestion import twitch_playback as tp
+    fn = status_fn or tp.live_status
+    try:
+        status, detail = fn(username)
+    except Exception as exc:
+        status, detail = "unknown", f"check failed ({exc.__class__.__name__})"
+    head = {"live": "LIVE", "offline": "OFFLINE or not found",
+            "restricted": "RESTRICTED", "blocked": "BLOCKED by Twitch",
+            "invalid": "INVALID channel name"}.get(status, "UNKNOWN")
+    return (f"{username}: {head}. {detail}. Unofficial check of Twitch's "
+            "public player route: live/offline only, no title, game or "
+            "viewer count, and Twitch can change or block it. Nothing was "
+            "recorded or downloaded.")
+
+
+def checklive_reply(state_dir: Path, username: str, status_fn=None) -> str:
     username = username.strip().lstrip("@").lower()
     if not username:
         return "Usage: /checklive <twitch-username>"
     if not _twitch_configured(state_dir):
-        return ("Live checks are not configured: they need a Twitch "
-                "developer application and OAuth consent, which are not "
-                "in place.")
+        # official route not set up (needs a Twitch developer app); fall
+        # back to the read-only public-player status check
+        return _public_status_reply(username, status_fn)
     from ..ingestion.twitch_clips import ClipFailed, TwitchClipsClient
     client = TwitchClipsClient(
         (state_dir / "twitch_client_id").read_text().strip(),
