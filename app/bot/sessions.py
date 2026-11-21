@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 
 from ..distribution.relay import validate_feed
@@ -40,6 +41,55 @@ def _feed_for(state_dir: Path, username: str) -> str | None:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+_tl = threading.local()
+
+
+def start_scheduled(state_dir: Path, username: str, ffmpeg: str,
+                    ffprobe: str) -> tuple[str, str | None]:
+    """Scheduler launch. Uses the broadcaster-authorized feed when one is
+    registered; otherwise public playback, which itself refuses unless
+    record authorization is ON for this source (default OFF). Returns
+    (reply, token); token identifies exactly the session this call started
+    and is None when nothing started."""
+    _tl.token = None
+    if _feed_for(state_dir, username) is not None:
+        reply = startclip_reply(state_dir, username, ffmpeg, ffprobe)
+    else:
+        reply = startplayback_reply(state_dir, username, ffmpeg, ffprobe)
+    token, _tl.token = getattr(_tl, "token", None), None
+    return reply, token
+
+
+def session_alive(username: str, token: str | None) -> bool:
+    with _lock:
+        sess = _sessions.get(username)
+        return (sess is not None and token is not None
+                and getattr(sess, "_sched_token", None) == token
+                and sess.alive() and not sess._stopping.is_set())
+
+
+def session_error(username: str, token: str | None) -> str:
+    with _lock:
+        sess = _sessions.get(username)
+        if (sess is not None and token is not None
+                and getattr(sess, "_sched_token", None) == token):
+            return sess.error or ""
+    return ""
+
+
+def stop_session(username: str, token: str | None) -> bool:
+    """Stop exactly the session identified by token; False (no effect)
+    when it is gone, already stopping, or replaced by a later one."""
+    with _lock:
+        sess = _sessions.get(username)
+        if (sess is not None and token is not None
+                and getattr(sess, "_sched_token", None) == token
+                and not sess._stopping.is_set()):
+            sess.stop()
+            return True
+    return False
 
 
 def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
@@ -92,6 +142,8 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
         session = session_factory(ffmpeg, ffprobe, feed, username,
                                   state_dir)
         session.start()
+        session._sched_token = uuid.uuid4().hex
+        _tl.token = session._sched_token
         _sessions[username] = session
     return (f"Clipping session started for {username} from its "
             "registered feed: recording, detecting and clipping now. "
@@ -230,6 +282,8 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
                 session = session_factory(ffmpeg, ffprobe, "", username,
                                           state_dir, playback=pb)
                 session.start()
+                session._sched_token = uuid.uuid4().hex
+                _tl.token = session._sched_token
                 res._released = True
                 _sessions[username] = session
         if msg is not None:

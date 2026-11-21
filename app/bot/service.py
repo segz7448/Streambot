@@ -149,6 +149,15 @@ class BotService:
                              lambda c: cf.youtubeauth_reply(self._state_dir(), c.args),
                              "YouTube consent run: /youtubeauth [status]")
         from . import pause as _pause_mod
+        from . import schedule_cmds as sc
+        for _n, _f, _d in (
+            ("timezone", sc.timezone_reply, "schedule timezone: /timezone [IANA name]"),
+            ("schedule", sc.schedule_reply, "schedule a clipping window: /schedule <user> <today|tomorrow|date> <HH:MM> <hours>"),
+            ("schedules", sc.schedules_reply, "list scheduled windows"),
+            ("unschedule", sc.unschedule_reply, "cancel a scheduled window: /unschedule <id>"),
+        ):
+            self.router.register(
+                _n, (lambda f: lambda c: f(self._state_dir(), c.args))(_f), _d)
         from . import youtube_views as yv
         for _n, _f, _d in (
             ("youtube", yv.youtube_reply, "YouTube publishing overview (read-only)"),
@@ -388,8 +397,53 @@ class BotService:
         self._handoff_task = asyncio.create_task(
             handoff.run_consumer(self._state_dir(),
                                  ffprobe=ffprobe_path))
+        self._sched_task = asyncio.create_task(self._schedule_loop())
+
+    async def _schedule_loop(self) -> None:
+        """Advance owner-scheduled windows; deliver durable notices.
+        Windows only ever start through the normal authorized paths
+        (registered feed, or public playback with record auth ON)."""
+        from ..core import schedule as _sched
+        from . import sessions as _sess
+        from . import media as _m
+        sd = self._state_dir()
+        ff, fp = _m.ffmpeg_paths()
+        while True:
+            try:
+                events = await asyncio.to_thread(
+                    _sched.tick, sd,
+                    lambda u: _sess.start_scheduled(sd, u, ff, fp),
+                    _sess.stop_session,
+                    alive_fn=_sess.session_alive,
+                    confirm_fn=lambda u, since: _sched.confirm_recording(
+                        sd, u, since),
+                    error_fn=_sess.session_error)
+                await asyncio.to_thread(_sched.enqueue_notices, sd, events)
+                admin = self.store.admin_id()
+                if admin is not None:
+                    for nid, text in await asyncio.to_thread(
+                            _sched.pending_notices, sd):
+                        try:
+                            await self.app.bot.send_message(admin, text)
+                        except Exception:
+                            log.exception("schedule notice send failed; "
+                                          "stays queued")
+                            break
+                        await asyncio.to_thread(_sched.mark_notice_sent, sd, nid)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("schedule tick failed")
+            await asyncio.sleep(30)
 
     async def _stop_handoff_consumer(self, _app) -> None:
+        st = getattr(self, "_sched_task", None)
+        if st is not None:
+            st.cancel()
+            try:
+                await st
+            except asyncio.CancelledError:
+                pass
         task = getattr(self, "_handoff_task", None)
         if task is not None:
             task.cancel()
@@ -429,6 +483,10 @@ class BotService:
         if recovered:
             log.warning("marked %d crashed session(s) INTERRUPTED",
                         recovered)
+        from ..core import schedule as _schedmod
+        _n = _schedmod.reconcile(self._state_dir())
+        if _n:
+            log.warning("ended %d interrupted schedule window(s) MISSED", _n)
         from . import handoff as _handoff
         requeued = _handoff.recover(self._state_dir())
         if requeued:
