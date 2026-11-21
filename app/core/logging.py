@@ -17,13 +17,31 @@ from pathlib import Path
 _CONFIGURED = False
 
 
-# Telegram bot tokens look like <digits>:<35 url-safe chars>. Any such
-# string, and any /bot<token>/ URL segment, is masked before it is written.
-_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
+# Masking is pattern based, so it is a best-effort boundary for the
+# credential shapes this service can actually emit, not generic secret
+# safety. Covered: Telegram bot tokens (also with an encoded colon),
+# Authorization / Proxy-Authorization / X-*-Token / Cookie header values,
+# Bearer and Basic credentials, and credential-like URL or form parameters
+# (token, access_token, refresh_token, client_secret, api_key, key,
+# password, secret, sig, signature, X-Amz-*/X-Goog-* signed parameters).
+_TOKEN_RE = re.compile(r"\d{6,}(?::|%3[Aa]|%253[Aa])[A-Za-z0-9_-]{20,}")
+_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
+_HEADER_RE = re.compile(
+    r"(?i)(authorization|proxy-authorization|cookie|set-cookie|x-[a-z-]*"
+    r"(?:token|secret|key|signature))(['\"]?\s*[:=]\s*['\"]?)[^\s,;'\"}]+"
+    r"(?:\s+[^\s,;'\"}]+)?")
+_PARAM_RE = re.compile(
+    r"(?i)([?&;\s'\"]|^)((?:access_|refresh_|id_|client_|api_|auth_)?"
+    r"(?:token|secret|key|password|passwd|sig|signature|credential|"
+    r"x-amz-[a-z-]+|x-goog-[a-z-]+))(=|%3[Dd])[^&\s'\"#]+")
 
 
 def redact(text: str) -> str:
-    return _TOKEN_RE.sub("[redacted-token]", text)
+    text = _TOKEN_RE.sub("[redacted-token]", text)
+    text = _HEADER_RE.sub(r"\1\2[redacted]", text)
+    text = _BEARER_RE.sub(r"\1 [redacted]", text)
+    text = _PARAM_RE.sub(r"\1\2\3[redacted]", text)
+    return text
 
 
 class JsonFormatter(logging.Formatter):
@@ -69,31 +87,86 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"nova.{name}")
 
 
+_SERVICE_HANDLERS: list | None = None
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """Rotating file whose active file is always created mode 0600."""
+
+    def _open(self):
+        import os
+        fd = os.open(self.baseFilename,
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a", encoding=self.encoding or "utf-8")
+
+    def doRollover(self):
+        import glob
+        import os
+        super().doRollover()
+        for f in glob.glob(self.baseFilename + ".*"):
+            try:
+                os.chmod(f, 0o600)
+            except OSError:
+                pass
+
+
 def setup_service_logging(log_dir: str, level: str = "INFO") -> logging.Logger:
     """Logging for the Telegram service entrypoint (app.bot.service).
 
-    Before this the service never installed handlers, so INFO records were
-    dropped and only WARNING+ reached a stderr pipe nobody can read. This
-    writes redacted JSON lines to <log_dir>/nova.log (rotating) and stderr,
-    and routes the framework's own "telegram" logger the same way so
-    polling start-up and failures are visible. httpx/httpcore are held at
-    WARNING because their INFO lines embed the request URL (bot token).
+    Singleton: the first successful call wins; later calls change nothing.
+    Handlers are built first and attached only if all of them were created,
+    so a failure (unwritable directory) leaves logging untouched. Existing
+    handlers on the nova, telegram and Python root loggers are replaced so
+    nothing unredacted can coexist, and lastResort is disabled. Output is
+    redacted JSON lines to <log_dir>/nova.log (0600 files, 0700 directory,
+    rotating) and stderr. httpx/httpcore stay at WARNING: their INFO lines
+    carry request URLs. Redaction covers only the shapes listed at redact().
     """
-    root = setup_logging(log_dir, level)
-    tg = logging.getLogger("telegram")
-    if not tg.handlers:
-        for h in root.handlers:
-            tg.addHandler(h)
-        tg.setLevel(getattr(logging, level, logging.INFO))
-        tg.propagate = False
-    # Everything else (httpx, asyncio, anything unexpected) reaches the
-    # Python root logger; give it the same redacting handlers so no record
-    # can fall through to the unredacted last-resort stderr handler.
-    py_root = logging.getLogger()
-    if not py_root.handlers:
-        for h in root.handlers:
-            py_root.addHandler(h)
-        py_root.setLevel(logging.WARNING)
+    global _SERVICE_HANDLERS
+    import os
+    import sys
+    root = logging.getLogger("nova")
+    if _SERVICE_HANDLERS is not None:
+        return root
+    lvl = getattr(logging, level, logging.INFO)
+    formatter = JsonFormatter()
+    handlers: list = []
+    try:
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        os.chmod(log_dir, 0o700)
+        fh = _PrivateRotatingFileHandler(
+            os.path.join(log_dir, "nova.log"), maxBytes=2_000_000,
+            backupCount=3, encoding="utf-8")
+        handlers.append(fh)
+        ch = logging.StreamHandler()
+        handlers.append(ch)
+        for h in handlers:
+            h.setFormatter(formatter)
+    except Exception:
+        for h in handlers:
+            h.close()
+        raise
+    for name, lv, prop in (("nova", lvl, False), ("telegram", lvl, False),
+                           ("", logging.WARNING, True)):
+        lg = logging.getLogger(name)
+        for old in list(lg.handlers):
+            lg.removeHandler(old)
+        for h in handlers:
+            lg.addHandler(h)
+        lg.setLevel(lv)
+        if name:
+            lg.propagate = prop
     for noisy in ("httpx", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+        lg = logging.getLogger(noisy)
+        lg.setLevel(logging.WARNING)
+        for old in list(lg.handlers):
+            lg.removeHandler(old)
+        lg.propagate = True
+    logging.lastResort = None
+
+    def _hook(et, ev, tb):
+        root.critical("uncaught exception", exc_info=(et, ev, tb))
+    sys.excepthook = _hook
+    _SERVICE_HANDLERS = handlers
     return root
