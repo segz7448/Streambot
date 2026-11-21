@@ -15,6 +15,7 @@ class DatabaseTests(unittest.TestCase):
 
     def test_migrate_creates_schema_and_is_idempotent(self):
         conn = connect(self.db)
+        self.addCleanup(conn.close)
         first = migrate(conn)
         self.assertEqual(first, [m[0] for m in MIGRATIONS])
         second = migrate(conn)
@@ -30,6 +31,7 @@ class DatabaseTests(unittest.TestCase):
 
     def test_foreign_keys_enforced(self):
         conn = connect(self.db)
+        self.addCleanup(conn.close)
         migrate(conn)
         with self.assertRaises(Exception):
             with conn:

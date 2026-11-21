@@ -207,6 +207,7 @@ class TitleUsesMeasuredDuration(unittest.TestCase):
                                        "height": 240},
             final_probe_fn=probe_fn)
         c = sqlite3.connect(db)
+        self.addCleanup(c.close)
         title = json.loads(c.execute(
             "SELECT metadata_json FROM candidate_events"
         ).fetchone()[0])["title"]

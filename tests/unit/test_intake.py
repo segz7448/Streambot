@@ -1,4 +1,7 @@
-import multiprocessing
+import json
+import os
+import subprocess
+import sys
 import sqlite3
 import tempfile
 import threading
@@ -483,11 +486,20 @@ class ClipIntakeAuthorityTests(unittest.TestCase):
         self.assertEqual(len(self._jobs()), 8)
 
     def test_multiprocess_boundary(self):
+        from tests.process_helpers import track_children
         self._fill(6)
-        ctx = multiprocessing.get_context("fork")
-        with ctx.Pool(4) as pool:
-            verdicts = pool.starmap(
-                _admit_one, [(self.db, "MP-%d" % i) for i in range(6)])
+        root = str(Path(__file__).resolve().parents[2])
+        children = track_children(self)
+        procs = [subprocess.Popen(
+            [sys.executable, "-m", "tests.proc_workers", "admit", self.db,
+             "MP-%d" % i], cwd=root, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True) for i in range(6)]
+        verdicts = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=60)
+            self.assertEqual(proc.returncode, 0, err)
+            verdicts.append(json.loads(out.strip().splitlines()[-1]))
+        self.assertEqual(len(children), 6)
         self.assertEqual(sum(1 for v in verdicts if v["accepted"]), 2,
                          verdicts)
         self.assertEqual(self.auth.day_count(DATE), 8)

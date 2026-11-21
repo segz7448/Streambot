@@ -46,7 +46,10 @@ class ViewsTests(Base):
         self.assertIn("unavailable", yv.youtube_reply(self.d / "nope"))
         # broken schema (table missing) is also unavailable, not empty
         bad = Path(tempfile.mkdtemp())
-        sqlite3.connect(str(bad / "nova.db")).execute("create table x(a)").connection.commit()
+        bad_conn = sqlite3.connect(str(bad / "nova.db"))
+        self.addCleanup(bad_conn.close)
+        bad_conn.execute("create table x(a)")
+        bad_conn.commit()
         self.assertIn("unavailable", yv.publishqueue_reply(bad))
 
     def test_queue_shows_jobs_retry_pause_and_records(self):
@@ -154,6 +157,7 @@ class PauseTests(Base):
         from app.core.database import connect
         from app.core.intake import ClipIntakeAuthority
         conn = connect(str(self.d / "nova.db"))
+        self.addCleanup(conn.close)
         q = JobQueue(conn)
         jid = q.enqueue("clip_intake_handoff", {"clip_id": "cliprow:1", "intake_date": "2026-11-21"})
         pause.set_paused(self.d, True)

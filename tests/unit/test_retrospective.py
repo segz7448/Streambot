@@ -98,6 +98,7 @@ class ProcessRecordingTests(unittest.TestCase):
         self.assertEqual(result["status"], "qc_failed")
         import sqlite3
         conn = sqlite3.connect(str(self.dir / "n.db"))
+        self.addCleanup(conn.close)
         try:
             rows = conn.execute("SELECT count(*) FROM clips").fetchone()
         except sqlite3.Error:

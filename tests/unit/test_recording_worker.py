@@ -43,6 +43,7 @@ class RecordingWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "t.db")
             conn = connect(db)
+            self.addCleanup(conn.close)
             migrate(conn)
             conn.execute(
                 "INSERT INTO twitch_sources (username, created_at, updated_at)"

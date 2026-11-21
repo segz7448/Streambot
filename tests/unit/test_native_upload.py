@@ -720,7 +720,11 @@ class NativeUploadV3Tests(NativeUploadTests):
         live = publish_records.ClipLease(self.state_dir, other)
         live.__enter__()
         try:
-            native_upload._prepare(self.state_dir, database.connect(self.db))
+            prep_conn = database.connect(self.db)
+            try:
+                native_upload._prepare(self.state_dir, prep_conn)
+            finally:
+                prep_conn.close()
         finally:
             live.__exit__()
         self.assertEqual(self._jobs()[0]["state"], "PENDING")

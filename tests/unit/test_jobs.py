@@ -10,6 +10,7 @@ class JobQueueTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.conn = connect(str(Path(self.tmp.name) / "t.db"))
+        self.addCleanup(self.conn.close)
         migrate(self.conn)
         self.q = JobQueue(self.conn)
 

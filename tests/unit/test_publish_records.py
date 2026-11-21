@@ -1,7 +1,8 @@
 from contextlib import closing
 from tests.unit import _prov
-import multiprocessing as mp
 import os
+import subprocess
+import sys
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -14,14 +15,6 @@ from app.distribution import publish_records as pr
 def _reserve(sd, cid, *a, **k):
     _prov.seed_clip(sd, cid)
     return pr.reserve(sd, cid, *a, **k)
-
-
-def held_worker(state, ready, release):
-    with pr.ClipLease(Path(state), 1) as lease:
-        _, row = _reserve(Path(state), 1, 'child', lease=lease)
-        ready.set()
-        release.wait(10)
-        pr.confirm(Path(state), 1, 'child-video', lease=lease, attempt_token=row['attempt_token'])
 
 
 class PublishRecordsTests(unittest.TestCase):
@@ -81,36 +74,48 @@ class PublishRecordsTests(unittest.TestCase):
         self.assertEqual(pr.get(self.d, 1)['state'], 'UNCERTAIN')
         self.assertEqual(pr.recover_interrupted(self.d), 0)
 
+    def _start_holder(self):
+        from tests.process_helpers import track_children
+        track_children(self)
+        root = str(Path(__file__).resolve().parents[2])
+        proc = subprocess.Popen(
+            [sys.executable, '-m', 'tests.proc_workers', 'hold', str(self.d)],
+            cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        line = proc.stdout.readline()
+        if line.strip() != 'READY':
+            proc.kill()
+            self.fail('holder did not become ready: ' + proc.stderr.read())
+        return proc
+
     def test_process_recovery_cannot_invalidate_live_uploader(self):
-        ctx = mp.get_context('spawn')
-        ready, release = ctx.Event(), ctx.Event()
-        proc = ctx.Process(target=held_worker, args=(str(self.d), ready, release))
-        proc.start()
+        proc = self._start_holder()
         try:
-            self.assertTrue(ready.wait(10))
             self.assertEqual(pr.recover_interrupted(self.d), 0)
             with self.assertRaises(pr.PublishBusy):
                 with pr.ClipLease(self.d, 1):
                     self.fail('duplicate worker acquired live lease')
         finally:
-            release.set()
-            proc.join(10)
-            if proc.is_alive():
+            proc.stdin.write('go\n')
+            proc.stdin.flush()
+            proc.stdin.close()
+            try:
+                proc.wait(10)
+            except subprocess.TimeoutExpired:
                 proc.terminate()
-                proc.join(5)
-        self.assertEqual(proc.exitcode, 0)
+                proc.wait(5)
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertEqual(proc.returncode, 0)
         self.assertEqual(pr.get(self.d, 1)['state'], 'CONFIRMED')
 
     def test_process_death_releases_lease_but_never_allows_retry(self):
-        ctx = mp.get_context('spawn')
-        ready, release = ctx.Event(), ctx.Event()
-        proc = ctx.Process(target=held_worker, args=(str(self.d), ready, release))
-        proc.start()
-        try:
-            self.assertTrue(ready.wait(10))
-        finally:
-            proc.terminate()
-            proc.join(5)
+        proc = self._start_holder()
+        proc.kill()
+        proc.wait(5)
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.stderr.close()
         self.assertEqual(pr.recover_interrupted(self.d), 1)
         with pr.ClipLease(self.d, 1) as lease:
             self.assertEqual(_reserve(self.d, 1, 'retry', lease=lease)[0], 'blocked')
