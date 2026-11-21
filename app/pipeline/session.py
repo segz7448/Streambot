@@ -50,6 +50,7 @@ class ClipSession:
         self._thread: threading.Thread | None = None
         self.error: str | None = None
         self.clips_finished = 0
+        self.phase = "starting"
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -229,11 +230,21 @@ class ClipSession:
                 raise
 
     @staticmethod
-    def _mark_state(db_path, session_id, state) -> None:
+    def _mark_state(db_path, session_id, state, error=None) -> None:
         try:
             c = connect(db_path)
             c.execute("UPDATE stream_sessions SET state=?, ended_at=? WHERE id=?",
                       (state, time.time(), session_id))
+            if error:
+                row = c.execute("SELECT notes FROM stream_sessions WHERE id=?",
+                                (session_id,)).fetchone()
+                try:
+                    n = json.loads(row[0]) if row and row[0] else {}
+                except Exception:
+                    n = {}
+                n["error"] = error
+                c.execute("UPDATE stream_sessions SET notes=? WHERE id=?",
+                          (json.dumps(n), session_id))
             c.commit(); c.close()
         except Exception:
             log.exception("session state mark failed")
@@ -243,6 +254,7 @@ class ClipSession:
         sid = self._session_id
         if sid is None:
             return
+        self.phase = "recording"
         try:
             c = connect(str(self.state_dir / "nova.db"))
             c.execute("UPDATE stream_sessions SET state='RECORDING' WHERE id=?"
@@ -346,6 +358,7 @@ class ClipSession:
         finally:
             self._stopping.set()
             sup.stopping.set()
+            self.phase = "stopping"
             try:
                 if self.playback is not None:
                     # asyncio.wait never cancels the task on timeout; a
@@ -378,6 +391,7 @@ class ClipSession:
                     self._mark_state(db_path, session_id, "INTERRUPTED")
                     return
             # finalize: analyze what remains, clip, finish
+            self.phase = "finalizing"
             try:
                 await asyncio.to_thread(detector.process_new_segments)
                 await asyncio.to_thread(clipper.process_pending)
@@ -401,8 +415,11 @@ class ClipSession:
                      time.time(), session_id))
                 conn.commit()
                 conn.close()
-            except Exception:
-                log.exception("session finalize failed")
+            except Exception as exc:
+                log.error("session finalize failed: %s", exc.__class__.__name__)
+                # sanitized (class name only), durable, never left STARTING/RECORDING
+                self.error = f"finalize failed: {exc.__class__.__name__}"
+                self._mark_state(db_path, session_id, "INTERRUPTED", self.error)
 
 
 def recover_interrupted_sessions(state_dir: Path) -> int:

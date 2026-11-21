@@ -461,6 +461,19 @@ class SetupFailures(Base):
         self.assertEqual(self.session_row()[1], "INTERRUPTED")
         self.assertIn("OSError", s.error)
 
+    def test_finalize_failure_is_sanitized_durable_interrupted(self):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        self.endpoint(live=False)
+        s = self.new_session()
+        with mock.patch.object(ClipSession, "_finish_clips", side_effect=OSError("/secret/path tok")):
+            s.start(); s.join(90)
+        self.assertFalse(s.alive())
+        sid, state, mode, notes = self.session_row()
+        self.assertEqual(state, "INTERRUPTED")
+        self.assertEqual(s.error, "finalize failed: OSError")
+        self.assertNotIn("secret", notes)
+        self.assertEqual(json.loads(notes)["error"], "finalize failed: OSError")
+
     def test_starting_state_recovered_on_boot(self):
         with closing(database.connect(str(self.sd / "nova.db"))) as c, c:
             n = time.time()

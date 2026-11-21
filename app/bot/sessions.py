@@ -108,7 +108,8 @@ def sessions_reply(state_dir: Path) -> str:
         live = {k: s for k, s in _sessions.items()}
     lines = []
     for name, s in live.items():
-        state = "stopping" if s._stopping.is_set() else "running"
+        state = getattr(s, "phase", None) or (
+            "stopping" if s._stopping.is_set() else "running")
         extra = f", error: {s.error}" if s.error else ""
         lines.append(f"{name}: {state}, {s.clips_finished} clip(s) held"
                      f"{extra}")
