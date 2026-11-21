@@ -119,7 +119,7 @@ class PairHandlerTests(unittest.TestCase):
         self.td.cleanup()
 
     def _run(self, coro):
-        return asyncio.new_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_missing_arg_asks_for_full_command_not_invalid(self):
         self.store.begin_challenge("abcdefgh")

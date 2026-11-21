@@ -8,6 +8,8 @@ from app.bot import ops
 
 class OpsTests(unittest.TestCase):
     def setUp(self):
+        from tests.process_helpers import track_children
+        self.children = track_children(self)
         self.state = Path(tempfile.mkdtemp())
         (self.state / "relay_enabled").write_text("1")  # gate: reviewed
         import unittest.mock as _mock
@@ -83,6 +85,8 @@ class OpsTests(unittest.TestCase):
                                           "start http://feed rtmp://a"))
             self.assertIn("stopped", ops.stoprelay_reply(self.state))
             self.assertEqual(mgr.active(), [])
+            self.assertEqual(len(self.children), 2)
+            self.assertTrue(all(p.poll() is not None for p in self.children))
         finally:
             ops.Relayer.restream = orig
 

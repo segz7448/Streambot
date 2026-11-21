@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-import threading
 import time
 from pathlib import Path
 
@@ -275,8 +274,8 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
       QC_FAILED or FAILED material is refused
     - path gate: the clip file must resolve under the session clip
       root; anything outside is refused before it is opened
-    - per-clip dedup: a clip already confirmed uploaded (publish:
-      <clip_id> journal) is never re-uploaded by a new command
+    - per-clip dedup: durable atomic publish_records reservations
+      block confirmed, in-progress and uncertain duplicate uploads
     - consent gate: without OAuth credentials nothing is attempted
     Failure honesty: pre-upload failures (auth token, resumable-session
     init) are definitive and journaled failed; once the upload PUT is
@@ -322,24 +321,7 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
                      f"publish refused path escape clip #{clip_id}")
         return (f"Refused: clip #{clip_id}'s file is outside the clip "
                 "storage roots. Nothing was uploaded.")
-    prior = ops.journal_result_ns(state_dir, "publish", clip_id,
-                                  "publish")
-    if prior is not None:
-        return (f"Clip #{clip_id} was already uploaded ({prior}). "
-                "Not re-uploading.")
-    # an earlier attempt for THIS clip that ended uncertain blocks any
-    # new upload command for the clip, not only a replayed update:
-    # the video may already exist server-side
-    for entry in ops.journal_uncertain(state_dir):
-        if entry.get("command") != "publish":
-            continue
-        parts = str(entry.get("text", "")).split()
-        if (len(parts) >= 2 and parts[0] == "/publish"
-                and parts[1].isdigit() and int(parts[1]) == clip_id):
-            return (f"An earlier /publish of clip #{clip_id} ended "
-                    "with an uncertain outcome - the video may already "
-                    "exist on YouTube. Reconcile in YouTube Studio "
-                    "before issuing /publish again.")
+    from ..distribution import publish_records
     from ..distribution.youtube import (YouTubeNotConfigured,
                                         YouTubeUploadFailed,
                                         publisher_from_env_or_state)
@@ -356,128 +338,134 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
     description = (f"Clipped from {source or 'a registered source'} by "
                    f"NOVA Clip Engine (clip #{clip_id}, session "
                    f"{session_id or '?'}).")
-    try:
-        vid = pub.publish(str(resolved), title,
-                          description=description, privacy="private",
-                          tags=plan.tags)
-    except YouTubeUploadFailed as exc:
-        if exc.uncertain:
+    # Durable atomic reservation in nova.db: the ownership and dedup
+    # authority for this clip, claimed in one BEGIN IMMEDIATE before any
+    # upload byte is sent. Independent of provider update IDs (works for
+    # native/operator callers with update_id=0) and not pruned like the
+    # command journal. A crash after the reservation is recovered as
+    # UNCERTAIN at startup - reconciled, never blind-retried.
+    reserved_by = (f"cmd-publish:{update_id}" if update_id
+                   else "operator-native")
+    def _publish_with_lease(lease):
+        decision, rec = publish_records.reserve(state_dir, clip_id, reserved_by, lease=lease)
+        token = rec.get("attempt_token")
+        if decision == "blocked":
+            if rec["state"] == "CONFIRMED":
+                return (f"Clip #{clip_id} was already uploaded "
+                        f"(yt:{rec['video_id']}). Not re-uploading.")
+            if rec["state"] == "RESERVED":
+                return (f"Clip #{clip_id} already has an upload in "
+                        f"progress (attempt {rec['attempts']}). A crashed "
+                        "attempt is marked for reconciliation at startup, "
+                        "never retried blindly.")
+            return (f"An earlier /publish of clip #{clip_id} ended "
+                    "with an uncertain outcome - the video may already "
+                    "exist on YouTube. Reconcile in YouTube Studio "
+                    "before issuing /publish again.")
+        try:
+            vid = pub.publish(str(resolved), title,
+                              description=description, privacy="private",
+                              tags=plan.tags)
+        except YouTubeUploadFailed as exc:
+            if exc.uncertain:
+                publish_records.mark_uncertain(state_dir, clip_id, str(exc), lease=lease, attempt_token=token)
+                ops.journal_mark_uncertain(state_dir, update_id, "publish",
+                                           f"/publish {args}")
+                record_error(
+                    state_dir,
+                    f"publish clip #{clip_id} uncertain ({exc.stage}): {exc}")
+                return ("Upload outcome uncertain: the request was already "
+                        "in flight. Preserved for reconciliation and NOT "
+                        "retried - check YouTube Studio before re-sending "
+                        "/publish.")
+            publish_records.fail_definitive(state_dir, clip_id, str(exc), lease=lease, attempt_token=token)
+            result = (f"YouTube upload of clip #{clip_id} failed before "
+                      f"any video data was sent ({exc.stage}): {exc}")
+            ops.journal_record(state_dir, update_id, "publish", result)
+            record_error(state_dir, result)
+            return result
+        except Exception as exc:
+            publish_records.mark_uncertain(state_dir, clip_id, str(exc), lease=lease, attempt_token=token)
             ops.journal_mark_uncertain(state_dir, update_id, "publish",
                                        f"/publish {args}")
-            record_error(
-                state_dir,
-                f"publish clip #{clip_id} uncertain ({exc.stage}): {exc}")
-            return ("Upload outcome uncertain: the request was already "
-                    "in flight. Preserved for reconciliation and NOT "
-                    "retried - check YouTube Studio before re-sending "
-                    "/publish.")
-        result = (f"YouTube upload of clip #{clip_id} failed before "
-                  f"any video data was sent ({exc.stage}): {exc}")
+            record_error(state_dir,
+                         f"publish clip #{clip_id} outcome uncertain: {exc}")
+            return ("Upload outcome uncertain (unexpected error). Preserved "
+                    "for reconciliation and NOT retried - check YouTube "
+                    "Studio before re-sending /publish.")
+        # confirm FIRST: durable success record before the reply; a crash
+        # between the upload and this write recovers as UNCERTAIN, not as a
+        # retry. The journal entries below are audit only.
+        try:
+            publish_records.confirm(state_dir, clip_id, vid, lease=lease, attempt_token=token)
+        except Exception:
+            # YouTube answered, but the local confirmation did not persist.
+            # Never emit a normal success or retry. Keep the returned id.
+            try:
+                publish_records.mark_uncertain(state_dir, clip_id,
+                    "confirmation write failed; returned video id " + vid,
+                    lease=lease, attempt_token=token)
+            except Exception:
+                pass  # RESERVED remains blocked and recovers to UNCERTAIN
+            return (f"YouTube returned video id {vid}, but durable confirmation "
+                    "failed. Outcome requires reconciliation; do NOT retry.")
+        ops.journal_record_ns(state_dir, "publish", clip_id, "publish",
+                              f"yt:{vid}")
+        result = (f"Clip #{clip_id} uploaded PRIVATE to YouTube "
+                  f"(video id {vid}). It stays private until you change it "
+                  "in YouTube Studio.")
         ops.journal_record(state_dir, update_id, "publish", result)
-        record_error(state_dir, result)
         return result
-    except Exception as exc:
-        ops.journal_mark_uncertain(state_dir, update_id, "publish",
-                                   f"/publish {args}")
-        record_error(state_dir,
-                     f"publish clip #{clip_id} outcome uncertain: {exc}")
-        return ("Upload outcome uncertain (unexpected error). Preserved "
-                "for reconciliation and NOT retried - check YouTube "
-                "Studio before re-sending /publish.")
-    # dedup record FIRST: a crash after the upload but before the replay
-    # guard is written still blocks a second upload of this clip.
-    ops.journal_record_ns(state_dir, "publish", clip_id, "publish",
-                          f"yt:{vid}")
-    result = (f"Clip #{clip_id} uploaded PRIVATE to YouTube "
-              f"(video id {vid}). It stays private until you change it "
-              "in YouTube Studio.")
-    ops.journal_record(state_dir, update_id, "publish", result)
-    return result
 
-_YOUTUBEAUTH_LOCK = threading.Lock()
+    publish_records.promote_legacy(state_dir)
+    try:
+        with publish_records.ClipLease(state_dir, clip_id) as lease:
+            return _publish_with_lease(lease)
+    except publish_records.PublishBusy:
+        return (f"Clip #{clip_id} already has an upload in progress. "
+                "A live publisher holds its ownership lease.")
 
 YOUTUBEAUTH_SETUP = (
-    "YouTube needs a Google OAuth client first. In Google Cloud "
-    "Console: create a project, enable YouTube Data API v3, set the "
-    "OAuth consent screen to Testing with yourself as a test user, "
-    "and create a Desktop-app OAuth client. The client id and secret "
-    "then go in through the secret channel. Nothing was requested "
-    "from Google.")
+    "YouTube needs a Google OAuth client first. Configure the client "
+    "and complete consent through the operator vault route, then inject "
+    "NOVA_YOUTUBE_CLIENT_ID, NOVA_YOUTUBE_CLIENT_SECRET and "
+    "NOVA_YOUTUBE_REFRESH_TOKEN together. Nothing was requested from "
+    "Google. This command never starts phone-browser consent or writes "
+    "credential files.")
 
 
 def youtubeauth_reply(state_dir: Path, args: str) -> str:
-    """Drive the owner-consent run for YouTube uploads. Non-blocking:
-    /youtubeauth returns the consent URL immediately and a daemon
-    thread completes the loopback exchange, so the command worker is
-    never parked for the 5-minute consent window."""
-    cid_path = state_dir / "youtube_client_id"
-    rt_path = state_dir / "youtube_refresh_token"
-    cid = cid_path.read_text().strip() if cid_path.exists() else ""
-    secret_path = state_dir / "youtube_client_secret"
-    secret = (secret_path.read_text().strip()
-              if secret_path.exists() else "")
+    """Report credential source without claiming token validity.
+
+    Consent and credential provisioning belong to the operator vault
+    route. Legacy files are a read-only continuity source until retired;
+    this handler never creates, refreshes or rewrites them.
+    """
+    from ..distribution.youtube import (ENV_CLIENT_ID, ENV_CLIENT_SECRET,
+                                        ENV_REFRESH_TOKEN)
+    env_keys = (ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_REFRESH_TOKEN)
+    if any(k in os.environ for k in env_keys):
+        if not all(os.environ.get(k, "").strip() for k in env_keys):
+            return ("Refused: the NOVA_YOUTUBE_* environment is incomplete. "
+                    "All three values must be nonempty. Vault mode is "
+                    "fail-closed; fix injection through the operator vault "
+                    "route. No file fallback or consent run was started.")
+        if args.strip() == "status":
+            return ("YouTube is configured via vault-injected environment "
+                    "credentials. Token validity is not checked by status. "
+                    "Uploads run as PRIVATE via /publish. State-dir "
+                    "credential files are not used.")
+        return ("Vault-injected YouTube credentials are configured. "
+                "Consent runs and local token writes are disabled; "
+                "re-consent goes through the operator vault route. "
+                "Nothing was started or written.")
     if args.strip() == "status":
-        if rt_path.exists():
-            return ("YouTube is authorized: a refresh token is stored. "
+        names = ("youtube_client_id", "youtube_refresh_token")
+        if all((state_dir / n).is_file() and
+               (state_dir / n).read_text().strip() for n in names):
+            return ("YouTube uses legacy state-dir credentials for read-only "
+                    "continuity. Token validity is not checked by status. "
+                    "Migrate to vault injection through the operator route. "
                     "Uploads run as PRIVATE via /publish.")
-        if cid:
-            return ("Client id present but no consent yet. "
-                    "/youtubeauth starts the consent run.")
         return "Not configured. " + YOUTUBEAUTH_SETUP
-    if not cid:
-        return YOUTUBEAUTH_SETUP
-    if rt_path.exists():
-        return ("YouTube is already authorized. Remove the stored "
-                "token via the operator channel if you want to "
-                "re-consent.")
-    if not _YOUTUBEAUTH_LOCK.acquire(blocking=False):
-        return ("A consent run is already waiting for you. Open the "
-                "link I sent, or wait for it to expire (5 minutes).")
-    # the client id is public by design; the client secret is not
-    for path, label in ((secret_path, "youtube_client_secret"),):
-        if path.exists() and path.stat().st_mode & 0o077:
-            _YOUTUBEAUTH_LOCK.release()
-            record_error(state_dir,
-                         f"youtubeauth refused: {label} is group/world-"
-                         "readable")
-            return (f"Refused: {label} is readable by others. "
-                    "Re-provision it 0600 through the secret channel. "
-                    "Nothing was started.")
-    from ..distribution.youtube import LoopbackAuth
-    try:
-        flow = LoopbackAuth(cid, secret, host="127.0.0.1", port=0)
-    except Exception as exc:
-        _YOUTUBEAUTH_LOCK.release()
-        record_error(state_dir, f"youtubeauth could not start: {exc}")
-        return f"Could not start the consent listener: {exc}"
-
-    def complete():
-        try:
-            code = flow.wait_for_code(timeout=300)
-            tokens = flow.exchange(code)
-            rtok = tokens.get("refresh_token")
-            if not rtok:
-                raise ValueError("Google returned no refresh token")
-            fd = os.open(rt_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                         0o600)
-            with os.fdopen(fd, "w") as fh:
-                fh.write(rtok)
-            record_error(state_dir, "youtubeauth: consent completed, "
-                                    "refresh token stored (0600)")
-        except Exception as exc:
-            record_error(state_dir, f"youtubeauth failed: {exc}")
-        finally:
-            try:
-                flow._server.server_close()
-            except Exception:
-                pass
-            _YOUTUBEAUTH_LOCK.release()
-
-    threading.Thread(target=complete, daemon=True).start()
-    return ("Open this link IN A BROWSER ON THIS PHONE to authorize "
-            "uploads (scope: youtube.upload only):\n"
-            f"{flow.authorization_url}\n"
-            "The link expires in 5 minutes. A Testing-mode project "
-            "shows an unverified-app warning, and its refresh token "
-            "expires 7 days after consent until Google verifies the "
-            "project. /youtubeauth status shows the result.")
+    return YOUTUBEAUTH_SETUP

@@ -203,6 +203,8 @@ def journal_record_ns(state_dir: Path, namespace: str, ident: int,
     def apply(data):
         import time as _t
         now = _t.time()
+        from ..distribution.publish_records import promote_legacy_entries
+        promote_legacy_entries(state_dir, data)
         _journal_migrate(data, now)
         data[f"{namespace}:{int(ident)}"] = {
             "command": command, "result": result, "ts": now}
@@ -253,6 +255,8 @@ def journal_mark_uncertain(state_dir: Path, update_id: int,
     def apply(data):
         import time as _t
         now = _t.time()
+        from ..distribution.publish_records import promote_legacy_entries
+        promote_legacy_entries(state_dir, data)
         _journal_migrate(data, now)
         data[_jkey(command, update_id)] = {
             "command": command, "status": "uncertain",
@@ -296,6 +300,8 @@ def journal_record(state_dir: Path, update_id: int, command: str,
     def apply(data):
         import time as _t
         now = _t.time()
+        from ..distribution.publish_records import promote_legacy_entries
+        promote_legacy_entries(state_dir, data)
         _journal_migrate(data, now)
         data[_jkey(command, update_id)] = {
             "command": command, "result": result, "ts": now}

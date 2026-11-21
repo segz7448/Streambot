@@ -8,6 +8,8 @@ from app.distribution.relay import DestinationStore, Relayer
 
 class RelayTests(unittest.TestCase):
     def setUp(self):
+        from tests.process_helpers import track_children
+        self.children = track_children(self)
         self.tmp = tempfile.mkdtemp()
         self.store = DestinationStore(os.path.join(self.tmp, "dest.json"))
 
@@ -144,3 +146,79 @@ class FeedHostCanonicalFormTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_feed("https://gone.example/feed", Path("/tmp/feeds"),
                           resolver=boom)
+
+class RestreamLifecycleRegressionTests(unittest.TestCase):
+    def setUp(self):
+        from tests.process_helpers import track_children
+        self.children = track_children(self)
+        self.root = Path(tempfile.mkdtemp())
+
+    def test_new_manager_stops_and_reaps_all_complete_identities(self):
+        from app.distribution.relay import RestreamManager
+        path = str(self.root / 'restream.pids')
+        first = RestreamManager(path)
+        pids = first.start([['sleep', '30'], ['sleep', '30']])
+        records = first._records()
+        self.assertTrue(all(r['start'] and r['cmd'] for r in records))
+        second = RestreamManager(path)
+        self.assertEqual(second.stop(), 2)
+        self.assertTrue(all(proc.poll() is not None for proc in self.children))
+        self.assertEqual(second._records(), [])
+
+    def test_transient_empty_identity_is_retried_before_persist(self):
+        from app.distribution.relay import RestreamManager
+        from unittest import mock
+        mgr = RestreamManager(str(self.root / 'restream.pids'))
+        real = mgr._identity
+        calls = [0]
+        def identity(pid):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {'start': '1', 'cmd': ''}
+            return real(pid)
+        with mock.patch.object(mgr, '_identity', side_effect=identity):
+            mgr.start([['sleep', '30']])
+        self.assertGreaterEqual(calls[0], 2)
+        self.assertTrue(mgr._records()[0]['cmd'])
+        self.assertEqual(mgr.stop(), 1)
+
+    def test_missing_identity_aborts_and_reaps_only_owned_launch(self):
+        from app.distribution.relay import RestreamManager
+        from unittest import mock
+        mgr = RestreamManager(str(self.root / 'restream.pids'))
+        with mock.patch.object(mgr, '_identity', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, 'identity unavailable'):
+                mgr.start([['sleep', '30']])
+        self.assertEqual(len(self.children), 1)
+        self.assertIsNotNone(self.children[0].poll())
+        self.assertEqual(mgr._records(), [])
+
+    def test_unverified_live_record_retained_never_signaled(self):
+        import subprocess
+        from app.distribution.relay import RestreamManager
+        proc = subprocess.Popen(['sleep', '30'])
+        mgr = RestreamManager(str(self.root / 'restream.pids'))
+        try:
+            mgr._save([{'pid': proc.pid, 'start': 'wrong-start', 'cmd': 'sleep 30'}])
+            self.assertEqual(mgr.stop(), 0)
+            self.assertIsNone(proc.poll())
+            self.assertEqual(mgr._records()[0]['pid'], proc.pid)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_empty_saved_identity_is_not_valid_even_when_current_empty(self):
+        import subprocess
+        from unittest import mock
+        from app.distribution.relay import RestreamManager
+        proc = subprocess.Popen(['sleep', '30'])
+        mgr = RestreamManager(str(self.root / 'restream.pids'))
+        try:
+            mgr._save([{'pid': proc.pid, 'start': 'same', 'cmd': ''}])
+            with mock.patch.object(mgr, '_identity', return_value={'start':'same', 'cmd':''}):
+                self.assertEqual(mgr.stop(), 0)
+            self.assertIsNone(proc.poll())
+            self.assertEqual(mgr._records()[0]['pid'], proc.pid)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)

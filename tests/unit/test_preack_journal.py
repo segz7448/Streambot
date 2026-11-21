@@ -54,6 +54,8 @@ class PreAckWrapperTests(unittest.TestCase):
 
 class JournalTests(unittest.TestCase):
     def setUp(self):
+        from tests.process_helpers import track_children
+        self.children = track_children(self)
         self.dir = Path(tempfile.mkdtemp())
         import unittest.mock as _mock
         # feed-validation now resolves hostnames; journaling tests stub DNS
@@ -87,6 +89,8 @@ class JournalTests(unittest.TestCase):
             mgr = RestreamManager(str(self.dir / "restream.pids"))
             self.assertEqual(len(mgr.active()), 1)  # not started twice
             mgr.stop()
+            self.assertEqual(len(self.children), 1)
+            self.assertTrue(all(p.poll() is not None for p in self.children))
         finally:
             ops.Relayer.restream = orig
 

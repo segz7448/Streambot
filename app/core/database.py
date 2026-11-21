@@ -133,6 +133,22 @@ MIGRATIONS: list[tuple[int, str]] = [
     CREATE UNIQUE INDEX IF NOT EXISTS clips_event_unique
         ON clips(event_id) WHERE event_id IS NOT NULL;
     """),
+    (3, """
+    -- Durable per-clip publish reservation: ownership/dedup authority
+    -- for YouTube uploads, independent of provider update IDs and of
+    -- the pruned command journal. See app/distribution/publish_records.py
+    CREATE TABLE IF NOT EXISTS publish_records (
+        clip_id INTEGER PRIMARY KEY,
+        state TEXT NOT NULL,
+        video_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        reserved_by TEXT,
+        last_error TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        attempt_token TEXT
+    );
+    """),
 ]
 
 JOB_STATES = (

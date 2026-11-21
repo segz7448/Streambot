@@ -262,14 +262,41 @@ class RestreamManager:
         import subprocess
         records = [rec for rec in self._records()
                    if self._alive(rec["pid"])]
-        for cmd in cmds:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._procs[proc.pid] = proc
-            ident = self._identity(proc.pid) or {"start": None, "cmd": ""}
-            records.append({"pid": proc.pid, "start": ident["start"],
-                            "cmd": ident["cmd"]})
-        self._save(records)
+        launched = []
+        try:
+            for cmd in cmds:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                launched.append(proc)
+                self._procs[proc.pid] = proc
+                # /proc/cmdline may transiently be empty just after exec.
+                # Only record a complete identity; never weaken PID-reuse
+                # checks to make the later stop succeed.
+                ident = None
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline and proc.poll() is None:
+                    ident = self._identity(proc.pid)
+                    if ident and ident.get("start") and ident.get("cmd"):
+                        break
+                    time.sleep(0.01)
+                if not ident or not ident.get("start") or not ident.get("cmd"):
+                    raise RuntimeError("new restream identity unavailable; launch aborted")
+                records.append({"pid": proc.pid, "start": ident["start"],
+                                "cmd": ident["cmd"]})
+            self._save(records)
+        except Exception:
+            # These Popen objects are children created in THIS call.
+            # Cleaning them up cannot target a reused/unrelated PID.
+            for proc in launched:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                self._procs.pop(proc.pid, None)
+            raise
         log.info("restream started: %d process(es)", len(cmds))
         return [rec["pid"] for rec in records]
 
@@ -281,6 +308,7 @@ class RestreamManager:
         import signal
         import time
         stopped = stale = 0
+        signaled = set()
         for rec in self._records():
             pid = rec["pid"]
             if not self._alive(pid):
@@ -290,11 +318,13 @@ class RestreamManager:
             verified = False
             if not ours and rec.get("start"):
                 cur = self._identity(pid)
-                verified = bool(cur and cur["start"] == rec["start"]
+                verified = bool(cur and rec.get("cmd")
+                                and cur["start"] == rec["start"]
                                 and cur["cmd"] == rec["cmd"])
             if ours or verified:
                 try:
                     os.kill(pid, signal.SIGTERM)
+                    signaled.add(pid)
                     stopped += 1
                 except OSError:
                     pass
@@ -309,8 +339,17 @@ class RestreamManager:
                 proc.wait(timeout=remaining)  # reaps; ffmpeg finalizes
             except Exception:
                 pass
-        self._procs.clear()
-        self._save([])
+        # Reap signaled children when this process is their parent,
+        # even when the manager object was recreated by a command.
+        while time.time() < deadline:
+            if not any(self._alive(rec["pid"]) for rec in self._records()
+                       if rec["pid"] in signaled):
+                break
+            time.sleep(0.01)
+        remaining = [rec for rec in self._records() if self._alive(rec["pid"])]
+        self._procs = {pid: proc for pid, proc in self._procs.items()
+                       if proc.poll() is None}
+        self._save(remaining)  # keep live/unverifiable identities, never lose them
         log.info("restream stopped: %d signaled, %d stale-unverified",
                  stopped, stale)
         return stopped

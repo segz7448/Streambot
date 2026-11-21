@@ -377,6 +377,8 @@ class BotService:
                 "another NOVA service instance holds the state lock; "
                 "refusing to start a second poller")
         self._lock_fd = lock_fd  # held for the life of the process
+        from ..distribution import publish_records as _pubrec
+        _pubrec.promote_legacy(self._state_dir())
         from . import sessions as _sess_mod
         from ..pipeline.session import recover_interrupted_sessions
         recovered = recover_interrupted_sessions(self._state_dir())
@@ -387,6 +389,11 @@ class BotService:
         requeued = _handoff.recover(self._state_dir())
         if requeued:
             log.warning("requeued %d interrupted handoff job(s)", requeued)
+        stranded = _pubrec.recover_interrupted(self._state_dir())
+        if stranded:
+            log.warning("marked %d stranded publish reservation(s) "
+                        "UNCERTAIN (reconcile, never blind-retry)",
+                        stranded)
         self.drain_inbox()
         # keep the pending backlog: commands sent during a restart must be
         # processed, not discarded; the watermark makes replays idempotent

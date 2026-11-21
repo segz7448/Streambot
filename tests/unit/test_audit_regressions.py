@@ -114,6 +114,10 @@ class SecretDetectionTests(unittest.TestCase):
 
 
 class RestreamIdentityTests(unittest.TestCase):
+    def setUp(self):
+        from tests.process_helpers import track_children
+        self.children = track_children(self)
+
     def test_unverified_pid_is_never_signaled(self):
         import subprocess
         import time

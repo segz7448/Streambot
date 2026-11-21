@@ -29,6 +29,7 @@ class YouTubePublisherTests(unittest.TestCase):
         auth = YouTubePublisher.__new__(YouTubePublisher)  # unused
         from app.distribution.youtube import LoopbackAuth
         flow = LoopbackAuth("cid", host="127.0.0.1", port=0)
+        self.addCleanup(flow._server.server_close)
         self.assertIn("youtube.upload", flow.authorization_url)
         self.assertNotIn("auth/youtube%20", flow.authorization_url)
         self.assertIn("code_challenge_method=S256", flow.authorization_url)
@@ -40,18 +41,26 @@ class YouTubePublisherTests(unittest.TestCase):
         from app.distribution.youtube import (LoopbackAuth,
                                               YouTubeUploadFailed)
         flow = LoopbackAuth("cid", host="127.0.0.1", port=0)
+        self.addCleanup(flow._server.server_close)
         import threading
-        t = threading.Thread(target=lambda: u.urlopen(
-            flow.redirect_uri + f"/?code=abc&state={flow.state}"),
-            daemon=True)
+        def visit(url):
+            with u.urlopen(url) as response:
+                response.read()
+        t = threading.Thread(target=visit, args=(
+            flow.redirect_uri + f"/?code=abc&state={flow.state}",), daemon=True)
         t.start()
         self.assertEqual(flow.wait_for_code(timeout=10), "abc")
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive())
         flow2 = LoopbackAuth("cid", host="127.0.0.1", port=0)
-        t2 = threading.Thread(target=lambda: u.urlopen(
-            flow2.redirect_uri + "/?code=abc&state=WRONG"), daemon=True)
+        self.addCleanup(flow2._server.server_close)
+        t2 = threading.Thread(target=visit, args=(
+            flow2.redirect_uri + "/?code=abc&state=WRONG",), daemon=True)
         t2.start()
         with self.assertRaises(YouTubeUploadFailed):
             flow2.wait_for_code(timeout=10)
+        t2.join(timeout=5)
+        self.assertFalse(t2.is_alive())
 
     def test_publish_confirmed_returns_video_id(self):
         pub = YouTubePublisher("cid", "rt")
@@ -225,3 +234,36 @@ class EnvFirstPublisherTests(unittest.TestCase):
                 for k, v in saved.items():
                     if v is not None:
                         os.environ[k] = v
+
+class FailClosedEnvTests(unittest.TestCase):
+    def test_empty_or_missing_each_value_refuses_without_file_fallback(self):
+        import tempfile
+        from app.distribution.youtube import publisher_from_env_or_state
+        keys = ('NOVA_YOUTUBE_CLIENT_ID', 'NOVA_YOUTUBE_CLIENT_SECRET', 'NOVA_YOUTUBE_REFRESH_TOKEN')
+        with tempfile.TemporaryDirectory() as d:
+            for key in keys:
+                for bad in ('', '   ', None):
+                    env = dict.fromkeys(keys, 'value')
+                    if bad is None:
+                        del env[key]
+                    else:
+                        env[key] = bad
+                    with self.subTest(key=key, bad=bad), mock.patch.dict('os.environ', env, clear=True), \
+                         mock.patch('app.distribution.youtube.publisher_from_state', side_effect=AssertionError('fallback')):
+                        with self.assertRaises(YouTubeNotConfigured):
+                            publisher_from_env_or_state(d)
+
+    def test_post_put_without_nonempty_id_is_uncertain(self):
+        import io
+        import json
+        for payload in ({}, {'id': ''}, {'id': None}, {'id': '   '}, {'id': 12}, []):
+            responses = [_resp({'access_token': 'token'}),
+                         _resp({}, {'Location': 'https://upload/session'}), _resp(payload)]
+            with self.subTest(payload=payload), \
+                 mock.patch('urllib.request.urlopen', side_effect=responses), \
+                 mock.patch('os.path.getsize', return_value=4), \
+                 mock.patch('builtins.open', mock.mock_open(read_data=b'data')):
+                with self.assertRaises(YouTubeUploadFailed) as exc:
+                    YouTubePublisher('cid', 'rt').publish('/tmp/v.mp4', 'title')
+                self.assertEqual(exc.exception.stage, 'upload')
+                self.assertTrue(exc.exception.uncertain)

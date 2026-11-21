@@ -217,8 +217,11 @@ class PublishCommandTests(unittest.TestCase):
     def test_uncertain_attempt_blocks_new_command_same_clip(self):
         d = Path(tempfile.mkdtemp())
         self._clip(d)
-        from app.bot import ops
-        ops.journal_mark_uncertain(d, 900, "publish", "/publish 1")
+        from app.distribution import publish_records
+        with publish_records.ClipLease(d, 1) as lease:
+            _, rec = publish_records.reserve(d, 1, "test-setup", lease=lease)
+            publish_records.mark_uncertain(d, 1, "test uncertainty", lease=lease,
+                                           attempt_token=rec['attempt_token'])
         fake = mock.Mock()
         with mock.patch("app.distribution.youtube.publisher_from_state",
                         return_value=fake):
@@ -249,65 +252,201 @@ class YouTubeAuthTests(unittest.TestCase):
         os.chmod(sp, secret_mode)
         return d
 
-    def tearDown(self):
-        # never leak the module-level lock between tests
-        cf._YOUTUBEAUTH_LOCK.acquire(blocking=False)
-        try:
-            cf._YOUTUBEAUTH_LOCK.release()
-        except RuntimeError:
-            pass
-
     def test_setup_instructions_without_client(self):
         d = Path(tempfile.mkdtemp())
-        r = cf.youtubeauth_reply(d, "")
-        self.assertIn("Google OAuth client first", r)
+        self.assertIn("Google OAuth client first", cf.youtubeauth_reply(d, ""))
         self.assertIn("Not configured", cf.youtubeauth_reply(d, "status"))
 
-    def test_bind_failure_releases_lock_and_close_runs(self):
+    def test_legacy_client_cannot_start_consent_or_write_token(self):
         d = self._dir_with_client()
-        with mock.patch("app.distribution.youtube.HTTPServer",
-                        side_effect=OSError("address in use")):
-            r1 = cf.youtubeauth_reply(d, "")
-        self.assertIn("Could not start", r1)
-        # the lock survived: a second attempt must not say "already
-        # waiting" - it must try (and fail the same way) again
-        with mock.patch("app.distribution.youtube.HTTPServer",
-                        side_effect=OSError("address in use")):
-            r2 = cf.youtubeauth_reply(d, "")
-        self.assertIn("Could not start", r2)
-        self.assertNotIn("already waiting", r2)
-
-    def test_world_readable_secret_refused_before_lock_leak(self):
-        d = self._dir_with_client(secret_mode=0o644)
-        r1 = cf.youtubeauth_reply(d, "")
-        self.assertIn("readable by others", r1)
-        r2 = cf.youtubeauth_reply(d, "")
-        self.assertIn("readable by others", r2)  # lock not stuck
-
-    def test_success_stores_token_0600_and_closes_server(self):
-        d = self._dir_with_client()
-        flow = mock.Mock()
-        flow.authorization_url = "https://accounts.google.com/x"
-        flow.wait_for_code.return_value = "code"
-        flow.exchange.return_value = {"refresh_token": "rtok"}
         with mock.patch("app.distribution.youtube.LoopbackAuth",
-                        return_value=flow):
-            r = cf.youtubeauth_reply(d, "")
-        self.assertIn("youtube.upload", r)
-        import time as _t
-        for _ in range(200):
-            # completion ends with lock release; waiting for that also
-            # covers the finally (server_close) running first
-            if cf._YOUTUBEAUTH_LOCK.acquire(blocking=False):
-                cf._YOUTUBEAUTH_LOCK.release()
-                break
-            _t.sleep(0.02)
-        self.assertEqual((d / "youtube_refresh_token").read_text(),
-                         "rtok")
-        self.assertEqual((d / "youtube_refresh_token").stat().st_mode
-                         & 0o777, 0o600)
-        flow._server.server_close.assert_called_once()
-        # lock free for the next run
-        self.assertTrue((d / "youtube_refresh_token").exists())
-        r2 = cf.youtubeauth_reply(d, "")
-        self.assertIn("already authorized", r2)
+                        side_effect=AssertionError("consent started")):
+            self.assertIn("operator vault route", cf.youtubeauth_reply(d, ""))
+        self.assertFalse((d / "youtube_refresh_token").exists())
+
+    def test_legacy_status_is_explicit_and_read_only(self):
+        d = self._dir_with_client()
+        (d / "youtube_refresh_token").write_text("old")
+        self.assertIn("legacy state-dir", cf.youtubeauth_reply(d, "status"))
+        self.assertIn("not checked", cf.youtubeauth_reply(d, "status"))
+        cf.youtubeauth_reply(d, "")
+        self.assertEqual((d / "youtube_refresh_token").read_text(), "old")
+
+class DurablePublishHandlerTests(unittest.TestCase):
+    _clip = PublishCommandTests._clip
+
+    def test_update_zero_success_durable_after_journal_prune(self):
+        from app.distribution import publish_records as pr
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        fake = mock.Mock()
+        fake.publish.return_value = 'zero-id-video'
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake):
+            self.assertIn('PRIVATE', cf.publish_reply(d, '1'))
+            for p in d.glob('*journal*'):
+                if p.is_file():
+                    p.unlink()
+            self.assertIn('already uploaded', cf.publish_reply(d, '1'))
+        fake.publish.assert_called_once()
+        self.assertEqual(pr.get(d, 1)['state'], 'CONFIRMED')
+
+    def test_update_zero_uncertain_blocks_repeat(self):
+        from app.distribution.youtube import YouTubeUploadFailed
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        fake = mock.Mock()
+        fake.publish.side_effect = YouTubeUploadFailed('reset', stage='upload', uncertain=True)
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake):
+            self.assertIn('uncertain', cf.publish_reply(d, '1'))
+            self.assertIn('Reconcile', cf.publish_reply(d, '1'))
+        fake.publish.assert_called_once()
+
+    def test_concurrent_same_clip_handler_one_upload(self):
+        import threading
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        entered, release = threading.Event(), threading.Event()
+        outputs, errors = [], []
+        def upload(*a, **kw):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('test timeout')
+            return 'race-video'
+        fake = mock.Mock()
+        fake.publish.side_effect = upload
+        def call():
+            try:
+                outputs.append(cf.publish_reply(d, '1'))
+            except Exception as exc:
+                errors.append(exc)
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake):
+            t = threading.Thread(target=call)
+            t.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertIn('in progress', cf.publish_reply(d, '1'))
+            finally:
+                release.set()
+                t.join(10)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIn('PRIVATE', outputs[0])
+        fake.publish.assert_called_once()
+
+    def test_handler_env_only_private_without_files(self):
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        env = {'NOVA_YOUTUBE_CLIENT_ID': 'cid', 'NOVA_YOUTUBE_CLIENT_SECRET': 'sec',
+               'NOVA_YOUTUBE_REFRESH_TOKEN': 'rt'}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch('app.distribution.youtube.publisher_from_state', side_effect=AssertionError('legacy read')), \
+             mock.patch('app.distribution.youtube.YouTubePublisher.publish', return_value='env-video') as upload:
+            self.assertIn('PRIVATE', cf.publish_reply(d, '1'))
+        self.assertEqual(upload.call_args.kwargs['privacy'], 'private')
+        self.assertFalse(list(d.glob('youtube_*')))
+
+
+class VaultAuthStatusTests(unittest.TestCase):
+    def test_vault_status_and_consent_refusal_without_local_write(self):
+        d = Path(tempfile.mkdtemp())
+        env = {'NOVA_YOUTUBE_CLIENT_ID': 'cid', 'NOVA_YOUTUBE_CLIENT_SECRET': 'sec',
+               'NOVA_YOUTUBE_REFRESH_TOKEN': 'rt'}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch('app.distribution.youtube.LoopbackAuth', side_effect=AssertionError('consent started')):
+            self.assertIn('environment', cf.youtubeauth_reply(d, 'status'))
+            self.assertIn('disabled', cf.youtubeauth_reply(d, ''))
+        self.assertFalse(list(d.glob('youtube_*')))
+
+    def test_incomplete_env_auth_refuses_even_with_legacy_files(self):
+        d = Path(tempfile.mkdtemp())
+        for name in ('youtube_client_id', 'youtube_client_secret', 'youtube_refresh_token'):
+            (d / name).write_text('old')
+        env = {'NOVA_YOUTUBE_CLIENT_ID': 'cid', 'NOVA_YOUTUBE_CLIENT_SECRET': ''}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIn('Refused', cf.youtubeauth_reply(d, 'status'))
+            self.assertIn('Refused', cf.youtubeauth_reply(d, ''))
+        self.assertEqual((d / 'youtube_refresh_token').read_text(), 'old')
+
+class LegacyPublishUpgradeTests(unittest.TestCase):
+    _clip = PublishCommandTests._clip
+
+    def test_legacy_success_promoted_to_durable_record(self):
+        from app.bot import ops
+        from app.distribution import publish_records as pr
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        ops.journal_record_ns(d, 'publish', 1, 'publish', 'yt:old-video')
+        fake = mock.Mock()
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake):
+            self.assertIn('already uploaded', cf.publish_reply(d, '1'))
+            (d / ops.JOURNAL).unlink()
+            self.assertIn('already uploaded', cf.publish_reply(d, '1'))
+        fake.publish.assert_not_called()
+        self.assertEqual(pr.get(d, 1)['video_id'], 'old-video')
+
+    def test_legacy_uncertainty_promoted_to_durable_record(self):
+        from app.bot import ops
+        from app.distribution import publish_records as pr
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        ops.journal_mark_uncertain(d, 123, 'publish', '/publish 1 title')
+        fake = mock.Mock()
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake):
+            self.assertIn('Reconcile', cf.publish_reply(d, '1'))
+            (d / ops.JOURNAL).unlink()
+            self.assertIn('Reconcile', cf.publish_reply(d, '1'))
+        fake.publish.assert_not_called()
+        self.assertEqual(pr.get(d, 1)['state'], 'UNCERTAIN')
+
+class PublishOwnershipRegressionTests(unittest.TestCase):
+    _clip = PublishCommandTests._clip
+
+    def test_confirmation_write_failure_visible_and_repeat_blocked(self):
+        from app.distribution import publish_records as pr
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        fake = mock.Mock()
+        fake.publish.return_value = 'returned-video'
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake), \
+             mock.patch.object(pr, 'confirm', side_effect=sqlite3.OperationalError('disk full')):
+            reply = cf.publish_reply(d, '1')
+            self.assertIn('durable confirmation failed', reply)
+            self.assertIn('returned-video', reply)
+            self.assertNotIn('uploaded PRIVATE', reply)
+            self.assertIn('Reconcile', cf.publish_reply(d, '1'))
+        fake.publish.assert_called_once()
+        self.assertEqual(pr.get(d, 1)['state'], 'UNCERTAIN')
+
+    def test_recovery_during_handler_preserves_live_reservation(self):
+        from app.distribution import publish_records as pr
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        fake = mock.Mock()
+        def upload(*a, **kw):
+            self.assertEqual(pr.recover_interrupted(d), 0)
+            self.assertEqual(pr.get(d, 1)['state'], 'RESERVED')
+            return 'live-video'
+        fake.publish.side_effect = upload
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake):
+            self.assertIn('uploaded PRIVATE', cf.publish_reply(d, '1'))
+        self.assertEqual(pr.get(d, 1)['state'], 'CONFIRMED')
+
+    def test_unrelated_audit_write_bulk_promotes_before_age_prune(self):
+        from app.bot import ops
+        from app.distribution import publish_records as pr
+        import json
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        old = {'publish:1': {'command': 'publish', 'result': 'yt:old-video', 'ts': 1},
+               'publish:77': {'command': 'publish', 'result': 'yt:other-old', 'ts': 1},
+               'tg:4': {'command': 'publish', 'status': 'uncertain', 'text': '/publish 88', 'ts': 1}}
+        (d / ops.JOURNAL).write_text(json.dumps(old))
+        ops.journal_record(d, 500, 'other', 'done')
+        self.assertIsNone(ops.journal_result_ns(d, 'publish', 1, 'publish'))
+        self.assertEqual(pr.get(d, 1)['video_id'], 'old-video')
+        self.assertEqual(pr.get(d, 77)['video_id'], 'other-old')
+        self.assertEqual(pr.get(d, 88)['state'], 'UNCERTAIN')
+        fake = mock.Mock()
+        with mock.patch('app.distribution.youtube.publisher_from_env_or_state', return_value=fake):
+            self.assertIn('already uploaded', cf.publish_reply(d, '1'))
+        fake.publish.assert_not_called()

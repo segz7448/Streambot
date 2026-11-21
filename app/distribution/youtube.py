@@ -211,9 +211,14 @@ class YouTubePublisher:
                 raise YouTubeUploadFailed(
                     f"upload interrupted: {exc}", stage="upload",
                     uncertain=True) from None
-        video_id = result.get("id")
-        if not video_id:
-            raise YouTubeUploadFailed(f"no video id in response: {result!r}")
+        video_id = result.get("id") if isinstance(result, dict) else None
+        if not isinstance(video_id, str) or not video_id.strip():
+            # the PUT completed and YouTube answered, but returned no
+            # usable video id: the video may exist server-side - this
+            # is upload-stage uncertainty, never a safe retry
+            raise YouTubeUploadFailed(
+                f"no video id in response: {result!r}",
+                stage="upload", uncertain=True)
         return str(video_id)
 
 
@@ -244,14 +249,18 @@ def publisher_from_env_or_state(state_dir: str) -> YouTubePublisher:
     remain the source (the pre-vault route) until the standalone copies
     are retired after verified env consumption.
     """
-    cid = os.environ.get(ENV_CLIENT_ID, "").strip()
-    sec = os.environ.get(ENV_CLIENT_SECRET, "").strip()
-    rtok = os.environ.get(ENV_REFRESH_TOKEN, "").strip()
-    if cid or sec or rtok:
-        if not (cid and rtok):
+    keys = (ENV_CLIENT_ID, ENV_CLIENT_SECRET, ENV_REFRESH_TOKEN)
+    present = [k for k in keys if k in os.environ]
+    if present:
+        vals = {k: os.environ.get(k, "").strip() for k in keys}
+        if not all(vals.values()):
             raise YouTubeNotConfigured(
-                "partial NOVA_YOUTUBE_* environment: client id and "
-                "refresh token must be injected together; refusing to "
-                "mix env credentials with state-dir files")
-        return YouTubePublisher(cid, rtok, sec)
+                "incomplete NOVA_YOUTUBE_* environment: all three of "
+                "NOVA_YOUTUBE_CLIENT_ID, NOVA_YOUTUBE_CLIENT_SECRET "
+                "and NOVA_YOUTUBE_REFRESH_TOKEN must be injected with "
+                "nonempty values; refusing to fall back to or mix "
+                "with state-dir files")
+        return YouTubePublisher(vals[ENV_CLIENT_ID],
+                                vals[ENV_REFRESH_TOKEN],
+                                vals[ENV_CLIENT_SECRET])
     return publisher_from_state(state_dir)
