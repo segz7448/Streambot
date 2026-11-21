@@ -96,15 +96,30 @@ def schedule_reply(state_dir, args: str) -> str:
             "filtered to a particular game. Clips stay private.")
 
 
+_STATE_TEXT = {
+    "AWAITING_QUALIFICATION": "waiting: cannot verify the game is GTA6, not recording",
+    "AWAITING_AUTH": "waiting: recording is not authorized for this streamer",
+    "BLOCKED": "stopped: Twitch access was refused (/unschedule dismisses it)",
+    "UNCERTAIN": "held: cannot prove an earlier session finished",
+}
+
+
 def schedules_reply(state_dir, _args="") -> str:
     rows = sched.list_visible(state_dir)
-    if not rows:
+    fenced = [q["username"] for q in sched.quarantined(state_dir)]
+    if not rows and not fenced:
         return "No scheduled clipping windows."
     tz = get_tz(state_dir) or DEFAULT_TIMEZONE
-    return "Schedules:\n" + "\n".join(
+    out = ["Schedules:"] if rows else []
+    out += [
         f"#{r['id']} {r['username']} {_fmt(r['start_at'], tz)} "
         f"{'whole day' if r['mode'] == 'day' else format((r['end_at'] - r['start_at']) / 3600, 'g') + 'h'}"
-        f" {r['state']}" for r in rows)
+        f" {_STATE_TEXT.get(r['state'], r['state'])}" for r in rows]
+    if fenced:
+        out.append("Fenced (no new session can start until the earlier one is "
+                   "proven finished, even if its schedule was cancelled): "
+                   + ", ".join(fenced))
+    return "\n".join(out)
 
 
 def unschedule_reply(state_dir, args: str) -> str:

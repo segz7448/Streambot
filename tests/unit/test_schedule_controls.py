@@ -424,6 +424,20 @@ class PolicyTests(Base):
             sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
         self.assertEqual(sched.cancel(self.d, sid, now=self.now + 5), "cancelled")
 
+    def test_schedules_reply_shows_waits_and_fence(self):
+        from app.bot.schedule_cmds import schedules_reply
+        sid, _, _ = self.day()
+        self.w.qualified = False
+        self.tick(self.now)
+        self.assertIn("cannot verify the game is GTA6", schedules_reply(self.d))
+        self.w.qualified = True
+        self.w.mode = "raise_ghost"
+        self.tick(self.now + 10)
+        self.assertTrue(sched.cancel(self.d, sid, now=self.now + 20).startswith("cancelled"))
+        out = schedules_reply(self.d)
+        self.assertIn("Fenced", out)
+        self.assertIn("kaicenat", out)
+
     def test_blocked_plan_can_be_dismissed(self):
         sid, _, _ = self.day()
         self.w.mode = "blocked"
