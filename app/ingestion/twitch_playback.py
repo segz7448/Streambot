@@ -306,7 +306,9 @@ def live_status(channel: str, *, opener=None, host_ok=None, clock=time.time,
     try:
         r = _resolve_impl(channel, 10**6, opener, host_ok, clock, timeout,
                           min_interval, should_stop, rate_prefix="status:")
-        return "live", f"{len(r.variants)} playback variant(s) offered"
+        return "live", (f"a public playlist is currently offered "
+                        f"({len(r.variants)} variant(s)); media, game, identity "
+                        "and rights are not verified")
     except PlaybackRefused as exc:
         k = exc.kind
         if k == "offline":

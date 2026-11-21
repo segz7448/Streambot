@@ -61,6 +61,8 @@ class LiveStatusTests(Base):
         self.assertIn("/api/channel/hls/ishowspeed.m3u8", calls[1])
         self.assertFalse(any(".ts" in c.split("?")[0] or "a720" in c for c in calls))   # no variant/segment fetch
         self.assertNotIn("SECRET", detail)
+        self.assertIn("public playlist is currently offered", detail)
+        self.assertIn("media, game, identity and rights are not verified", detail)
 
     def test_status_mapping_keeps_offline_restricted_blocked_unknown_distinct(self):
         cases = [

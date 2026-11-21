@@ -80,7 +80,8 @@ def _public_status_reply(username: str, status_fn=None) -> str:
     return (f"{username}: {head}. {detail}. Unofficial check of Twitch's "
             "public player route: live/offline only, no title, game or "
             "viewer count, and Twitch can change or block it. No video or media "
-            "was downloaded and nothing was recorded.")
+            "segments were downloaded or recorded; only playback metadata "
+            "was checked.")
 
 
 def checklive_reply(state_dir: Path, username: str, status_fn=None) -> str:

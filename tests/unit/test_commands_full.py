@@ -35,7 +35,7 @@ class CommandsFullTests(unittest.TestCase):
             self.assertIn("ishowspeed: " + head, out)
             self.assertIn("Unofficial", out)
             self.assertIn("no title, game or viewer count", out)
-            self.assertIn("No video or media was downloaded and nothing was recorded", out)
+            self.assertIn("No video or media segments were downloaded or recorded; only playback metadata was checked", out)
             self.assertNotIn("developer application", out)
 
     def test_checklive_status_function_crash_is_unknown_not_a_traceback_or_secret(self):
