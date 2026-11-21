@@ -107,6 +107,14 @@ class BotService:
                              lambda c: self._startclip(c.args),
                              "start an authorized clipping session over "
                              "the source's registered feed")
+        self.router.register("startplayback",
+                             lambda c: self._startplayback(c.args),
+                             "capture a streamer's public live playback "
+                             "(needs record authorization)")
+        self.router.register("sourceauth",
+                             lambda c: self._sourceauth(c.args),
+                             "per-streamer record/repost authorization: "
+                             "/sourceauth <user> [record|repost] [on|off]")
         self.router.register("stopclip",
                              lambda c: self._stopclip(),
                              "stop active clipping sessions")
@@ -185,6 +193,16 @@ class BotService:
         from . import sessions as sess
         ff, fp = bot_media.ffmpeg_paths()
         return sess.startclip_reply(self._state_dir(), args, ff, fp)
+
+    def _startplayback(self, args: str) -> str:
+        from . import media as bot_media
+        from . import sessions as sess
+        ff, fp = bot_media.ffmpeg_paths()
+        return sess.startplayback_reply(self._state_dir(), args, ff, fp)
+
+    def _sourceauth(self, args: str) -> str:
+        from . import source_auth
+        return source_auth.sourceauth_reply(self._state_dir(), args)
 
     def _stopclip(self) -> str:
         from . import sessions as sess

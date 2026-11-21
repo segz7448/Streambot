@@ -76,6 +76,16 @@ class RollingBuffer:
             args += ["-segment_start_number", str(start_number)]
         return args + [pattern]
 
+    def segmenter_output_args(self, start_number: int = 0) -> list[str]:
+        """Output-side args only (everything after the input), for a caller
+        that feeds ffmpeg its own input (hls_pump pipes MPEG-TS to stdin)."""
+        pattern = str(self.dir / "seg-%06d.ts")
+        args = ["-c", "copy", "-f", "segment", "-segment_time",
+                str(self.segment_seconds), "-reset_timestamps", "1"]
+        if start_number:
+            args += ["-segment_start_number", str(start_number)]
+        return args + [pattern]
+
     def segments(self) -> list[Segment]:
         paths = sorted(self.dir.glob("seg-*.ts"))
         anchor_t: float | None = None

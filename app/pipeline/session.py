@@ -29,7 +29,12 @@ class ClipSession:
                  source_label: str, state_dir: Path,
                  segment_seconds: int = 5, tick_seconds: float = 3.0,
                  clip_pre_seconds: float = 20.0,
-                 clip_post_seconds: float = 10.0):
+                 clip_post_seconds: float = 10.0,
+                 playback: dict | None = None):
+        # playback: None for mode A feeds. For public playback: a dict with
+        # optional initial_resolved and test/owned-fixture hooks
+        # (resolve_fn, capture_fn, opener, host_ok, worker_kwargs).
+        self.playback = playback
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.feed = feed
@@ -58,6 +63,22 @@ class ClipSession:
     def join(self, timeout: float = 30.0) -> None:
         if self._thread:
             self._thread.join(timeout)
+
+    def _notes(self, now: float) -> str:
+        """Durable origin and authorization snapshot (session row)."""
+        if self.playback is None:
+            return "mode A session"
+        from ..bot import source_auth
+        return json.dumps({
+            "origin": "twitch_public_playback", "mode": "playback",
+            "source": self.source_label,
+            "record_authorized_at_start": source_auth.allowed(
+                self.state_dir, self.source_label, "record"),
+            "repost_authorized_at_start": source_auth.allowed(
+                self.state_dir, self.source_label, "repost"),
+            "started_at": now,
+            "note": "authorization is re-read at every publish and capture "
+                    "check; this snapshot is provenance only"})
 
     def _finish_clips(self, session_id: int, out_dir: Path,
                       runtime_dir: Path) -> None:
@@ -207,7 +228,9 @@ class ClipSession:
         cur = conn.execute(
             "INSERT INTO stream_sessions (source_id, state, started_at,"
             " ingest_mode, notes) VALUES (?,?,?,?,?)",
-            (source_id, "RECORDING", now, "feed", "mode A session"))
+            (source_id, "RECORDING", now,
+             "playback" if self.playback is not None else "feed",
+             self._notes(now)))
         session_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -217,8 +240,15 @@ class ClipSession:
                             pre_event_seconds=30, post_event_seconds=30,
                             max_storage_mb=256)
         runner = FFmpegRunner(self.ffmpeg, self.ffprobe, max_concurrent=1)
-        worker = RecordingWorker(runner, buf, self.feed, db_path,
-                                 sweep_seconds=max(1, self.segment_seconds))
+        if self.playback is not None:
+            from ..recording.playback_worker import PlaybackWorker
+            pb = dict(self.playback)
+            worker = PlaybackWorker(
+                buf, self.source_label, db_path, self.state_dir, self.ffmpeg,
+                initial_resolved=pb.pop("initial_resolved", None), **pb)
+        else:
+            worker = RecordingWorker(runner, buf, self.feed, db_path,
+                                     sweep_seconds=max(1, self.segment_seconds))
         detector = CandidateDetector(self.ffmpeg, buf, db_path)
         clipper = AutoClipper(buf, db_path, HeuristicProvider(),
                               self.ffmpeg, str(work),
@@ -246,6 +276,12 @@ class ClipSession:
                             self.state_dir / "runtime")
                     finally:
                         finishing = False
+                if self.playback is not None and getattr(worker, "finished", False):
+                    # the Supervisor swallows service crashes and idles until
+                    # stopped, so the playback worker reports its own end
+                    if worker.end_reason == "failed":
+                        raise RuntimeError(worker.error_text or "playback failed")
+                    break
                 if task.done():
                     exc = task.exception() if not task.cancelled() \
                         else None
@@ -271,6 +307,15 @@ class ClipSession:
                     self._finish_clips, session_id, work,
                     self.state_dir / "runtime")
                 conn = connect(db_path)
+                if self.playback is not None:
+                    try:
+                        row = conn.execute("SELECT notes FROM stream_sessions WHERE id=?", (session_id,)).fetchone()
+                        n = json.loads(row[0]) if row and row[0] else {}
+                        n["end_reason"] = getattr(worker, "end_reason", "unknown")
+                        n["error"] = self.error
+                        conn.execute("UPDATE stream_sessions SET notes=? WHERE id=?", (json.dumps(n), session_id))
+                    except Exception:
+                        log.exception("playback notes update failed")
                 conn.execute(
                     "UPDATE stream_sessions SET state=?, ended_at=?"
                     " WHERE id=?",
