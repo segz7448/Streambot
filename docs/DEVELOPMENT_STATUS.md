@@ -450,11 +450,18 @@ itself missing/unreadable raises inside the send attempt and is
 classified UNCERTAIN rather than UNAVAILABLE; the clip is then held
 for reconciliation and never blind-resent, which is the safe side.
 
-## Intake authority + n8n handoff consumer (2026-11-21, local candidate)
+## Intake authority + n8n handoff consumer (2026-11-21)
 
-STATUS: LOCAL CANDIDATE UNDER INDEPENDENT REVIEW. NOT pushed, NOT
-deployed, NOT live on AGT. No external effects exist yet beyond a
-webhook POST that has never been sent to a real endpoint.
+STATUS: PUSHED + DEPLOYED INERT (default-unconfigured). Independent
+review gave bounded clearance 2026-11-21 (patch sha256
+b3dffb8caa8d7b858c25f7da2dd03980138c95ecc52018f39542f6920627a5af).
+Pushed as da88881; deployed on the owner's AGT phone as deployment
+54fc42b5-70de-4496-8817-0fcdf5e69ce6 (previous e91cb357 stopped, kept
+as rollback). The 4 pre-existing HELD clips are intact and untouched.
+Because NOVA_N8N_WEBHOOK_URL / NOVA_N8N_WEBHOOK_SECRET are not
+provisioned, the consumer is fail-closed: admission runs locally,
+handoff notices stay pending, and ZERO network calls are made. No
+external effect has ever been sent to a real endpoint.
 
 What the candidate does (all verified only by local synthetic tests):
 - app/core/intake.py: local authoritative admission for bot-produced
