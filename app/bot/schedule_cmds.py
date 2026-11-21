@@ -90,11 +90,14 @@ def schedule_reply(state_dir, args: str) -> str:
             "segment is saved. If a session ends early I try again until the "
             "schedule ends. I message you when a session starts, ends, or the "
             "schedule ends with nothing recorded. /stopclip or /unschedule <id> "
-            "cancels it and nothing restarts. Clips stay private.")
+            "cancels it and nothing restarts. If Twitch restricts, challenges or "
+            "throttles access I stop and tell you; I do not keep retrying. I "
+            "cannot tell what game is being played, so nothing here is "
+            "filtered to a particular game. Clips stay private.")
 
 
 def schedules_reply(state_dir, _args="") -> str:
-    rows = sched.list_open(state_dir)
+    rows = sched.list_visible(state_dir)
     if not rows:
         return "No scheduled clipping windows."
     tz = get_tz(state_dir) or DEFAULT_TIMEZONE

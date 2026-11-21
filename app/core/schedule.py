@@ -12,7 +12,11 @@ Plan states:    SCHEDULED (eligible, no attempt running) -> ACTIVE (an attempt
                 owns the streamer) -> back to SCHEDULED when the attempt ended
                 early, until end_at; DONE (recorded at least once) or MISSED
                 at end_at; UNCERTAIN (a launch raised: no automatic retry
-                until the process restarts or the owner cancels); CANCELLED.
+                until the exact owned work is verified gone); BLOCKED (Twitch
+                restricted / challenged / throttled / quality / invalid: never
+                retried, the owner must create a new schedule); AWAITING_AUTH
+                (recording is not authorized for the streamer: no attempts at
+                all until the grant actually turns on); CANCELLED.
 Attempt states: INTENT -> LAUNCHED -> RECORDING -> STOPPING -> ENDED;
                 NOT_STARTED (definitive: nothing launched); UNCERTAIN;
                 INTERRUPTED (service restarted).
@@ -87,8 +91,9 @@ MAX_OPEN = 50
 GRACE_S = 15 * 60          # a fixed window never started this long after its start is MISSED
 CONFIRM_TIMEOUT_S = 180    # launched but no valid segment yet
 STOP_WARN_S = 300
-PLAN_OPEN = ("SCHEDULED", "ACTIVE", "UNCERTAIN")
-ATTEMPT_OPEN = ("INTENT", "LAUNCHED", "RECORDING", "STOPPING", "UNCERTAIN")
+PLAN_OPEN = ("SCHEDULED", "ACTIVE", "UNCERTAIN", "AWAITING_AUTH")
+BLOCKING_KINDS = ("restricted", "challenge", "blocked", "quality", "invalid")
+ATTEMPT_OPEN = ("INTENT", "LAUNCHED", "RECORDING", "STOPPING", "UNCERTAIN", "UNRESOLVED")
 _USER = re.compile(r"^[a-z0-9_]{3,25}$")
 
 
@@ -217,6 +222,14 @@ def list_open(state_dir) -> list[dict]:
                  "('SCHEDULED','ACTIVE','UNCERTAIN') ORDER BY start_at")
 
 
+def list_visible(state_dir) -> list[dict]:
+    """Open plans plus ones held for the owner (BLOCKED), so a stop is
+    never invisible."""
+    return _read(state_dir,
+                 "SELECT * FROM clip_schedules WHERE state IN "
+                 "('SCHEDULED','ACTIVE','UNCERTAIN','BLOCKED') ORDER BY start_at")
+
+
 def cancel(state_dir, sid: int, now: float | None = None) -> str:
     """End a plan's eligibility. Returns 'none' (nothing cancellable),
     'cancelled' or 'cancelled_running' (a session is running: the next
@@ -228,12 +241,10 @@ def cancel(state_dir, sid: int, now: float | None = None) -> str:
             return "none"
         running = c.execute(
             "SELECT 1 FROM schedule_attempts WHERE schedule_id=? AND state IN "
-            "('INTENT','LAUNCHED','RECORDING','STOPPING')", (sid,)).fetchone()
+            "('INTENT','LAUNCHED','RECORDING','STOPPING','UNCERTAIN','UNRESOLVED')",
+            (sid,)).fetchone()
         c.execute("UPDATE clip_schedules SET state='CANCELLED',note=?,updated_at=? "
                   "WHERE id=?", ("cancelled by the owner", now, sid))
-        c.execute("UPDATE schedule_attempts SET state='ABANDONED',note=?,updated_at=? "
-                  "WHERE schedule_id=? AND state='UNCERTAIN'",
-                  ("owner cancelled; verify /sessions", now, sid))
         return "cancelled_running" if running else "cancelled"
 
 
@@ -275,12 +286,28 @@ def _backoff(fails: int) -> float:
     return 300.0 if fails < 3 else 900.0
 
 
-def _after_attempt(c, plan_id, now, why: str) -> list[str]:
-    """Attempt just ended: decide the plan's next state. Returns text for the
-    owner notice (callers insert it in the same transaction)."""
+def _after_attempt(c, plan_id, now, why: str, terminal: str = "") -> list[str]:
+    """Attempt just ended: decide the plan's next state. Typed terminal
+    reasons from the session survive here: blocked-type reasons stop the plan,
+    a missing grant waits for the grant. Returns notice text (callers insert
+    it in the same transaction)."""
     p = c.execute("SELECT * FROM clip_schedules WHERE id=?", (plan_id,)).fetchone()
     if p is None or p["state"] not in ("ACTIVE", "UNCERTAIN"):
         return []     # cancelled or already terminal: stays that way
+    if terminal in BLOCKING_KINDS:
+        c.execute("UPDATE clip_schedules SET state='BLOCKED',note=?,updated_at=? WHERE id=?",
+                  (f"session stopped: {terminal}", now, plan_id))
+        return [f"Schedule #{plan_id} for {p['username']}: the session stopped because "
+                f"Twitch access was refused ({terminal}). I stopped and will not retry "
+                "on my own. To try again later, create a new schedule once you have "
+                "checked with /checklive."]
+    if terminal == "unauthorized":
+        c.execute("UPDATE clip_schedules SET state='AWAITING_AUTH',note=?,updated_at=? "
+                  "WHERE id=?", ("recording authorization is off", now, plan_id))
+        return [f"Schedule #{plan_id} for {p['username']}: recording authorization is "
+                "off, so the session stopped. I will wait and resume only if you turn "
+                f"recording on for this streamer (/sourceauth {p['username']} record on, "
+                "only with their permission)."]
     if now >= p["end_at"]:
         return _finish(c, p, now)
     c.execute("UPDATE clip_schedules SET state='SCHEDULED',next_try_at=?,note=?,"
@@ -332,30 +359,56 @@ class Ops:
     means the outcome is unknown. stop(user, aid) -> bool; running/alive/
     stopping(user, aid) -> bool; confirm(aid) -> bool; error(user, aid) -> str."""
 
-    def __init__(self, start, stop, running, alive, stopping, confirm, error):
+    def __init__(self, start, stop, running, alive, stopping, confirm, error,
+                 writer_active=None, terminal=None, record_allowed=None):
         self.start, self.stop, self.running = start, stop, running
         self.alive, self.stopping, self.confirm, self.error = alive, stopping, confirm, error
+        # writer_active(username) -> True while anything may still be writing
+        # for that streamer (best effort, errs toward True when unsure)
+        self.writer_active = writer_active or (lambda user: False)
+        # terminal(user, aid) -> typed reason the exact session stopped for good ('' if none)
+        self.terminal = terminal or (lambda user, aid: "")
+        # record_allowed(user) -> the owner's record grant is currently ON
+        self.record_allowed = record_allowed or (lambda user: False)
 
 
-def reconcile(state_dir, now: float | None = None) -> int:
-    """Startup, one transaction: sessions died with the process, so every
-    open attempt is INTERRUPTED and plans still inside their window are
-    eligible again; notices caught mid-send are flagged as possible repeats."""
+def reconcile(state_dir, now: float | None = None, writer_active=None) -> int:
+    """Startup, one transaction. The old sessions' threads died with the
+    process, but their recorder children may not have: an open attempt
+    whose streamer still shows a live writer becomes UNRESOLVED and its
+    plan is held UNCERTAIN until the tick verifies the writer is gone.
+    Otherwise the attempt is INTERRUPTED and a plan still inside its
+    window is eligible again. Notices caught mid-send are flagged as
+    possible repeats."""
     now = now if now is not None else time.time()
+    writer_active = writer_active or (lambda user: False)
     n = 0
     with txn(state_dir) as c:
         c.execute("UPDATE schedule_notices SET sending_at=NULL,repeat=1 WHERE "
                   "sending_at IS NOT NULL AND sent_at IS NULL")
+        held = set()
         for a in c.execute("SELECT * FROM schedule_attempts WHERE state IN "
-                           "('INTENT','LAUNCHED','RECORDING','STOPPING','UNCERTAIN')"
-                           ).fetchall():
-            c.execute("UPDATE schedule_attempts SET state='INTERRUPTED',note=?,"
-                      "updated_at=? WHERE id=?",
-                      ("service restarted", now, a["id"]))
+                           "('INTENT','LAUNCHED','RECORDING','STOPPING','UNCERTAIN',"
+                           "'UNRESOLVED')").fetchall():
             n += 1
+            if writer_active(a["username"]):
+                c.execute("UPDATE schedule_attempts SET state='UNRESOLVED',note=?,"
+                          "updated_at=? WHERE id=?",
+                          ("restart: a writer may still be running", now, a["id"]))
+                held.add(a["schedule_id"])
+            else:
+                c.execute("UPDATE schedule_attempts SET state='INTERRUPTED',note=?,"
+                          "updated_at=? WHERE id=?", ("service restarted", now, a["id"]))
         for p in c.execute("SELECT * FROM clip_schedules WHERE state IN "
                            "('ACTIVE','UNCERTAIN')").fetchall():
-            if now >= p["end_at"]:
+            if p["id"] in held:
+                c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,"
+                          "updated_at=? WHERE id=?",
+                          ("restart: waiting for a possible recorder to stop", now, p["id"]))
+                _notice(c, p["id"], f"Service restarted. Schedule #{p['id']} for "
+                        f"{p['username']} is on hold: something may still be writing "
+                        "for that streamer. I will resume only after it has been quiet.", now)
+            elif now >= p["end_at"]:
                 for t in _finish(c, p, now):
                     _notice(c, p["id"], t, now)
             else:
@@ -388,20 +441,27 @@ def tick(state_dir, ops: Ops, now: float | None = None) -> None:
     for a in _read(state_dir,
                    "SELECT a.*, p.state AS pstate, p.end_at AS pend FROM "
                    "schedule_attempts a JOIN clip_schedules p ON p.id=a.schedule_id "
-                   "WHERE a.state IN ('LAUNCHED','RECORDING','STOPPING','INTENT','UNCERTAIN')"):
+                   "WHERE a.state IN ('LAUNCHED','RECORDING','STOPPING','INTENT','UNCERTAIN','UNRESOLVED')"):
         _step_attempt(state_dir, ops, a, now)
     # 2. expired plans
     for p in _read(state_dir, "SELECT * FROM clip_schedules WHERE state IN "
-                   "('SCHEDULED','UNCERTAIN') AND end_at<=?", (now,)):
+                   "('SCHEDULED','UNCERTAIN','AWAITING_AUTH') AND end_at<=?", (now,)):
         with txn(state_dir) as c:
             cur = c.execute("SELECT * FROM clip_schedules WHERE id=? AND state IN "
-                            "('SCHEDULED','UNCERTAIN')", (p["id"],)).fetchone()
+                            "('SCHEDULED','UNCERTAIN','AWAITING_AUTH')", (p["id"],)).fetchone()
             if cur is not None:
-                c.execute("UPDATE schedule_attempts SET state='ABANDONED',note=?,"
-                          "updated_at=? WHERE schedule_id=? AND state='UNCERTAIN'",
-                          ("schedule ended; verify /sessions", now, p["id"]))
                 for t in _finish(c, cur, now):
                     _notice(c, p["id"], t, now)
+    # 2b. a missing grant waits for the grant itself, never for the clock
+    for p in _read(state_dir, "SELECT * FROM clip_schedules WHERE state='AWAITING_AUTH' "
+                   "AND end_at>?", (now,)):
+        if ops.record_allowed(p["username"]):
+            with txn(state_dir) as c:
+                if c.execute("UPDATE clip_schedules SET state='SCHEDULED',next_try_at=NULL,"
+                             "note=?,updated_at=? WHERE id=? AND state='AWAITING_AUTH'",
+                             ("recording authorization turned on", now, p["id"])).rowcount:
+                    _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: recording "
+                            "is now authorized; resuming.", now)
     # 3. due plans
     for p in _read(state_dir, "SELECT * FROM clip_schedules WHERE state='SCHEDULED'"
                    " AND start_at<=? AND end_at>? ORDER BY start_at", (now, now)):
@@ -434,69 +494,117 @@ def _launch(state_dir, ops: Ops, p, now) -> None:
         c.execute("INSERT INTO schedule_attempts (id,schedule_id,username,state,"
                   "created_at,updated_at) VALUES (?,?,?,?,?,?)",
                   (aid, p["id"], p["username"], "INTENT", now, now))
-    # the attempt id is durable; only now may anything launch
+    # the attempt id is durable; only now may anything launch. A session
+    # object is registered under this id before its thread starts, so
+    # whatever happened, the registry says exactly what is owned.
     try:
         kind, reply = ops.start(p["username"], aid)
         raised = False
     except Exception as exc:
         kind, reply, raised = None, exc.__class__.__name__, True
+    stop_after = None
     with txn(state_dir) as c:
-        if raised:
-            if ops.running(p["username"], aid):
-                _set_attempt(c, aid, ("INTENT",), "LAUNCHED", now,
-                             "launch raised but the session is running",
-                             launched_at=now)
-                _notice(c, p["id"], f"Schedule #{p['id']}: {p['username']} launched "
-                        "(with a launch error); waiting for the first recorded segment.", now)
-            else:
-                _set_attempt(c, aid, ("INTENT",), "UNCERTAIN", now,
-                             f"launch raised {reply}")
-                c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,"
-                          "updated_at=? WHERE id=?", (f"launch raised {reply}", now, p["id"]))
-                _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: the "
-                        f"launch failed with {reply} and I cannot tell whether "
-                        "anything started. I will not retry automatically; check "
-                        "/sessions. /unschedule cancels it.", now)
-        elif kind == "started":
-            _set_attempt(c, aid, ("INTENT",), "LAUNCHED", now, launched_at=now)
-            _notice(c, p["id"], f"Schedule #{p['id']}: started {p['username']}; "
-                    "waiting for the first recorded segment before calling it recording.", now)
+        cur = c.execute("SELECT * FROM clip_schedules WHERE id=?", (p["id"],)).fetchone()
+        eligible = cur["state"] == "ACTIVE" and now < cur["end_at"]
+        running = bool(kind == "started" or (raised and ops.running(p["username"], aid)))
+        if running:
+            note = "launch raised but the session is running" if raised else None
+            _set_attempt(c, aid, ("INTENT",), "LAUNCHED", now, note, launched_at=now)
+            if eligible:
+                _notice(c, p["id"], f"Schedule #{p['id']}: started {p['username']}; "
+                        "waiting for the first recorded segment before calling it "
+                        "recording.", now)
+            else:       # cancelled/ended while the launch was in flight
+                why = "cancel" if cur["state"] == "CANCELLED" else "window_end"
+                _set_attempt(c, aid, ("LAUNCHED",), "STOPPING", now,
+                             "stopping a session started after cancel/end",
+                             stop_by=why, stopping_at=now)
+                stop_after = aid
+        elif raised:
+            if ops.writer_active(p["username"]):
+                _set_attempt(c, aid, ("INTENT",), "UNCERTAIN", now, f"launch raised {reply}")
+                c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,updated_at=? "
+                          "WHERE id=? AND state='ACTIVE'", (f"launch raised {reply}", now, p["id"]))
+                _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: the launch "
+                        f"failed with {reply} and something may still be writing for that "
+                        "streamer. On hold until it has been quiet. /unschedule cancels.", now)
+            else:       # verified: nothing registered, nothing writing
+                _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, f"launch raised {reply}")
+                _retry_later(c, p, cur, now, f"launch failed ({reply})", 300.0, eligible)
+        elif kind == "blocked":
+            _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, reply)
+            c.execute("UPDATE clip_schedules SET state='BLOCKED',note=?,updated_at=? "
+                      "WHERE id=? AND state='ACTIVE'", (reply[:200], now, p["id"]))
+            if cur["state"] == "ACTIVE":
+                _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: Twitch "
+                        f"refused access ({reply[:150]}). I stopped trying and will not "
+                        "retry on my own. To try again later, create a new schedule "
+                        "once you have checked with /checklive.", now)
+        elif kind == "unauthorized":
+            _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, reply)
+            c.execute("UPDATE clip_schedules SET state='AWAITING_AUTH',note=?,updated_at=? "
+                      "WHERE id=? AND state='ACTIVE'", (reply[:200], now, p["id"]))
+            if cur["state"] == "ACTIVE":
+                _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: recording is "
+                        "not authorized for this streamer (default OFF), so nothing started. "
+                        "I will wait and resume only if you turn recording on "
+                        f"(/sourceauth {p['username']} record on, only with their "
+                        "permission). I am not retrying in the meantime.", now)
         else:
             _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, reply)
-            cur = c.execute("SELECT * FROM clip_schedules WHERE id=?", (p["id"],)).fetchone()
-            fails = cur["fails"] + 1
-            c.execute("UPDATE clip_schedules SET state='SCHEDULED',fails=?,next_try_at=?,"
-                      "note=?,notified_wait=1,updated_at=? WHERE id=?",
-                      (fails, now + _backoff(fails), reply[:200], now, p["id"]))
-            if not cur["notified_wait"]:
-                _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: not "
-                        f"recording yet ({reply[:150]}). I will keep trying every few "
-                        "minutes until the schedule ends and only message you when "
-                        "something starts, ends or is missed.", now)
+            _retry_later(c, p, cur, now, reply, _backoff(cur["fails"] + 1), eligible)
+    if stop_after:
+        try:
+            ops.stop(p["username"], stop_after)
+        except Exception:
+            pass        # stays STOPPING; the tick retries
+
+
+def _retry_later(c, p, cur, now, reason, delay, eligible) -> None:
+    """Definitive no-start: back to SCHEDULED, but never overwrite a plan
+    that was cancelled/ended while the attempt was in flight."""
+    if not eligible:
+        return
+    fails = cur["fails"] + 1
+    c.execute("UPDATE clip_schedules SET state='SCHEDULED',fails=?,next_try_at=?,note=?,"
+              "notified_wait=1,updated_at=? WHERE id=? AND state='ACTIVE'",
+              (fails, now + delay, reason[:200], now, p["id"]))
+    if not cur["notified_wait"]:
+        _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: not recording yet "
+                f"({reason[:150]}). I will keep trying every few minutes until the "
+                "schedule ends and only message you when something starts, ends or is "
+                "missed.", now)
 
 
 def _step_attempt(state_dir, ops: Ops, a, now) -> None:
     user, aid, st = a["username"], a["id"], a["state"]
-    if st == "INTENT":
-        # a launch whose outcome could not be committed: adopt the session
-        # if it is really running under this attempt id, else hold it as
-        # UNCERTAIN. Never relaunch, never assume.
+    if st in ("INTENT", "UNCERTAIN", "UNRESOLVED"):
+        running = ops.running(user, aid)
         with txn(state_dir) as c:
-            if ops.running(user, aid):
-                if _set_attempt(c, aid, ("INTENT",), "LAUNCHED", now,
-                                "adopted after an unrecorded launch", launched_at=now):
+            if running:
+                if st == "INTENT" and _set_attempt(
+                        c, aid, ("INTENT",), "LAUNCHED", now,
+                        "adopted after an unrecorded launch", launched_at=now):
                     _notice(c, a["schedule_id"], f"Schedule #{a['schedule_id']}: {user} "
                             "launched; waiting for the first recorded segment.", now)
-            elif _set_attempt(c, aid, ("INTENT",), "UNCERTAIN", now, "launch outcome lost"):
-                c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,updated_at=? "
-                          "WHERE id=? AND state='ACTIVE'", ("launch outcome lost", now,
-                                                          a["schedule_id"]))
-                _notice(c, a["schedule_id"], f"Schedule #{a['schedule_id']} for {user}: "
-                        "I could not record whether a launch happened; not retrying "
-                        "automatically. Check /sessions; /unschedule cancels.", now)
+                return
+            if ops.writer_active(user):
+                if st == "INTENT" and _set_attempt(c, aid, ("INTENT",), "UNCERTAIN", now,
+                                                   "launch outcome lost; a writer is active"):
+                    c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,"
+                              "updated_at=? WHERE id=? AND state='ACTIVE'",
+                              ("launch outcome lost; a writer is active", now,
+                               a["schedule_id"]))
+                    _notice(c, a["schedule_id"], f"Schedule #{a['schedule_id']} for {user}: "
+                            "I could not record whether a launch happened and something "
+                            "may be writing. On hold until it has been quiet.", now)
+                return
+            # nothing registered and nothing writing: ownership verified gone
+            _set_attempt(c, aid, ("INTENT", "UNCERTAIN", "UNRESOLVED"), "INTERRUPTED", now,
+                         "verified: no owned session and no active writer")
+            for t in _after_attempt(c, a["schedule_id"], now, "verified idle after a lost launch"):
+                _notice(c, a["schedule_id"], t, now)
         return
-    if st == "UNCERTAIN":
-        return      # held until the owner cancels or the process restarts
     running = ops.running(user, aid)
     reason = None
     if a["pstate"] == "CANCELLED":
@@ -521,7 +629,8 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
         if not running:
             with txn(state_dir) as c:
                 _set_attempt(c, aid, ("STOPPING",), "ENDED", now)
-                for t in _after_attempt(c, a["schedule_id"], now, a["stop_by"] or "stopped"):
+                for t in _after_attempt(c, a["schedule_id"], now, a["stop_by"] or "stopped",
+                                        ops.terminal(user, aid)):
                     _notice(c, a["schedule_id"], t, now)
             return
         failed = False
@@ -548,7 +657,7 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
                          f"session ended ({err})" if err != "error" else "session ended")
             for t in _after_attempt(c, a["schedule_id"], now,
                                     "ended before recording" if st == "LAUNCHED"
-                                    else "ended early"):
+                                    else "ended early", ops.terminal(user, aid)):
                 _notice(c, a["schedule_id"], t, now)
         return
     if st == "LAUNCHED":

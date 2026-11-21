@@ -52,6 +52,21 @@ class ClipSession:
         self.clips_finished = 0
         self.phase = "starting"
 
+    @property
+    def terminal_kind(self):
+        """Typed reason the playback worker stopped for good (restricted,
+        challenge, blocked, unauthorized, quality, invalid), 'unauthorized'
+        when recording authorization was revoked mid-run, else None."""
+        w = getattr(self, "_worker", None)
+        if w is None:
+            return None
+        kind = getattr(w, "terminal_kind", None)
+        if kind:
+            return kind
+        if getattr(w, "end_reason", None) == "revoked":
+            return "unauthorized"
+        return None
+
     def start(self) -> None:
         self._thread = threading.Thread(
             target=lambda: asyncio.run(self._run()), daemon=True)
@@ -317,6 +332,7 @@ class ClipSession:
         else:
             worker = RecordingWorker(runner, buf, self.feed, db_path,
                                      sweep_seconds=max(1, self.segment_seconds))
+        self._worker = worker
         detector = CandidateDetector(self.ffmpeg, buf, db_path)
         clipper = AutoClipper(buf, db_path, HeuristicProvider(),
                               self.ffmpeg, str(work),

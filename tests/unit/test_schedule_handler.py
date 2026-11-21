@@ -121,7 +121,7 @@ class LoopTests(Base):
         self.assertEqual(ss._sessions, {})
         self.assertEqual(len(sent), 1)                      # one message, not one per try
         self.assertEqual(sent[0][0], 12345)
-        self.assertIn("not recording yet", sent[0][1])
+        self.assertIn("not authorized", sent[0][1])
         self.assertEqual(sched.pending_notices(self.dir), [])
         self.assertEqual([r[0] for r in self.rows("SELECT state FROM schedule_attempts")], ["NOT_STARTED"])
 
@@ -251,9 +251,124 @@ class BindingTests(Base):
     def test_not_started_when_authorization_off(self):
         self.cmd("/addsource ishowspeed")
         kind, reply = ss.start_scheduled(self.dir, "ishowspeed", "ff", "fp", "e" * 32)
-        self.assertEqual(kind, "not_started")
+        self.assertEqual(kind, "unauthorized")
         self.assertIn("not authorized", reply)
         self.assertEqual(ss._sessions, {})
+
+
+class OwnershipRegistryTests(Base):
+    def _tl(self, aid):
+        ss._tl.attempt, ss._tl.started, ss._tl.refusal = aid, False, None
+        self.addCleanup(lambda: setattr(ss._tl, "attempt", None))
+
+    def test_registered_before_start_and_raise_policy(self):
+        self.cmd("/addsource ishowspeed")
+        (self.dir / "feeds").mkdir()
+        (self.dir / "feeds" / "ishowspeed.url").write_text("https://relay.example/x.m3u8")
+        seen = {}
+
+        class Dead(_Fake):
+            def __init__(self, *a, **k):
+                super().__init__(None)
+
+            def start(self):
+                seen["registered"] = ss._sessions.get("ishowspeed") is self
+                raise RuntimeError("thread start failed")
+
+            def alive(self):
+                return False
+        self._tl("a" * 32)
+        with mock.patch.object(ss, "validate_feed", lambda f, d: f):
+            with self.assertRaises(RuntimeError):
+                ss.startclip_reply(self.dir, "ishowspeed", "ff", "fp", session_factory=Dead)
+        self.assertTrue(seen["registered"])                  # tracked BEFORE the effect
+        self.assertNotIn("ishowspeed", ss._sessions)         # dead start holds nothing
+
+        class Live(Dead):
+            def start(self):
+                seen["live_registered"] = ss._sessions.get("ishowspeed") is self
+                raise RuntimeError("raised after the thread started")
+
+            def alive(self):
+                return True
+        self._tl("b" * 32)
+        with mock.patch.object(ss, "validate_feed", lambda f, d: f):
+            with self.assertRaises(RuntimeError):
+                ss.startclip_reply(self.dir, "ishowspeed", "ff", "fp", session_factory=Live)
+        self.assertTrue(seen["live_registered"])
+        self.assertTrue(ss.session_running("ishowspeed", "b" * 32))   # adoptable, still owned
+        self.assertFalse(ss._tl.started)
+
+    def test_stopclip_during_reservation_cancels_and_does_not_retry(self):
+        from app.bot import source_auth
+        self.cmd("/addsource ishowspeed")
+        source_auth.set_scope(self.dir, "ishowspeed", "record", True)
+        now = time.time()
+        sid = sched.add(self.dir, "ishowspeed", now - 100, None, now=now - 200,
+                        day_end=now + 86400)
+        calls = []
+
+        def resolve(username, authorized, should_stop=None, **k):
+            calls.append(username)
+            ss.stopclip_reply(self.dir)          # /stopclip arrives during preflight
+            return {"x": 1}
+        ops = sched.Ops(
+            start=lambda u, a: ss.start_scheduled(self.dir, u, "ff", "fp", a, resolve_fn=resolve),
+            stop=ss.stop_session, running=ss.session_running, alive=ss.session_alive,
+            stopping=ss.session_stopping, confirm=lambda a: False, error=ss.session_error,
+            terminal=ss.session_terminal)
+        sched.tick(self.dir, ops, now=now)
+        self.assertEqual(self.rows("SELECT state FROM clip_schedules")[0][0], "CANCELLED")
+        for k in range(1, 6):
+            sched.tick(self.dir, ops, now=now + 400 * k)
+        self.assertEqual(len(calls), 1)          # no second resolve
+        self.assertEqual(ss._sessions, {})
+
+    def test_worker_and_session_expose_typed_terminal(self):
+        from app.recording.playback_worker import PlaybackWorker
+        from app.pipeline.session import ClipSession
+        w = PlaybackWorker.__new__(PlaybackWorker)
+        w.captured_segments = 0
+        for kind in ("restricted", "challenge", "blocked", "unauthorized", "quality", "invalid"):
+            w.terminal_kind = None
+            with self.assertRaises(RuntimeError):
+                w._refused(kind)
+            self.assertEqual(w.terminal_kind, kind)
+        w.terminal_kind = None
+        with self.assertRaises(RuntimeError):
+            w._refused("offline")
+        self.assertIsNone(w.terminal_kind)               # offline stays retryable
+        cs = ClipSession("ff", "fp", "", "ishowspeed", self.dir, playback={})
+        self.assertIsNone(cs.terminal_kind)
+        cs._worker = types.SimpleNamespace(terminal_kind=None, end_reason="revoked")
+        self.assertEqual(cs.terminal_kind, "unauthorized")
+        cs._worker = types.SimpleNamespace(terminal_kind="challenge", end_reason="failed")
+        self.assertEqual(cs.terminal_kind, "challenge")
+        ss._sessions["ishowspeed"] = cs
+        cs._sched_token = "t" * 32
+        self.assertEqual(ss.session_terminal("ishowspeed", "t" * 32), "challenge")
+        self.assertEqual(ss.session_terminal("ishowspeed", "u" * 32), "")
+
+
+class WriterActiveTests(Base):
+    def test_recent_file_and_orphan_process_both_count(self):
+        import os, subprocess, sys
+        work = self.dir / "sessions" / "ishowspeed"
+        work.mkdir(parents=True)
+        self.assertFalse(ss.writer_active(self.dir, "ishowspeed"))
+        f = work / "seg.ts"
+        f.write_bytes(b"x")
+        self.assertTrue(ss.writer_active(self.dir, "ishowspeed"))
+        old = time.time() - 600
+        os.utime(f, (old, old))
+        self.assertFalse(ss.writer_active(self.dir, "ishowspeed"))
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", str(work / "out.ts")])
+        try:
+            time.sleep(0.3)
+            self.assertTrue(ss.writer_active(self.dir, "ishowspeed"))    # orphan child by cmdline
+        finally:
+            p.kill(); p.wait()
+        self.assertFalse(ss.writer_active(self.dir, "ishowspeed"))
 
 
 if __name__ == "__main__":

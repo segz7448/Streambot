@@ -200,7 +200,11 @@ class PlaybackWorker:
                 return True
         return False
 
+    terminal_kind = None      # typed reason for a terminal refusal (read by the scheduler)
+
     def _refused(self, kind: str) -> str:
+        if kind in TERMINAL:
+            self.terminal_kind = kind
         if kind == "offline":
             if self.captured_segments:
                 return "ended"

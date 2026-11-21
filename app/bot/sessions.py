@@ -60,21 +60,67 @@ def _launched() -> None:
 
 
 def start_scheduled(state_dir: Path, username: str, ffmpeg: str,
-                    ffprobe: str, attempt_id: str) -> tuple[str, str]:
+                    ffprobe: str, attempt_id: str,
+                    resolve_fn=None) -> tuple[str, str]:
     """Scheduler launch for an already-committed attempt id. Uses the
     broadcaster-authorized feed when registered, else public playback,
     which refuses unless record auth is ON for this source (default OFF).
-    ('started', reply) only when a session thread was launched;
-    ('not_started', reason) is definitive. An exception means unknown."""
-    _tl.attempt, _tl.started = attempt_id, False
+    Kinds: 'started' (a session thread was launched and is registered under
+    the attempt id), 'not_started' (definitive, retryable, e.g. offline),
+    'unauthorized' (owner has not enabled recording; backs off, no network),
+    'blocked' (Twitch restricted / challenged / throttled: never retried).
+    An exception means unknown; the registry then tells what is running."""
+    _tl.attempt, _tl.started, _tl.refusal = attempt_id, False, None
     try:
         if _feed_for(state_dir, username) is not None:
             reply = startclip_reply(state_dir, username, ffmpeg, ffprobe)
         else:
-            reply = startplayback_reply(state_dir, username, ffmpeg, ffprobe)
-        return ("started" if _tl.started else "not_started"), reply
+            reply = startplayback_reply(state_dir, username, ffmpeg, ffprobe,
+                                        resolve_fn=resolve_fn)
+        if _tl.started:
+            return "started", reply
+        if _tl.refusal in ("restricted", "challenge", "blocked", "quality", "invalid"):
+            return "blocked", reply
+        if _tl.refusal == "unauthorized":
+            return "unauthorized", reply
+        return "not_started", reply
     finally:
-        _tl.attempt, _tl.started = None, False
+        _tl.attempt, _tl.started, _tl.refusal = None, False, None
+
+
+def writer_active(state_dir: Path, username: str, quiet_s: float = 90.0) -> bool:
+    """Best effort check that nothing is still writing for this streamer:
+    True if a file in its session directory changed within quiet_s, or a
+    process (not this one) has that directory in its command line (an
+    orphan recorder from an earlier run). Unreadable /proc falls back to
+    modification times only."""
+    import os
+    import time
+    work = Path(state_dir) / "sessions" / username
+    now = time.time()
+    for root, _dirs, files in os.walk(work):
+        for f in files:
+            try:
+                if now - os.stat(os.path.join(root, f)).st_mtime < quiet_s:
+                    return True
+            except OSError:
+                continue
+    me = str(os.getpid())
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    needle = str(work).encode()
+    for pid in pids:
+        if not pid.isdigit() or pid == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                if needle in fh.read():
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def _match(username: str, attempt_id):
@@ -118,6 +164,25 @@ def stop_session(username: str, attempt_id) -> bool:
             s.stop()
             return True
     return False
+
+
+def _discard_failed_start(username: str, session) -> None:
+    """start() raised (lock held by the caller). A session that is not
+    running holds nothing; one that somehow is stays registered so its
+    slot and exact object remain owned and adoptable."""
+    try:
+        alive = session.alive()
+    except Exception:
+        alive = True
+    if not alive and _sessions.get(username) is session:
+        del _sessions[username]
+
+
+def session_terminal(username: str, attempt_id) -> str:
+    """Typed terminal reason of the exact session ('' when none/unknown)."""
+    with _lock:
+        s = _match(username, attempt_id)
+        return (getattr(s, "terminal_kind", None) or "") if s is not None else ""
 
 
 def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
@@ -170,9 +235,13 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
         session = session_factory(ffmpeg, ffprobe, feed, username,
                                   state_dir)
         _bind(session)
-        session.start()
+        _sessions[username] = session      # tracked BEFORE any effect
+        try:
+            session.start()
+        except BaseException:
+            _discard_failed_start(username, session)
+            raise
         _launched()
-        _sessions[username] = session
     return (f"Clipping session started for {username} from its "
             "registered feed: recording, detecting and clipping now. "
             "Clips are HELD for your review - /deliveries flush sends "
@@ -269,10 +338,12 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
     if row is None:
         return f"{username} is not registered. Use /addsource first."
     if not source_auth.allowed(state_dir, username, "record"):
+        _tl.refusal = "unauthorized"
         return (f"Recording is not authorized for {username} (default OFF). "
                 f"Nothing started. Only with the streamer's permission: "
                 f"/sourceauth {username} record on")
     res = _Reservation()
+    res._sched_token = getattr(_tl, "attempt", None)
     with _lock:
         existing = _sessions.get(username)
         if existing is not None and (not existing._stopping.is_set()
@@ -294,6 +365,7 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
             **(hooks or {}))
     except tp.PlaybackRefused as exc:
         release()
+        _tl.refusal = exc.kind
         why = {"offline": "the channel is offline or unknown",
                "restricted": "Twitch restricted access",
                "challenge": "Twitch presented a challenge (not bypassed)",
@@ -320,10 +392,14 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
                 session = session_factory(ffmpeg, ffprobe, "", username,
                                           state_dir, playback=pb)
                 _bind(session)
-                session.start()
-                _launched()
                 res._released = True
-                _sessions[username] = session
+                _sessions[username] = session  # tracked BEFORE any effect
+                try:
+                    session.start()
+                except BaseException:
+                    _discard_failed_start(username, session)
+                    raise
+                _launched()
         if msg is not None:
             release()
             return msg

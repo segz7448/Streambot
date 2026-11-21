@@ -426,6 +426,7 @@ class BotService:
         from ..clipping.retrospective import validate_recording
         from ..core import schedule as _sched
         from . import sessions as _sess
+        from . import source_auth as _auth
         from . import media as _m
         sd = self._state_dir()
         ff, fp = _m.ffmpeg_paths()
@@ -441,7 +442,10 @@ class BotService:
             stop=_sess.stop_session, running=_sess.session_running,
             alive=_sess.session_alive, stopping=_sess.session_stopping,
             confirm=lambda a: _sched.confirm_recording(sd, a, valid),
-            error=_sess.session_error)
+            error=_sess.session_error,
+            writer_active=lambda u: _sess.writer_active(sd, u),
+            terminal=_sess.session_terminal,
+            record_allowed=lambda u: _auth.allowed(sd, u, "record"))
         while True:
             try:
                 await self._blocking(_sched.tick, sd, ops)
@@ -514,7 +518,10 @@ class BotService:
             log.warning("marked %d crashed session(s) INTERRUPTED",
                         recovered)
         from ..core import schedule as _schedmod
-        _n = _schedmod.reconcile(self._state_dir())
+        from . import sessions as _s2
+        _n = _schedmod.reconcile(
+            self._state_dir(),
+            writer_active=lambda u: _s2.writer_active(self._state_dir(), u))
         if _n:
             log.warning("ended %d interrupted schedule window(s) MISSED", _n)
         from . import handoff as _handoff
