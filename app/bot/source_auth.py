@@ -103,7 +103,9 @@ def sourceauth_reply(state_dir, args: str) -> str:
         ("record", False): "Capture is off. A running playback session is told to "
                            "stop at its next authorization check (not instant).",
         ("repost", True): "Playback clips from this streamer may now be queued for "
-                          "YouTube (private upload, existing daily cap).",
+                          "YouTube (private upload, existing daily cap). Only clips whose "
+                          "publish was refused earlier are re-queued; clips made while "
+                          "repost was off were never queued and are NOT backfilled.",
         ("repost", False): "Repost is off: any later publish attempt for this "
                            "streamer's playback clips (automatic, queued or manual) "
                            "is refused. Work already reserved or in flight may still start or "

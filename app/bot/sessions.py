@@ -128,15 +128,32 @@ def sessions_reply(state_dir: Path) -> str:
     return "\n".join(out) if out else "No clipping sessions yet."
 
 
+class _Reservation:
+    """Placeholder owning the username while a start is in flight (resolve
+    runs outside the lock). Looks like a running session to every other
+    start; /stopclip cancels it."""
+    def __init__(self):
+        self._stopping = threading.Event()
+        self.error = None
+        self.clips_finished = 0
+
+    def stop(self):
+        self._stopping.set()
+
+    def alive(self):
+        return False
+
+
 def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
                         ffprobe: str, session_factory=ClipSession,
                         resolve_fn=None, hooks: dict | None = None) -> str:
     """/startplayback <user>: capture a streamer's PUBLIC live playback.
-    Requires a registered source AND record authorization (default OFF).
-    Resolves once up front and refuses an offline or restricted channel, so
-    nothing pretends to record. The reply always states the repost status:
-    clips stay HELD for the owner and cannot be published unless repost is
-    separately authorized."""
+    Requires a registered source and record authorization (default OFF).
+    The username is reserved under the lock BEFORE the up-front resolve, and
+    the reservation, record permission and cancellation are rechecked before
+    launching, so starts cannot overlap or replace another session. The reply
+    says the session is STARTING (not yet confirmed recording); /sessions
+    shows its durable state."""
     from . import source_auth
     from ..ingestion import twitch_playback as tp
     username = username.strip().lstrip("@").lower()
@@ -151,16 +168,24 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
         return (f"Recording is not authorized for {username} (default OFF). "
                 f"Nothing started. Only with the streamer's permission: "
                 f"/sourceauth {username} record on")
+    res = _Reservation()
     with _lock:
         existing = _sessions.get(username)
         if existing is not None and (not existing._stopping.is_set()
                                      or existing.alive()):
-            return (f"A session for {username} is already running or "
-                    "still finalizing. Nothing was started.")
+            return (f"A session for {username} is already running, starting "
+                    "or finalizing. Nothing was started.")
+        _sessions[username] = res
+
+    def release():
+        with _lock:
+            if _sessions.get(username) is res:
+                del _sessions[username]
     try:
         resolved = (resolve_fn or tp.resolve)(
             username, authorized=True, **(hooks or {}))
     except tp.PlaybackRefused as exc:
+        release()
         why = {"offline": "the channel is offline or unknown",
                "restricted": "Twitch restricted access",
                "challenge": "Twitch presented a challenge (not bypassed)",
@@ -168,19 +193,35 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
                "quality": "no variant within the quality cap"}.get(
                    exc.kind, f"playback unavailable ({exc.kind})")
         return f"Not started: {why}. Nothing is recording."
-    repost = source_auth.allowed(state_dir, username, "repost")
+    except BaseException:
+        release()
+        raise
     pb = {"initial_resolved": resolved}
     pb.update({k: v for k, v in (hooks or {}).items()
                if k in ("opener", "host_ok")})
-    with _lock:
-        session = session_factory(ffmpeg, ffprobe, "", username, state_dir,
-                                  playback=pb)
-        session.start()
-        _sessions[username] = session
-    return (f"Playback capture started for {username}. Clips are HELD for "
-            "you only. Repost to YouTube is "
+    try:
+        with _lock:
+            if _sessions.get(username) is not res or res._stopping.is_set():
+                return ("Start cancelled before launch (a stop arrived or the "
+                        "slot changed). Nothing is recording.")
+            if not source_auth.allowed(state_dir, username, "record"):
+                del _sessions[username]
+                return (f"Recording authorization for {username} was turned "
+                        "off during startup. Nothing is recording.")
+            session = session_factory(ffmpeg, ffprobe, "", username,
+                                      state_dir, playback=pb)
+            session.start()
+            _sessions[username] = session
+    except BaseException:
+        release()
+        raise
+    repost = source_auth.allowed(state_dir, username, "repost")
+    return (f"Playback capture for {username} is STARTING (not yet confirmed "
+            "recording; /sessions shows its state). Clips are HELD for you "
+            "only. Repost to YouTube is "
             + ("ON for this streamer." if repost else
-               "OFF: playback clips cannot be published until "
-               f"/sourceauth {username} repost on (needs the streamer's "
-               "permission).")
+               "OFF: playback clips cannot be published, and clips made "
+               "while it is off are NOT queued and NOT backfilled if you "
+               f"turn it on later (/sourceauth {username} repost on, only "
+               "with the streamer's permission).")
             + " /stopclip ends the session.")

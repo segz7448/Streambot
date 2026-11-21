@@ -32,8 +32,8 @@ def make_fixture(d):
 
 
 class Endpoint:
-    def __init__(self, d, live: bool, token_status=200, usher_status=200):
-        self.d, self.live = d, live
+    def __init__(self, d, live: bool, token_status=200, usher_status=200, junk=False):
+        self.d, self.live, self.junk = d, live, junk
         self.token_status, self.usher_status = token_status, usher_status
         ep = self
         self.hits = []
@@ -69,7 +69,8 @@ class Endpoint:
                         txt = "\n".join(l for l in txt.splitlines() if l != "#EXT-X-ENDLIST") + "\n"
                     self._send(200, txt.encode())
                 elif path.startswith("/media/") and (ep.d / path[7:]).exists():
-                    self._send(200, (ep.d / path[7:]).read_bytes())
+                    self._send(200, b"\x00not mpegts at all\xff" * 500 if ep.junk
+                               else (ep.d / path[7:]).read_bytes())
                 else:
                     self._send(404, b"")
         self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -184,10 +185,10 @@ class FakeCtx:
 
 class FakeBuf:
     session_id = 9
-    def __init__(self, d): self.d = d
+    def __init__(self, d): self.d, self.n = d, 0
     def reconcile(self, db): return 0
     def enforce_storage_cap(self): pass
-    def next_seq(self): return 0
+    def next_seq(self): return self.n
     def segmenter_output_args(self, n=0): return ["x"]
 
 
@@ -196,8 +197,17 @@ class WorkerPolicy(Base):
         source_auth.set_scope(self.sd, "streamerx", "record", True)
         kw.setdefault("resolve_interval", 0.0); kw.setdefault("reconnect_base_seconds", 0.01)
         kw.setdefault("auth_poll_seconds", 0.0)
-        return PlaybackWorker(FakeBuf(self.sd), "streamerx", str(self.sd / "nova.db"), self.sd,
-                              "ffmpeg", resolve_fn=resolve, capture_fn=capture, **kw)
+        buf = FakeBuf(self.sd)
+        def cap(*a, **k):
+            r = capture(*a, **k)
+            buf.n += getattr(r, "segments", 0)       # a real capture writes segment files
+            if not isinstance(r.ffmpeg_rc, int):
+                r.ffmpeg_rc = 0
+            return r
+        w = PlaybackWorker(buf, "streamerx", str(self.sd / "nova.db"), self.sd,
+                           "ffmpeg", resolve_fn=resolve,
+                           capture_fn=cap if capture else None, **kw)
+        return w
 
     def run_w(self, w):
         return asyncio.run(w.run(FakeCtx()))
@@ -254,6 +264,135 @@ class WorkerPolicy(Base):
         self.assertEqual((w.end_reason, len(calls)), ("revoked", 1))
 
 
+class Lifecycle(Base):
+    def test_invalid_mpegts_with_ffmpeg_rc1_is_not_success(self):
+        self.endpoint(live=False, junk=True)
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        s = self.new_session(resolve_interval=0.0, reconnect_base_seconds=0.01, max_reconnects=1)
+        s.start(); s.join(90)
+        self.assertEqual(self.session_row()[1], "INTERRUPTED")
+        self.assertIsNotNone(s.error)
+        n = json.loads(self.session_row()[3])
+        self.assertEqual(n["end_reason"], "failed")
+
+    def test_unexpected_capture_oserror_is_terminal_failure_with_finished_set(self):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        def cap(*a, **k): raise OSError("disk exploded https://x/?sig=SECRETSIG")
+        w = PlaybackWorker(FakeBuf(self.sd), "streamerx", str(self.sd / "nova.db"), self.sd, "ffmpeg",
+                           initial_resolved=object(), capture_fn=cap, resolve_interval=0.0)
+        with self.assertRaises(RuntimeError) as c:
+            asyncio.run(w.run(FakeCtx()))
+        self.assertTrue(w.finished)
+        self.assertEqual(w.end_reason, "failed")
+        self.assertNotIn("SECRET", str(c.exception) + repr(w.error_text))
+        self.assertIn("OSError", w.error_text)
+
+    def test_setup_reconcile_failure_is_terminal_not_clean(self):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        b = FakeBuf(self.sd)
+        def boom(db): raise sqlite3.OperationalError("locked")
+        b.reconcile = boom
+        w = PlaybackWorker(b, "streamerx", str(self.sd / "nova.db"), self.sd, "ffmpeg",
+                           capture_fn=lambda *a, **k: None)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(w.run(FakeCtx()))
+        self.assertTrue(w.finished)
+        self.assertEqual(w.end_reason, "failed")
+
+    def test_cancel_drains_capture_thread_before_finished(self):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        state = {"in": threading.Event(), "out": threading.Event()}
+        def cap(*a, should_stop=None, **k):
+            state["in"].set()
+            while not should_stop():
+                time.sleep(0.05)
+            time.sleep(0.5)                      # slow to wind down
+            state["out"].set()
+            return mock.Mock(reason="stopped", segments=0, ffmpeg_rc=0)
+        w = PlaybackWorker(FakeBuf(self.sd), "streamerx", str(self.sd / "nova.db"), self.sd, "ffmpeg",
+                           initial_resolved=object(), capture_fn=cap, resolve_interval=0.0,
+                           auth_poll_seconds=0.0)
+
+        async def go():
+            t = asyncio.create_task(w.run(FakeCtx()))
+            while not state["in"].is_set():
+                await asyncio.sleep(0.05)
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            return state["out"].is_set(), w.finished
+        thread_done, finished = asyncio.run(go())
+        self.assertTrue(thread_done)             # capture thread drained before return
+        self.assertTrue(finished)
+
+
+class StartRaces(Base):
+    def setUp(self):
+        super().setUp()
+        bot_sessions._sessions.clear()
+        with closing(sqlite3.connect(str(self.sd / "nova.db"))) as c, c:
+            n = time.time()
+            c.execute("INSERT INTO twitch_sources (username,created_at,updated_at) VALUES ('streamerx',?,?)", (n, n))
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        self.started = []
+        outer = self
+        class F:
+            def __init__(s, *a, **k): s._stopping = threading.Event(); s.error = None; s.clips_finished = 0
+            def start(s): outer.started.append(s)
+            def alive(s): return False
+            def stop(s): s._stopping.set()
+        self.F = F
+
+    def start(self, resolve):
+        return bot_sessions.startplayback_reply(self.sd, "streamerx", "ffmpeg", "ffprobe",
+                                                session_factory=self.F, resolve_fn=resolve)
+
+    def test_concurrent_starts_only_one_launches_and_is_tracked(self):
+        gate = threading.Event()
+        def slow(*a, **k):
+            gate.wait(5); return object()
+        outs = []
+        t1 = threading.Thread(target=lambda: outs.append(self.start(slow))); t1.start()
+        time.sleep(0.3)
+        second = self.start(slow)                       # while the first is resolving
+        self.assertIn("already running, starting", second)
+        gate.set(); t1.join(10)
+        self.assertEqual(len(self.started), 1)
+        self.assertIs(bot_sessions._sessions["streamerx"], self.started[0])
+        self.assertIn("STARTING", outs[0])
+        bot_sessions.stopclip_reply(self.sd)
+        self.assertTrue(self.started[0]._stopping.is_set())    # stop reaches the tracked session
+
+    def test_stop_during_resolve_cancels_launch(self):
+        gate = threading.Event()
+        def slow(*a, **k):
+            gate.wait(5); return object()
+        outs = []
+        t1 = threading.Thread(target=lambda: outs.append(self.start(slow))); t1.start()
+        time.sleep(0.3)
+        self.assertIn("Stopping 1", bot_sessions.stopclip_reply(self.sd))
+        gate.set(); t1.join(10)
+        self.assertEqual(self.started, [])
+        self.assertIn("cancelled", outs[0])
+
+    def test_record_revoked_during_resolve_aborts_and_frees_slot(self):
+        def revoke(*a, **k):
+            source_auth.set_scope(self.sd, "streamerx", "record", False)
+            return object()
+        out = self.start(revoke)
+        self.assertIn("turned off during startup", out)
+        self.assertEqual(self.started, [])
+        self.assertNotIn("streamerx", bot_sessions._sessions)
+
+    def test_resolve_exception_frees_slot(self):
+        def bad(*a, **k): raise ValueError("x")
+        with self.assertRaises(ValueError):
+            self.start(bad)
+        self.assertNotIn("streamerx", bot_sessions._sessions)
+
+
 class StartPlayback(Base):
     def reply(self, user, resolve=None, **kw):
         started = []
@@ -280,7 +419,8 @@ class StartPlayback(Base):
         out, st = self.reply("streamerx", off); self.assertIn("offline", out); self.assertEqual(st, [])
         out, st = self.reply("streamerx", lambda *a, **k: object())
         self.assertEqual(len(st), 1)
-        self.assertIn("Repost to YouTube is OFF", out)
+        self.assertIn("STARTING", out)
+        self.assertIn("Repost to YouTube is OFF", out); self.assertIn("NOT backfilled", out)
         self.assertIn("HELD", out)
         source_auth.set_scope(self.sd, "streamerx", "repost", True)
         bot_sessions._sessions.clear()

@@ -102,6 +102,7 @@ class PlaybackWorker:
         if not self._recheck():
             return "revoked"
         self.cycles += 1
+        seq_before = self.buffer.next_seq()
         try:
             res = self.capture_fn(
                 resolved, self.ffmpeg, "", max_media_seconds=self.cycle_media,
@@ -110,11 +111,22 @@ class PlaybackWorker:
                 output_args=self.buffer.segmenter_output_args(self.buffer.next_seq()))
         except tp.PlaybackRefused as e:
             return self._refused(e.kind)
-        self.captured_segments += res.segments
+        seq_after = self.buffer.next_seq()
+        wrote = seq_after > seq_before
+        self.captured_segments += res.segments if wrote else 0
         log.info("playback cycle %d channel=%s reason=%s segments=%d",
                  self.cycles, self.channel, res.reason, res.segments)
         if res.reason == "stopped":
             return "revoked" if not self.record_ok() else "stopped"
+        # success needs real evidence: ffmpeg exited 0 AND new segment files
+        # exist when media was fed; otherwise it is a failed cycle (retry,
+        # bounded), never a clean end
+        ok_exit = res.ffmpeg_rc == 0
+        if res.reason in ("ended", "media_cap", "deadline") and \
+                (not ok_exit or (res.segments > 0 and not wrote)):
+            log.warning("playback cycle %d: ffmpeg rc=%s wrote=%s; failed cycle",
+                        self.cycles, res.ffmpeg_rc, wrote)
+            return "retry"
         if res.reason == "ended":
             return "ended"
         if res.reason in ("media_cap", "deadline"):
@@ -132,48 +144,73 @@ class PlaybackWorker:
 
     # -- service entry -------------------------------------------------
     async def run(self, ctx) -> None:
-        reconciled = self.buffer.reconcile(self.db_path)
-        if reconciled:
-            log.info("reconciled %d on-disk segments", reconciled)
+        """Owns its blocking capture thread: on cancel, stop and DRAIN it
+        before finished is set; any unexpected error is a terminal failure
+        with guaranteed cleanup (finished is always set, never left as a
+        clean-looking not_started)."""
+        self._stop_req = False
+        task = None
         try:
-            while not ctx.stopping:
-                ctx.heartbeat()
-                t0 = time.monotonic()
-                task = asyncio.create_task(asyncio.to_thread(
-                    self._cycle, lambda: ctx.stopping))
-                while not task.done():
+            try:
+                reconciled = self.buffer.reconcile(self.db_path)
+                if reconciled:
+                    log.info("reconciled %d on-disk segments", reconciled)
+                stop = lambda: ctx.stopping or self._stop_req
+                while not stop():
                     ctx.heartbeat()
-                    self.buffer.enforce_storage_cap()
-                    await asyncio.wait({task}, timeout=1.0)
-                outcome = task.result()      # RuntimeError propagates (terminal)
-                if outcome in ("ended", "stopped", "revoked"):
-                    self.end_reason = outcome
-                    return
-                if outcome == "continue":
-                    # fresh token; keep resolve spacing within the rate bound
-                    self.gap_seconds += self.resolve_interval
-                    await self._wait(ctx, self.resolve_interval)
-                    continue
-                # retry: bounded backoff + cumulative gap
-                self.reconnects += 1
-                if self.reconnects > self.max_reconnects:
-                    raise RuntimeError(
-                        f"playback unstable: {self.max_reconnects} reconnects exhausted")
-                delay = max(min(60.0, self.reconnect_base * 2 ** (self.reconnects - 1)),
-                            self.resolve_interval)
-                self.gap_seconds += delay
-                if self.gap_seconds > self.max_gap:
-                    raise RuntimeError("playback unstable: cumulative reconnect gap exceeded")
-                await self._wait(ctx, delay)
-            self.end_reason = "stopped"
-        except RuntimeError as exc:
-            self.end_reason = "failed"
-            self.error_text = str(exc)
-            raise
+                    task = asyncio.create_task(asyncio.to_thread(self._cycle, stop))
+                    while not task.done():
+                        ctx.heartbeat()
+                        self.buffer.enforce_storage_cap()
+                        await asyncio.wait({task}, timeout=1.0)
+                    outcome = task.result()   # RuntimeError/OSError propagate
+                    task = None
+                    if outcome in ("ended", "stopped", "revoked"):
+                        self.end_reason = outcome
+                        return
+                    if outcome == "continue":
+                        self.gap_seconds += self.resolve_interval
+                        await self._wait(ctx, self.resolve_interval)
+                        continue
+                    self.reconnects += 1
+                    if self.reconnects > self.max_reconnects:
+                        raise RuntimeError(
+                            f"playback unstable: {self.max_reconnects} reconnects exhausted")
+                    delay = max(min(60.0, self.reconnect_base * 2 ** (self.reconnects - 1)),
+                                self.resolve_interval)
+                    self.gap_seconds += delay
+                    if self.gap_seconds > self.max_gap:
+                        raise RuntimeError("playback unstable: cumulative reconnect gap exceeded")
+                    await self._wait(ctx, delay)
+                self.end_reason = "stopped"
+            except asyncio.CancelledError:
+                self.end_reason = "stopped"
+                raise
+            except Exception as exc:
+                self.end_reason = "failed"
+                self.error_text = (str(exc) if isinstance(exc, RuntimeError)
+                                   else f"playback worker error: {type(exc).__name__}")
+                raise RuntimeError(self.error_text) from None
         finally:
-            self.finished = True
-            self.buffer.enforce_storage_cap()
-            self.buffer.reconcile(self.db_path)
+            self._stop_req = True
+            if task is not None:
+                # drain the owned capture thread (bounded) before declaring done
+                deadline = time.monotonic() + 60.0
+                while not task.done() and time.monotonic() < deadline:
+                    await asyncio.wait({task}, timeout=0.5)
+                if not task.done():
+                    self.end_reason = "failed"
+                    self.error_text = "capture thread did not stop in time"
+                else:
+                    task.exception() if not task.cancelled() else None
+            try:
+                self.buffer.enforce_storage_cap()
+                self.buffer.reconcile(self.db_path)
+            except Exception as exc:
+                if self.end_reason != "failed":
+                    self.end_reason = "failed"
+                    self.error_text = f"finalize error: {type(exc).__name__}"
+            self.finished = task is None or task.done()
             log.info("playback stopped session=%s reason=%s segments=%d",
                      self.session_name, self.end_reason, self.captured_segments)
 

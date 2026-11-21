@@ -279,7 +279,7 @@ class ClipSession:
                 if self.playback is not None and getattr(worker, "finished", False):
                     # the Supervisor swallows service crashes and idles until
                     # stopped, so the playback worker reports its own end
-                    if worker.end_reason == "failed":
+                    if worker.end_reason in ("failed", "not_started"):
                         raise RuntimeError(worker.error_text or "playback failed")
                     break
                 if task.done():
