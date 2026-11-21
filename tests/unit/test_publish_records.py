@@ -76,17 +76,40 @@ class PublishRecordsTests(unittest.TestCase):
 
     def _start_holder(self):
         from tests.process_helpers import track_children
+        from tests.proc_workers import spawn_ready
         track_children(self)
         root = str(Path(__file__).resolve().parents[2])
-        proc = subprocess.Popen(
+        proc = spawn_ready(
             [sys.executable, '-m', 'tests.proc_workers', 'hold', str(self.d)],
-            cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True)
-        line = proc.stdout.readline()
-        if line.strip() != 'READY':
-            proc.kill()
-            self.fail('holder did not become ready: ' + proc.stderr.read())
+            root, timeout=30)
+        self.assertEqual(pr.get(self.d, 1)['state'], 'RESERVED')
         return proc
+
+    def test_stalled_or_wrong_worker_is_killed_and_reaped(self):
+        from tests.proc_workers import spawn_ready
+        root = str(Path(__file__).resolve().parents[2])
+        made = []
+        real = subprocess.Popen
+
+        def tracking(*a, **k):
+            proc = real(*a, **k)
+            made.append(proc)
+            return proc
+        cases = [
+            ([sys.executable, '-c', 'import time; time.sleep(60)'], 'timed out'),
+            ([sys.executable, '-c', 'print("NOPE", flush=True); import time; time.sleep(60)'], 'unexpected'),
+            ([sys.executable, '-c', 'raise SystemExit(3)'], 'exited'),
+        ]
+        from unittest import mock
+        with mock.patch('subprocess.Popen', side_effect=tracking):
+            for argv, word in cases:
+                with self.assertRaises(AssertionError) as cm:
+                    spawn_ready(argv, root, timeout=1.0)
+                self.assertIn(word, str(cm.exception))
+        self.assertEqual(len(made), 3)
+        for proc in made:
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(proc.stdout.closed and proc.stdin.closed and proc.stderr.closed)
 
     def test_process_recovery_cannot_invalidate_live_uploader(self):
         proc = self._start_holder()
@@ -96,7 +119,7 @@ class PublishRecordsTests(unittest.TestCase):
                 with pr.ClipLease(self.d, 1):
                     self.fail('duplicate worker acquired live lease')
         finally:
-            proc.stdin.write('go\n')
+            proc.stdin.write(b'go\n')
             proc.stdin.flush()
             proc.stdin.close()
             try:
