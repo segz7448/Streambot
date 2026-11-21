@@ -11,7 +11,12 @@ class ServiceLoggingTest(unittest.TestCase):
     def setUp(self):
         import sys
         nl._SERVICE_HANDLERS = None
+        import threading
+        self._thook = threading.excepthook
         self._hook, self._lr = sys.excepthook, logging.lastResort
+        self._child = logging.getLogger("telegram.ext.Updater")
+        self._child_state = (list(self._child.handlers),
+                             self._child.propagate)
         self._saved = {n: (list(logging.getLogger(n).handlers),
                            logging.getLogger(n).level,
                            logging.getLogger(n).propagate)
@@ -27,6 +32,9 @@ class ServiceLoggingTest(unittest.TestCase):
             lg.setLevel(lvl)
             lg.propagate = prop
         nl._SERVICE_HANDLERS = None
+        import threading
+        threading.excepthook = self._thook
+        self._child.handlers, self._child.propagate = self._child_state
         sys.excepthook, logging.lastResort = self._hook, self._lr
 
     def test_writes_info_and_framework_records_redacted(self):
@@ -148,6 +156,59 @@ class ServiceLoggingTest(unittest.TestCase):
             # retry on a good dir works and does not duplicate
             nl.setup_service_logging(os.path.join(d, "logs"))
             self.assertEqual(len(logging.getLogger("nova").handlers), 2)
+
+    def test_framework_child_handler_thread_hook_and_malformed_format(self):
+        import io
+        import sys
+        import threading
+        leaky = io.StringIO()
+        self._child.addHandler(logging.StreamHandler(leaky))
+        self._child.propagate = False
+        tok = "SYNTH-secret-child-1"
+        with tempfile.TemporaryDirectory() as d:
+            nl.setup_service_logging(os.path.join(d, "logs"))
+            self.assertEqual(self._child.handlers, [])
+            self.assertTrue(self._child.propagate)
+            self._child.error("child key=%s", tok)
+
+            def boom():
+                raise RuntimeError("thread url ?token=" + tok)
+            t = threading.Thread(target=boom, name="clip-synth")
+            t.start()
+            t.join()
+
+            err = io.StringIO()
+            real = sys.stderr
+            sys.stderr = err
+            try:
+                logging.getLogger("nova.x").error(
+                    "bad %s %d key=" + tok, "only-one-arg-" + tok)
+                logging.getLogger("nova.x").error("ok-after")
+            finally:
+                sys.stderr = real
+            for h in logging.getLogger("nova").handlers:
+                h.flush()
+            with open(os.path.join(d, "logs", "nova.log")) as fh:
+                text = fh.read()
+            self.assertEqual(leaky.getvalue(), "")
+            self.assertNotIn(tok, text)
+            self.assertNotIn(tok, err.getvalue())
+            self.assertIn("uncaught thread exception in clip-synth", text)
+            self.assertIn("unformattable log message", text)
+            self.assertIn("ok-after", text)
+            # the file handler's own failure path prints only a summary
+            fhdl = [x for x in logging.getLogger("nova").handlers
+                    if hasattr(x, "doRollover")][0]
+            sys.stderr = err
+            try:
+                try:
+                    raise OSError("x " + tok)
+                except OSError:
+                    fhdl.handleError(logging.makeLogRecord({}))
+            finally:
+                sys.stderr = real
+            self.assertNotIn(tok, err.getvalue())
+            self.assertIn("logging failure: OSError", err.getvalue())
 
 
 if __name__ == "__main__":

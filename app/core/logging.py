@@ -45,12 +45,21 @@ def redact(text: str) -> str:
 
 
 class JsonFormatter(logging.Formatter):
+    @staticmethod
+    def _safe_message(record: logging.LogRecord) -> str:
+        # A malformed format string or args must not take the record (or
+        # the default Handler.handleError dump of msg/args) down with it.
+        try:
+            return record.getMessage()
+        except Exception as exc:  # noqa: BLE001
+            return "[unformattable log message: %s]" % type(exc).__name__
+
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created)),
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
+            "msg": self._safe_message(record),
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
@@ -90,7 +99,24 @@ def get_logger(name: str) -> logging.Logger:
 _SERVICE_HANDLERS: list | None = None
 
 
+def _safe_handle_error(self, record) -> None:
+    """Replace Handler.handleError, which prints raw msg/args to stderr."""
+    import sys
+    try:
+        et = sys.exc_info()[0]
+        sys.stderr.write("logging failure: %s\n"
+                         % (et.__name__ if et else "unknown"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class _SafeStreamHandler(logging.StreamHandler):
+    handleError = _safe_handle_error
+
+
 class _PrivateRotatingFileHandler(RotatingFileHandler):
+    handleError = _safe_handle_error
+
     """Rotating file whose active file is always created mode 0600."""
 
     def _open(self):
@@ -139,7 +165,7 @@ def setup_service_logging(log_dir: str, level: str = "INFO") -> logging.Logger:
             os.path.join(log_dir, "nova.log"), maxBytes=2_000_000,
             backupCount=3, encoding="utf-8")
         handlers.append(fh)
-        ch = logging.StreamHandler()
+        ch = _SafeStreamHandler()
         handlers.append(ch)
         for h in handlers:
             h.setFormatter(formatter)
@@ -157,16 +183,31 @@ def setup_service_logging(log_dir: str, level: str = "INFO") -> logging.Logger:
         lg.setLevel(lv)
         if name:
             lg.propagate = prop
+    # Reconcile every already-created framework logger: a child such as
+    # telegram.ext.Updater with its own handler or propagate=False would
+    # bypass the replaced ancestors. Children must have no handlers and
+    # propagate to their (now redacting) ancestor.
+    for name, lg in list(logging.root.manager.loggerDict.items()):
+        if not isinstance(lg, logging.Logger):
+            continue
+        if name.startswith(("telegram.", "nova.", "httpx", "httpcore")):
+            for old in list(lg.handlers):
+                lg.removeHandler(old)
+            lg.propagate = True
     for noisy in ("httpx", "httpcore"):
-        lg = logging.getLogger(noisy)
-        lg.setLevel(logging.WARNING)
-        for old in list(lg.handlers):
-            lg.removeHandler(old)
-        lg.propagate = True
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.lastResort = None
 
     def _hook(et, ev, tb):
         root.critical("uncaught exception", exc_info=(et, ev, tb))
     sys.excepthook = _hook
+    import threading
+
+    def _thread_hook(args):
+        root.critical("uncaught thread exception in %s",
+                      getattr(args.thread, "name", "?"),
+                      exc_info=(args.exc_type, args.exc_value,
+                                args.exc_traceback))
+    threading.excepthook = _thread_hook
     _SERVICE_HANDLERS = handlers
     return root
