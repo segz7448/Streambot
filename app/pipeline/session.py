@@ -214,6 +214,7 @@ class ClipSession:
         try:
             await self._run_inner()
         except BaseException as exc:
+            self.phase = "interrupted"
             self.error = f"{exc.__class__.__name__}: {exc}"[:300]
             log.exception("clip session %s failed", self.source_label)
             sid = self._session_id
@@ -379,6 +380,7 @@ class ClipSession:
             # drained. Never analyze, clip or finalize under a live writer.
             if self.playback is not None and hasattr(worker, "capture_thread_active"):
                 if worker.capture_thread_active():
+                    self.phase = "cleanup-pending"
                     self.error = ("capture thread still running after stop; "
                                   "cleanup pending, analysis skipped")
                     self._mark_state(db_path, session_id, "INTERRUPTED")
@@ -387,6 +389,7 @@ class ClipSession:
                             await asyncio.sleep(0.2)
                         except asyncio.CancelledError:
                             continue
+                    self.phase = "interrupted"
                     self.error = ("capture thread drained late; session "
                                   "interrupted, analysis skipped")
                     self._mark_state(db_path, session_id, "INTERRUPTED")
@@ -420,6 +423,7 @@ class ClipSession:
                 except Exception as exc:
                     log.error("session finalize failed: %s", exc.__class__.__name__)
                     # sanitized (class name only), durable, never left STARTING/RECORDING
+                    self.phase = "interrupted"
                     self.error = f"finalize failed: {exc.__class__.__name__}"
                     self._mark_state(db_path, session_id, "INTERRUPTED", self.error)
                 self.phase = "ended"

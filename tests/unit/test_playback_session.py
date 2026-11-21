@@ -424,6 +424,7 @@ class DrainBoundary(Base):
         s, ended, analysed = self.run_session_nojoin(block_seconds=8.0, drain_wait=1.0)
         time.sleep(4.0)                                   # well past every drain wait
         self.assertTrue(s.alive(), "session released ownership under a live writer")
+        self.assertEqual(s.phase, "cleanup-pending")
         self.assertNotEqual(self.session_row()[1], "ENDED")
         self.assertIn("cleanup pending", s.error or "")
         n_before = len(analysed)
@@ -431,6 +432,7 @@ class DrainBoundary(Base):
         self.assertFalse(s.alive())
         self.assertIn("t", ended)                         # writer actually finished first
         self.assertEqual(self.session_row()[1], "INTERRUPTED")
+        self.assertEqual(s.phase, "interrupted")
         self.assertEqual(len(analysed), n_before)         # nothing analysed after stop
 
     def test_zero_byte_segment_rc0_is_not_a_successful_recording(self):
@@ -460,6 +462,7 @@ class SetupFailures(Base):
         self.assertFalse(s.alive())
         self.assertEqual(self.session_row()[1], "INTERRUPTED")
         self.assertIn("OSError", s.error)
+        self.assertEqual(s.phase, "interrupted")
 
     def test_finalize_failure_is_sanitized_durable_interrupted(self):
         source_auth.set_scope(self.sd, "streamerx", "record", True)

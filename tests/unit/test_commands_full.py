@@ -1,3 +1,4 @@
+from contextlib import closing
 from tests.unit import _prov
 import os
 import sqlite3
@@ -91,7 +92,7 @@ class PublishCommandTests(unittest.TestCase):
             sess.mkdir(parents=True, exist_ok=True)
             clip = sess / f"clip-{clip_id}.mp4"
         clip.write_bytes(b"mp4data")
-        with sqlite3.connect(str(d / "nova.db")) as conn:
+        with closing(sqlite3.connect(str(d / "nova.db"))) as conn, conn:
             conn.execute(
                 "INSERT INTO clips(id, file_path, status, created_at, session_id)"
                 " VALUES(?,?,?,?,?)",

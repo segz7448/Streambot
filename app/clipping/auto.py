@@ -9,6 +9,8 @@ operator visibility rather than silently dropping it.
 """
 from __future__ import annotations
 
+import contextlib
+
 import time
 from typing import Callable
 
@@ -51,107 +53,107 @@ class AutoClipper:
     def process_pending(self) -> int:
         """Score pending events and extract clips above threshold.
         Returns the number of clips produced."""
-        conn = connect(self.db_path)
-        events = self._pending_events(conn)
-        if not events:
-            conn.close()
-            return 0
-        # Unit bridge: candidate_events.confidence is normalized 0..1;
-        # HeuristicProvider expects audio loudness in LUFS (its mapping
-        # (lufs + 60) / 60 recovers the normalized value). Convert here
-        # so a 0.1-confidence event scores 0.1, not ~1.0. Scene
-        # confidences pass through unchanged (provider uses 0.5 * score).
-        spikes = [(e["at"], e["conf"] * 60 - 60) for e in events
-                  if e["kind"] == "audio_spike"]
-        scenes = [(e["at"], e["conf"]) for e in events
-                  if e["kind"] == "scene_change"]
-        try:
-            moments = self.provider.score_moments(
-                self.buffer.segment_seconds, spikes, scenes)
-        except QuotaExhausted:
-            # AI understanding was requested; a spent quota means the
-            # pipeline is DEGRADED/OFFLINE, not silently heuristic. Queue
-            # every pending job and surface it; nothing is scored or
-            # evicted while the provider is down.
-            log.warning(
-                "intelligence OFFLINE: provider quota exhausted; "
-                "%d pending jobs queued, retry next pass - no silent "
-                "heuristic substitution", len(events))
-            conn.executemany(
-                "UPDATE candidate_events SET status='QUEUED' WHERE id=?",
-                [(e["id"],) for e in events])
+        with contextlib.closing(connect(self.db_path)) as conn:
+            events = self._pending_events(conn)
+            if not events:
+                conn.close()
+                return 0
+            # Unit bridge: candidate_events.confidence is normalized 0..1;
+            # HeuristicProvider expects audio loudness in LUFS (its mapping
+            # (lufs + 60) / 60 recovers the normalized value). Convert here
+            # so a 0.1-confidence event scores 0.1, not ~1.0. Scene
+            # confidences pass through unchanged (provider uses 0.5 * score).
+            spikes = [(e["at"], e["conf"] * 60 - 60) for e in events
+                      if e["kind"] == "audio_spike"]
+            scenes = [(e["at"], e["conf"]) for e in events
+                      if e["kind"] == "scene_change"]
+            try:
+                moments = self.provider.score_moments(
+                    self.buffer.segment_seconds, spikes, scenes)
+            except QuotaExhausted:
+                # AI understanding was requested; a spent quota means the
+                # pipeline is DEGRADED/OFFLINE, not silently heuristic. Queue
+                # every pending job and surface it; nothing is scored or
+                # evicted while the provider is down.
+                log.warning(
+                    "intelligence OFFLINE: provider quota exhausted; "
+                    "%d pending jobs queued, retry next pass - no silent "
+                    "heuristic substitution", len(events))
+                conn.executemany(
+                    "UPDATE candidate_events SET status='QUEUED' WHERE id=?",
+                    [(e["id"],) for e in events])
+                conn.commit()
+                conn.close()
+                return 0
+            by_ts = {m.timestamp: m for m in moments}
+            # Cross-kind merge: one moment can fire both an audio_spike and a
+            # scene_change; clipping both yields two clips of the same content.
+            # Within merge_seconds keep the higher-scored event and mark the
+            # other MERGED (visible in the DB, never silently dropped). Distinct
+            # moments further apart are unaffected.
+            scored = sorted(
+                ((e, by_ts[e["at"]].score if e["at"] in by_ts else e["conf"])
+                 for e in events),
+                key=lambda es: es[0]["at"])
+            merged_ids: set[int] = set()
+            kept: list[tuple[dict, float]] = []
+            for event, score in scored:
+                if kept and event["at"] - kept[-1][0]["at"] < self.merge_seconds:
+                    prev, pscore = kept[-1]
+                    if score > pscore:
+                        conn.execute(
+                            "UPDATE candidate_events SET status='MERGED' WHERE id=?",
+                            (prev["id"],))
+                        merged_ids.add(prev["id"])
+                        kept[-1] = (event, score)
+                    else:
+                        conn.execute(
+                            "UPDATE candidate_events SET status='MERGED' WHERE id=?",
+                            (event["id"],))
+                        merged_ids.add(event["id"])
+                    continue
+                kept.append((event, score))
+            scores = {e["id"]: s for e, s in kept}
+            produced = 0
+            for event in events:
+                if event["id"] in merged_ids:
+                    continue
+                score = scores.get(event["id"], event["conf"])
+                if score < self.min_score:
+                    conn.execute(
+                        "UPDATE candidate_events SET status='REJECTED' WHERE id=?",
+                        (event["id"],))
+                    continue
+                out = (f"{self.out_dir}/clip-{self.buffer.session_id}-"
+                       f"{event['id']}.mp4")
+                try:
+                    path = self.extract_fn(self.ffmpeg, self.buffer,
+                                           event["at"], out,
+                                           pre_seconds=self.pre_seconds,
+                                           post_seconds=self.post_seconds)
+                except Exception as exc:
+                    log.warning("clip extraction failed for event %s: %s",
+                                event["id"], exc)
+                    conn.execute(
+                        "UPDATE candidate_events SET status='FAILED' WHERE id=?",
+                        (event["id"],))
+                    continue
+                if path is None:
+                    # window rotated out of the buffer; cannot clip this event
+                    conn.execute(
+                        "UPDATE candidate_events SET status='EXPIRED' WHERE id=?",
+                        (event["id"],))
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO clips (event_id, session_id,"
+                    " file_path, duration_seconds, status, created_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (event["id"], self.buffer.session_id, str(path),
+                     self.buffer.segment_seconds, "PENDING", time.time()))
+                conn.execute(
+                    "UPDATE candidate_events SET status='CLIPPED' WHERE id=?",
+                    (event["id"],))
+                produced += 1
             conn.commit()
             conn.close()
-            return 0
-        by_ts = {m.timestamp: m for m in moments}
-        # Cross-kind merge: one moment can fire both an audio_spike and a
-        # scene_change; clipping both yields two clips of the same content.
-        # Within merge_seconds keep the higher-scored event and mark the
-        # other MERGED (visible in the DB, never silently dropped). Distinct
-        # moments further apart are unaffected.
-        scored = sorted(
-            ((e, by_ts[e["at"]].score if e["at"] in by_ts else e["conf"])
-             for e in events),
-            key=lambda es: es[0]["at"])
-        merged_ids: set[int] = set()
-        kept: list[tuple[dict, float]] = []
-        for event, score in scored:
-            if kept and event["at"] - kept[-1][0]["at"] < self.merge_seconds:
-                prev, pscore = kept[-1]
-                if score > pscore:
-                    conn.execute(
-                        "UPDATE candidate_events SET status='MERGED' WHERE id=?",
-                        (prev["id"],))
-                    merged_ids.add(prev["id"])
-                    kept[-1] = (event, score)
-                else:
-                    conn.execute(
-                        "UPDATE candidate_events SET status='MERGED' WHERE id=?",
-                        (event["id"],))
-                    merged_ids.add(event["id"])
-                continue
-            kept.append((event, score))
-        scores = {e["id"]: s for e, s in kept}
-        produced = 0
-        for event in events:
-            if event["id"] in merged_ids:
-                continue
-            score = scores.get(event["id"], event["conf"])
-            if score < self.min_score:
-                conn.execute(
-                    "UPDATE candidate_events SET status='REJECTED' WHERE id=?",
-                    (event["id"],))
-                continue
-            out = (f"{self.out_dir}/clip-{self.buffer.session_id}-"
-                   f"{event['id']}.mp4")
-            try:
-                path = self.extract_fn(self.ffmpeg, self.buffer,
-                                       event["at"], out,
-                                       pre_seconds=self.pre_seconds,
-                                       post_seconds=self.post_seconds)
-            except Exception as exc:
-                log.warning("clip extraction failed for event %s: %s",
-                            event["id"], exc)
-                conn.execute(
-                    "UPDATE candidate_events SET status='FAILED' WHERE id=?",
-                    (event["id"],))
-                continue
-            if path is None:
-                # window rotated out of the buffer; cannot clip this event
-                conn.execute(
-                    "UPDATE candidate_events SET status='EXPIRED' WHERE id=?",
-                    (event["id"],))
-                continue
-            conn.execute(
-                "INSERT OR IGNORE INTO clips (event_id, session_id,"
-                " file_path, duration_seconds, status, created_at)"
-                " VALUES (?,?,?,?,?,?)",
-                (event["id"], self.buffer.session_id, str(path),
-                 self.buffer.segment_seconds, "PENDING", time.time()))
-            conn.execute(
-                "UPDATE candidate_events SET status='CLIPPED' WHERE id=?",
-                (event["id"],))
-            produced += 1
-        conn.commit()
-        conn.close()
-        return produced
+            return produced

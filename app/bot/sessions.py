@@ -6,6 +6,7 @@ endpoints before any process starts.
 """
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 from pathlib import Path
@@ -17,8 +18,16 @@ _lock = threading.Lock()
 _sessions: dict[str, ClipSession] = {}
 
 
-def _db(state_dir: Path) -> sqlite3.Connection:
-    return sqlite3.connect(str(state_dir / "nova.db"))
+@contextlib.contextmanager
+def _db(state_dir: Path):
+    """Connection that commits on success, rolls back on error and ALWAYS
+    closes (sqlite3's own context manager never closes)."""
+    conn = sqlite3.connect(str(state_dir / "nova.db"))
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _feed_for(state_dir: Path, username: str) -> str | None:

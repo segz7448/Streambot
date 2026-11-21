@@ -1,3 +1,4 @@
+from contextlib import closing
 from tests.unit import _prov
 import multiprocessing as mp
 import os
@@ -26,7 +27,7 @@ def held_worker(state, ready, release):
 class PublishRecordsTests(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
-        with sqlite3.connect(str(self.d / 'nova.db')) as conn:
+        with closing(sqlite3.connect(str(self.d / 'nova.db'))) as conn, conn:
             migrate(conn)
             for n in range(1, 5):
                 conn.execute('INSERT INTO clips(id,created_at) VALUES (?,0)', (n,))
@@ -132,6 +133,6 @@ class PublishRecordsTests(unittest.TestCase):
         with mock.patch('time.time', return_value=1):
             ops.journal_record(self.d, 700, 'other', 'done')
         self.assertLessEqual(len(json.loads((self.d / ops.JOURNAL).read_text())), ops.JOURNAL_CAP)
-        with sqlite3.connect(str(self.d / 'nova.db')) as conn:
+        with closing(sqlite3.connect(str(self.d / 'nova.db'))) as conn, conn:
             self.assertEqual(conn.execute('SELECT count(*) FROM publish_records').fetchone()[0], 600)
         self.assertEqual(pr.get(self.d, 599)['video_id'], 'v599')

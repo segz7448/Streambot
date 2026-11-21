@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import contextlib
 import sqlite3
 import time
 from pathlib import Path
@@ -17,8 +18,15 @@ from ..editing.presets import PRESETS
 _USERNAME = re.compile(r"^[A-Za-z0-9_]{3,25}$")
 
 
-def _db(state_dir: Path) -> sqlite3.Connection:
-    return sqlite3.connect(str(state_dir / "nova.db"))
+@contextlib.contextmanager
+def _db(state_dir: Path):
+    """Commits on success, rolls back on error, ALWAYS closes."""
+    conn = sqlite3.connect(str(state_dir / "nova.db"))
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def addsource_reply(state_dir: Path, username: str) -> str:

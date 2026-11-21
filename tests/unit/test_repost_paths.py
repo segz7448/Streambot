@@ -91,6 +91,7 @@ class Paths(unittest.TestCase):
         import sqlite3
         bare = sqlite3.connect(":memory:")
         self.assertEqual(provenance.repost_allowed(bare, 1).reason, "provenance schema missing")
+        bare.close()
         self.assertEqual(provenance.repost_allowed(c, 12345).reason, "clip row missing")
         for m in ("feed", "upload"):
             self.sql("UPDATE stream_sessions SET ingest_mode=? WHERE id=?", (m, self.sid))

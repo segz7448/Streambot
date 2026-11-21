@@ -147,19 +147,22 @@ class RollingBuffer:
     def reconcile(self, db_path: str) -> int:
         """Record on-disk segments missing from the database (post-restart)."""
         conn = connect(db_path)
-        known = {r["sequence"] for r in conn.execute(
-            "SELECT sequence FROM recording_segments WHERE session_id = ?",
-            (self.session_id,))}
-        added = 0
-        with conn:
-            for seg in self.segments():
-                if seg.sequence in known:
-                    continue
-                conn.execute(
-                    "INSERT INTO recording_segments"
-                    " (session_id, file_path, sequence, duration_seconds,"
-                    "  created_at) VALUES (?, ?, ?, ?, ?)",
-                    (self.session_id, str(seg.path), seg.sequence,
-                     seg.duration_seconds, seg.created_at))
-                added += 1
-        return added
+        try:
+            known = {r["sequence"] for r in conn.execute(
+                "SELECT sequence FROM recording_segments WHERE session_id = ?",
+                (self.session_id,))}
+            added = 0
+            with conn:
+                for seg in self.segments():
+                    if seg.sequence in known:
+                        continue
+                    conn.execute(
+                        "INSERT INTO recording_segments"
+                        " (session_id, file_path, sequence, duration_seconds,"
+                        "  created_at) VALUES (?, ?, ?, ?, ?)",
+                        (self.session_id, str(seg.path), seg.sequence,
+                         seg.duration_seconds, seg.created_at))
+                    added += 1
+            return added
+        finally:
+            conn.close()
