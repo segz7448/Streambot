@@ -70,6 +70,15 @@ IDLE = "idle"
 PROCESSED = "processed"
 
 
+def _fail_blocked(queue, job_id, error):
+    """Visible terminal FAILED row (not silently completed)."""
+    import time as _t
+    with queue.conn:
+        queue.conn.execute(
+            "UPDATE job_queue SET state='FAILED', locked_by=NULL,"
+            " locked_at=NULL, last_error=?, updated_at=? WHERE id=?",
+            (error[:2000], _t.time(), job_id))
+
 def _check_webhook_url(url: str) -> None:
     # The POST carries a Bearer secret: cleartext transport is refused
     # outright. The error never embeds the URL (it can carry path
@@ -190,11 +199,12 @@ def _process_one_admission(conn, state_dir: Path) -> bool:
                     "completed without effect", job_id)
         return True
     from ..core.provenance import repost_allowed
-    if not repost_allowed(conn, clip_row_id)[0]:
-        queue.complete(job_id)
-        log.info("admission job %s: playback clip %s, repost not "
-                 "authorized; not admitted, clip stays HELD", job_id,
-                 clip_row_id)
+    _o = repost_allowed(conn, clip_row_id)
+    if not _o.allowed:
+        from ..core.provenance import prefixed
+        _fail_blocked(queue, job_id, prefixed(_o))
+        log.info("admission job %s: clip %s not admitted (%s); stays HELD",
+                 job_id, clip_row_id, _o.reason)
         return True
     try:
         from ..core.intake import ClipIntakeAuthority
@@ -329,10 +339,12 @@ def _run_once_locked(state_dir: Path, *,
                         "completed without effect", job_id)
             return PROCESSED
         from ..core.provenance import repost_allowed as _ra
-        if not _ra(conn, row_id)[0]:
-            queue.complete(job_id)
-            log.info("handoff job %s: playback clip %s, repost not "
-                     "authorized; no post", job_id, row_id)
+        _o = _ra(conn, row_id)
+        if not _o.allowed:
+            from ..core.provenance import prefixed
+            _fail_blocked(queue, job_id, prefixed(_o))
+            log.info("handoff job %s: clip %s not posted (%s)", job_id,
+                     row_id, _o.reason)
             return PROCESSED
         row = conn.execute(
             "SELECT file_path FROM clips WHERE id = ?", (row_id,)).fetchone()

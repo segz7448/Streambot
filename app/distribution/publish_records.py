@@ -117,9 +117,11 @@ def reserve(state_dir, clip_id, reserved_by, *, lease, gate=None):
         # single reservation boundary shared by native, manual and
         # operator paths (provenance read from durable rows)
         from ..core.provenance import repost_allowed
-        if not repost_allowed(conn, clip_id)[0]:
+        origin = repost_allowed(conn, clip_id)
+        if not origin.allowed:
             conn.rollback()
-            return 'repost_denied', None
+            return 'repost_denied', {'reason': origin.reason,
+                                     'retryable': origin.retryable}
         row = conn.execute('SELECT * FROM publish_records WHERE clip_id=?',
                            (clip_id,)).fetchone()
         if row is not None and row['state'] != 'FAILED':

@@ -392,10 +392,12 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                          "to the queue unspent", job_id)
                 return True
             if decision == "repost_denied":
+                from ..core.provenance import DENIED_PREFIX, UNREADABLE_PREFIX
                 _fail_permanent(
                     queue, job_id,
-                    "repost not authorized for this playback source; "
-                    "clip stays HELD (nothing uploaded)")
+                    (DENIED_PREFIX if rec.get("retryable") else UNREADABLE_PREFIX)
+                    + str(rec.get("reason"))
+                    + " (clip stays HELD, nothing uploaded)")
                 log.info("native upload job %s: repost not authorized; "
                          "no upload", job_id)
                 return True

@@ -349,10 +349,14 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
     def _publish_with_lease(lease):
         decision, rec = publish_records.reserve(state_dir, clip_id, reserved_by, lease=lease)
         if decision == "repost_denied":
-            return (f"Clip #{clip_id} came from a playback session and repost "
-                    "is not authorized for its source. Not uploaded. "
-                    "(/sourceauth <user> repost on, only with the streamer's "
-                    "permission.)")
+            why = rec.get("reason", "unknown")
+            if rec.get("retryable"):
+                return (f"Clip #{clip_id} is from a playback session and repost "
+                        "is not authorized for its source. Not uploaded; the "
+                        "clip stays HELD. (/sourceauth <user> repost on, only "
+                        "with the streamer's permission, then /publish again.)")
+            return (f"Clip #{clip_id}: origin could not be verified ({why}). "
+                    "Not uploaded; the clip stays HELD and needs inspection.")
         token = rec.get("attempt_token")
         if decision == "blocked":
             if rec["state"] == "CONFIRMED":

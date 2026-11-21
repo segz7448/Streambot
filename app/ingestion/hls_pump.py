@@ -52,11 +52,11 @@ class PumpResult:
     stderr_tail: str     # redacted, bounded
 
 
-def _fetch(url, opener, host_ok, timeout, limit, deadline):
+def _fetch(url, opener, host_ok, timeout, limit, deadline, should_stop):
     if not tp._host_ok(url, host_ok):
         raise tp.PlaybackRefused("blocked", "URI outside the allowed playback hosts")
     code, body = tp.call_opener(opener, urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0"}), timeout, limit, deadline)
+        url, headers={"User-Agent": "Mozilla/5.0"}), timeout, limit, deadline, should_stop)
     if code != 200:
         raise tp._status_refusal(code, "media")
     if len(body) > limit:
@@ -224,7 +224,7 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
                 reason = "ffmpeg_exit"; break
             try:
                 text = _fetch(base, op, host_ok, timeout, PLAYLIST_MAX_BYTES,
-                              dl).decode("utf-8", "replace")
+                              dl, should_stop).decode("utf-8", "replace")
             except tp.PlaybackRefused as e:
                 if e.kind == "offline" and segs_n:
                     reason = "ended"; break
@@ -239,7 +239,7 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
                 if should_stop() or clock() >= t_end or media >= max_media_seconds:
                     break
                 try:
-                    blob = _fetch(uri, op, host_ok, timeout, SEGMENT_MAX_BYTES, dl)
+                    blob = _fetch(uri, op, host_ok, timeout, SEGMENT_MAX_BYTES, dl, should_stop)
                 except tp.PlaybackRefused as e:
                     if e.kind == "offline":      # expired segment: skip
                         next_seq = seq + 1

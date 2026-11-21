@@ -54,6 +54,9 @@ def set_scope(state_dir, user: str, scope: str, on: bool) -> None:
                   " DO UPDATE SET value=excluded.value",
                   (_key(user, scope), "1" if on else "0"))
         c.commit()
+        if scope == "repost" and on:
+            from ..core.provenance import requeue_denied
+            requeue_denied(c)       # jobs refused only for a missing grant
     finally:
         c.close()
 
@@ -94,6 +97,7 @@ def sourceauth_reply(state_dir, args: str) -> str:
                           "YouTube (private upload, existing daily cap).",
         ("repost", False): "Repost is off: any later publish attempt for this "
                            "streamer's playback clips (automatic, queued or manual) "
-                           "is refused. An upload already in flight cannot be recalled.",
+                           "is refused. Work already reserved or in flight may still start or "
+                           "finish; it cannot be recalled.",
     }[(scope, on)]
     return f"{user} {scope}: {'ON' if on else 'off'}. {note}"

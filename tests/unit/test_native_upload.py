@@ -546,8 +546,8 @@ class NativeUploadV3Tests(NativeUploadTests):
                 "SELECT id FROM twitch_sources WHERE username=?",
                 (source_name,)).fetchone()[0]
             sess = conn.execute(
-                "INSERT INTO stream_sessions (source_id, state)"
-                " VALUES (?, 'ENDED')", (sid,))
+                "INSERT INTO stream_sessions (source_id, state, ingest_mode)"
+                " VALUES (?, 'ENDED', 'upload')", (sid,))
             ev = conn.execute(
                 "INSERT INTO candidate_events (session_id, detected_at,"
                 " kind, confidence, status, metadata_json) VALUES"

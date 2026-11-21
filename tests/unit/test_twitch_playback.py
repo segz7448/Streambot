@@ -30,7 +30,7 @@ def fake(gql=None, usher=None, calls=None):
         "signature": "SECRETSIG"}}}).encode())
     usher = usher or (200, MASTER.encode())
 
-    def op(req, timeout, limit=None, deadline=None):
+    def op(req, timeout, limit=None, deadline=None, should_stop=None):
         if calls is not None:
             calls.append(req.full_url)
         return gql if req.full_url.startswith(tp.GQL_URL) else usher
@@ -97,7 +97,7 @@ class ResolveTests(Base):
             self.assertEqual(c.exception.kind, kind, kw)
 
     def test_network_exception_text_is_not_propagated(self):
-        def op(req, timeout, limit=None, deadline=None):
+        def op(req, timeout, limit=None, deadline=None, should_stop=None):
             raise OSError("boom https://usher.ttvnw.net/x?sig=SECRETSIG")
         with self.assertRaises(tp.PlaybackRefused) as c:
             self.res(opener=op)
@@ -161,14 +161,14 @@ class ResolveTests(Base):
 
     def test_full_traceback_has_no_signed_values(self):
         import traceback
-        def op(req, timeout, limit=None, deadline=None):
+        def op(req, timeout, limit=None, deadline=None, should_stop=None):
             raise OSError("boom https://usher.ttvnw.net/x?sig=SECRETSIG&token=SECRETTOK")
         try:
             self.res(opener=op)
         except tp.PlaybackRefused as e:
             tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         self.assertNotIn("SECRET", tb)
-        def bad_json(req, timeout, limit=None, deadline=None):
+        def bad_json(req, timeout, limit=None, deadline=None, should_stop=None):
             return 200, b'{"data": SECRETTOK'
         tp._last.clear()
         try:
@@ -204,7 +204,7 @@ class PumpTests(Base):
         pl = (playlist or self.playlist).encode()
         overrides = overrides or {}
 
-        def op(req, timeout, limit=None, deadline=None):
+        def op(req, timeout, limit=None, deadline=None, should_stop=None):
             u = req.full_url
             if seen is not None:
                 seen.append(u)
@@ -331,6 +331,42 @@ class PumpTests(Base):
         finally:
             srv.shutdown(); srv.server_close()
 
+    def test_error_body_trickle_and_cancel_and_blackhole_bounded(self):
+        import http.server, socketserver
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                self.send_response(403); self.send_header("Content-Length", "400"); self.end_headers()
+                for _ in range(400):
+                    try:
+                        self.wfile.write(b"z"); self.wfile.flush()
+                    except OSError: return
+                    time.sleep(0.05)
+        class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+        srv = S(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            u = f"http://127.0.0.1:{srv.server_port}/"
+            t0 = time.time()
+            with self.assertRaises(tp.PlaybackRefused):
+                tp.default_opener(urllib.request.Request(u), 5, 1000, time.monotonic() + 0.3)
+            self.assertLess(time.time() - t0, 1.0)            # was 1.2s+ with in-process reads
+            ev = threading.Event()
+            threading.Timer(0.3, ev.set).start()
+            t0 = time.time()
+            with self.assertRaises(tp.PlaybackRefused):
+                tp.default_opener(urllib.request.Request(u), 30, 1000, None, ev.is_set)
+            self.assertLess(time.time() - t0, 1.5)
+        finally:
+            srv.shutdown(); srv.server_close()
+        # unroutable address: connect blocks; absolute deadline still wins
+        t0 = time.time()
+        with self.assertRaises(tp.PlaybackRefused):
+            tp.default_opener(urllib.request.Request("http://10.255.255.1/"), 30, 1000,
+                              time.monotonic() + 0.5)
+        self.assertLess(time.time() - t0, 1.5)
+
     def test_group_cleanup_after_leader_exit_and_spawn_failure(self):
         script = self.d / "leaderexit.sh"
         script.write_text("#!/bin/sh\nsleep 300 &\necho $! > %s\nexit 0\n" % (self.d / "child.pid"))
@@ -397,7 +433,7 @@ class PumpTests(Base):
 
     def test_pump_exception_traceback_is_clean(self):
         import traceback
-        def op(req, timeout, limit=None, deadline=None):
+        def op(req, timeout, limit=None, deadline=None, should_stop=None):
             raise OSError("boom https://x.ttvnw.net/a?sig=SECRETSIG&token=SECRETTOK")
         try:
             hls_pump.capture(self.resolved(), "ffmpeg", str(self.d / "capA.ts"),

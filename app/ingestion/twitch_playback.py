@@ -98,41 +98,88 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def default_opener(req: urllib.request.Request, timeout: float,
-                   limit: int = MAX_BYTES, deadline=None):
-    """(status, body). Redirects refused. Reads limit+1 bytes in chunks and
-    raises PlaybackRefused('error') on overflow instead of truncating. An
-    absolute monotonic ``deadline`` is checked between chunks and bounds the
-    connect timeout; a single blocked socket read can still run up to one
-    socket timeout past it (documented, bounded by min(timeout, remaining))."""
-    def remaining():
+                   limit: int = MAX_BYTES, deadline=None, should_stop=None):
+    """(status, body) via a killable child process.
+
+    The whole request (DNS, connect, TLS, headers, body, HTTPError body) runs
+    in _fetch_child.py in its own process group. The parent polls with an
+    absolute monotonic ``deadline`` and ``should_stop`` and kills the group
+    when either fires, so neither getaddrinfo nor a trickling body can
+    outlive them (bounded by the poll interval, ~0.1s, plus kill/reap).
+    Overflow past ``limit`` raises instead of truncating. Redirects refused
+    in the child. The URL goes to the child on stdin, never in argv."""
+    import json, os, select, signal, struct, subprocess, sys
+    def left():
         return (deadline - time.monotonic()) if deadline is not None else timeout
-    if remaining() <= 0:
+    if left() <= 0:
         raise PlaybackRefused("error", "deadline reached")
-    op = urllib.request.build_opener(_NoRedirect)
+    if should_stop is not None and should_stop():
+        raise PlaybackRefused("error", "cancelled")
+    child = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_fetch_child.py")
     try:
-        with op.open(req, timeout=max(0.2, min(timeout, remaining()))) as r:
-            chunks, n = [], 0
-            while True:
-                if remaining() <= 0:
-                    raise PlaybackRefused("error", "deadline reached during read")
-                b = r.read1(min(65536, limit + 1 - n))
+        proc = subprocess.Popen(
+            [sys.executable, "-I", child], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError:
+        raise PlaybackRefused("error", "cannot start fetch worker") from None
+    t_hard = time.monotonic() + max(0.5, timeout)   # whole-request cap
+    buf = bytearray()
+    why = None
+    try:
+        try:
+            proc.stdin.write(json.dumps({
+                "url": req.full_url, "headers": dict(req.header_items()),
+                "limit": limit, "timeout": max(0.2, min(timeout, left()))}).encode())
+            proc.stdin.close()
+        except OSError:
+            pass
+        fd = proc.stdout.fileno()
+        while True:
+            if should_stop is not None and should_stop():
+                why = "cancelled"; break
+            if left() <= 0 or time.monotonic() >= t_hard:
+                why = "deadline reached"; break
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if r:
+                b = os.read(fd, 65536)
                 if not b:
                     break
-                chunks.append(b); n += len(b)
-                if n > limit:
-                    raise PlaybackRefused("error", "response too large")
-            return r.status, b"".join(chunks)
-    except urllib.error.HTTPError as e:
+                buf.extend(b)
+                if len(buf) > 4 + limit + 4096 and len(buf) > 4 + limit:
+                    why = "response too large"; break
+        if why is None:
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                why = "deadline reached"
+    finally:
         try:
-            body = e.read(4096)
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=5)
         except Exception:
-            body = b""
-        return e.code, body
+            pass
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    if why:
+        raise PlaybackRefused("error", why)
+    if proc.returncode != 0 or len(buf) < 4:
+        raise PlaybackRefused("error", "network error")
+    status = struct.unpack(">I", bytes(buf[:4]))[0]
+    body = bytes(buf[4:])
+    if status == 200 and len(body) > limit:
+        raise PlaybackRefused("error", "response too large")
+    return status, body
 
 
-def call_opener(op, req, timeout, limit=MAX_BYTES, deadline=None):
+def call_opener(op, req, timeout, limit=MAX_BYTES, deadline=None, should_stop=None):
     """Uniform call so injected test openers and the real one agree."""
-    return op(req, timeout, limit, deadline)
+    return op(req, timeout, limit, deadline, should_stop)
 
 
 _last: dict = {}
@@ -168,7 +215,7 @@ def _status_refusal(code: int, stage: str) -> PlaybackRefused:
     return PlaybackRefused("error", f"{stage} HTTP {code}")
 
 
-def _get_token(channel, opener, timeout, deadline=None):
+def _get_token(channel, opener, timeout, deadline=None, should_stop=None):
     body = json.dumps({"operationName": "PlaybackAccessToken",
                        "variables": {"isLive": True, "login": channel,
                                      "playerType": "site"},
@@ -176,7 +223,7 @@ def _get_token(channel, opener, timeout, deadline=None):
     req = urllib.request.Request(GQL_URL, data=body, headers={
         "Client-ID": PLAYER_CLIENT_ID, "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0"})
-    code, raw = call_opener(opener, req, timeout, 100_000, deadline)
+    code, raw = call_opener(opener, req, timeout, 100_000, deadline, should_stop)
     if code != 200:
         raise _status_refusal(code, "token")
     try:
@@ -232,7 +279,7 @@ def parse_master(text: str, host_ok=None) -> list:
 
 def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
             opener=None, host_ok=None, clock=time.time, timeout: float = 15.0,
-            min_interval: float = MIN_INTERVAL_SEC) -> Resolved:
+            min_interval: float = MIN_INTERVAL_SEC, should_stop=None) -> Resolved:
     """Resolve one public live channel. Raises PlaybackRefused, never
     returns a partial result. ``authorized`` must be passed True by a
     caller that holds the owner's per-source decision."""
@@ -247,7 +294,7 @@ def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
     op = opener or default_opener
     dl = time.monotonic() + max(timeout * 3, 1.0)   # whole-resolve deadline
     try:
-        value, sig = _get_token(login, op, timeout, dl)
+        value, sig = _get_token(login, op, timeout, dl, should_stop)
         usher = (f"https://{USHER_HOST}/api/channel/hls/{login}.m3u8?"
                  + urllib.parse.urlencode({
                      "sig": sig, "token": value, "allow_source": "true",
@@ -258,7 +305,7 @@ def resolve(channel: str, *, authorized: bool = False, max_height: int = 720,
             raise PlaybackRefused("blocked", "playlist host not allowed")
         code, raw = call_opener(op, urllib.request.Request(
             usher, headers={"User-Agent": "Mozilla/5.0"}), timeout,
-            MAX_BYTES, dl)
+            MAX_BYTES, dl, should_stop)
         if code != 200:
             raise _status_refusal(code, "playlist")
         variants = parse_master(raw.decode("utf-8", "replace"), host_ok)
