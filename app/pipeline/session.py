@@ -25,6 +25,8 @@ log = get_logger("pipeline.session")
 
 
 class ClipSession:
+    DRAIN_WAIT_SECONDS = 90.0
+
     def __init__(self, ffmpeg: str, ffprobe: str, feed: str,
                  source_label: str, state_dir: Path,
                  segment_seconds: int = 5, tick_seconds: float = 3.0,
@@ -205,6 +207,51 @@ class ClipSession:
                             session_id, exc)
 
     async def _run(self) -> None:
+        """Outer guard: ANY failure in setup or run is a terminal error with
+        the session row left INTERRUPTED (never stuck STARTING/RECORDING)."""
+        self._session_id = None
+        try:
+            await self._run_inner()
+        except BaseException as exc:
+            self.error = f"{exc.__class__.__name__}: {exc}"[:300]
+            log.exception("clip session %s failed", self.source_label)
+            sid = self._session_id
+            if sid is not None:
+                try:
+                    c = connect(str(self.state_dir / "nova.db"))
+                    c.execute("UPDATE stream_sessions SET state='INTERRUPTED',"
+                              " ended_at=? WHERE id=? AND state IN"
+                              " ('STARTING','RECORDING')", (time.time(), sid))
+                    c.commit(); c.close()
+                except Exception:
+                    log.exception("could not mark failed session interrupted")
+            if not isinstance(exc, Exception):
+                raise
+
+    @staticmethod
+    def _mark_state(db_path, session_id, state) -> None:
+        try:
+            c = connect(db_path)
+            c.execute("UPDATE stream_sessions SET state=?, ended_at=? WHERE id=?",
+                      (state, time.time(), session_id))
+            c.commit(); c.close()
+        except Exception:
+            log.exception("session state mark failed")
+
+    def _mark_recording(self) -> None:
+        """Worker callback: first validated segments exist."""
+        sid = self._session_id
+        if sid is None:
+            return
+        try:
+            c = connect(str(self.state_dir / "nova.db"))
+            c.execute("UPDATE stream_sessions SET state='RECORDING' WHERE id=?"
+                      " AND state='STARTING'", (sid,))
+            c.commit(); c.close()
+        except Exception:
+            log.exception("mark recording failed")
+
+    async def _run_inner(self) -> None:
         from ..clipping.auto import AutoClipper
         from ..core.lifecycle import HealthRegistry, Service, Supervisor
         from ..detection.detector import CandidateDetector
@@ -228,10 +275,12 @@ class ClipSession:
         cur = conn.execute(
             "INSERT INTO stream_sessions (source_id, state, started_at,"
             " ingest_mode, notes) VALUES (?,?,?,?,?)",
-            (source_id, "RECORDING", now,
+            (source_id,
+             "STARTING" if self.playback is not None else "RECORDING", now,
              "playback" if self.playback is not None else "feed",
              self._notes(now)))
         session_id = cur.lastrowid
+        self._session_id = session_id
         conn.commit()
         conn.close()
 
@@ -245,7 +294,9 @@ class ClipSession:
             pb = dict(self.playback)
             worker = PlaybackWorker(
                 buf, self.source_label, db_path, self.state_dir, self.ffmpeg,
-                initial_resolved=pb.pop("initial_resolved", None), **pb)
+                initial_resolved=pb.pop("initial_resolved", None),
+                on_recording=self._mark_recording,
+                ffprobe=self.ffprobe, **pb)
         else:
             worker = RecordingWorker(runner, buf, self.feed, db_path,
                                      sweep_seconds=max(1, self.segment_seconds))
@@ -296,9 +347,36 @@ class ClipSession:
             self._stopping.set()
             sup.stopping.set()
             try:
-                await asyncio.wait_for(task, timeout=20)
+                if self.playback is not None:
+                    # asyncio.wait never cancels the task on timeout; a
+                    # repeated cancellation must not abandon cleanup
+                    t_end = time.monotonic() + self.DRAIN_WAIT_SECONDS
+                    while not task.done() and time.monotonic() < t_end:
+                        try:
+                            await asyncio.wait({task}, timeout=0.5)
+                        except asyncio.CancelledError:
+                            continue
+                else:
+                    await asyncio.wait_for(task, timeout=20)
             except Exception:
                 pass
+            # a playback capture thread may still be writing segments:
+            # this session stays ALIVE and OWNS the slot until it is actually
+            # drained. Never analyze, clip or finalize under a live writer.
+            if self.playback is not None and hasattr(worker, "capture_thread_active"):
+                if worker.capture_thread_active():
+                    self.error = ("capture thread still running after stop; "
+                                  "cleanup pending, analysis skipped")
+                    self._mark_state(db_path, session_id, "INTERRUPTED")
+                    while worker.capture_thread_active():
+                        try:
+                            await asyncio.sleep(0.2)
+                        except asyncio.CancelledError:
+                            continue
+                    self.error = ("capture thread drained late; session "
+                                  "interrupted, analysis skipped")
+                    self._mark_state(db_path, session_id, "INTERRUPTED")
+                    return
             # finalize: analyze what remains, clip, finish
             try:
                 await asyncio.to_thread(detector.process_new_segments)
@@ -339,7 +417,7 @@ def recover_interrupted_sessions(state_dir: Path) -> int:
     migrate(conn)
     cur = conn.execute(
         "UPDATE stream_sessions SET state='INTERRUPTED', ended_at=?"
-        " WHERE state='RECORDING'", (time.time(),))
+        " WHERE state IN ('RECORDING','STARTING')", (time.time(),))
     conn.commit()
     conn.close()
     return cur.rowcount

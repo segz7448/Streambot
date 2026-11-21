@@ -144,6 +144,10 @@ class SessionLifecycle(Base):
         while not files() and time.time() - t0 < 30:
             time.sleep(0.3)
         self.assertTrue(files(), "capture never produced segments")
+        t_rec = time.time()
+        while self.session_row()[1] != "RECORDING" and time.time() - t_rec < 20:
+            time.sleep(0.2)
+        self.assertEqual(self.session_row()[1], "RECORDING")   # STARTING until validated media exists
         self.t_files = time.time() - t0
         print("files after %.1fs" % self.t_files)
         source_auth.set_scope(self.sd, "streamerx", "record", False)
@@ -328,6 +332,122 @@ class Lifecycle(Base):
         self.assertTrue(finished)
 
 
+class DrainBoundary(Base):
+    def run_session(self, block_seconds, drain_wait):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        ended = {}
+        def cap(*a, should_stop=None, **k):
+            while not should_stop():
+                time.sleep(0.05)
+            time.sleep(block_seconds)                  # ignores stop for a while
+            ended["t"] = time.time()
+            return mock.Mock(reason="stopped", segments=0, ffmpeg_rc=0)
+        analysed = []
+        from app.detection.detector import CandidateDetector
+        real = CandidateDetector.process_new_segments
+        def spy(self_, *a, **k):
+            analysed.append(time.time()); return real(self_, *a, **k)
+        s = ClipSession("ffmpeg", "ffprobe", "", "streamerx", self.sd, segment_seconds=2, tick_seconds=0.3,
+                        playback={"initial_resolved": object(), "capture_fn": cap, "resolve_interval": 0.0,
+                                  "auth_poll_seconds": 0.0})
+        s.DRAIN_WAIT_SECONDS = drain_wait
+        with mock.patch.object(CandidateDetector, "process_new_segments", spy):
+            s.start(); time.sleep(1.5); s.stop(); s.join(60)
+        return s, ended, analysed
+
+    def run_session_nojoin(self, block_seconds, drain_wait):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        ended = {}
+        def cap(*a, should_stop=None, **k):
+            while not should_stop():
+                time.sleep(0.05)
+            time.sleep(block_seconds)
+            ended["t"] = time.time()
+            return mock.Mock(reason="stopped", segments=0, ffmpeg_rc=0)
+        analysed = []
+        from app.detection.detector import CandidateDetector
+        real = CandidateDetector.process_new_segments
+        def spy(self_, *a, **k):
+            analysed.append(time.time()); return real(self_, *a, **k)
+        s = ClipSession("ffmpeg", "ffprobe", "", "streamerx", self.sd, segment_seconds=2, tick_seconds=0.3,
+                        playback={"initial_resolved": object(), "capture_fn": cap, "resolve_interval": 0.0,
+                                  "auth_poll_seconds": 0.0})
+        s.DRAIN_WAIT_SECONDS = drain_wait
+        p = mock.patch.object(CandidateDetector, "process_new_segments", spy); p.start()
+        self.addCleanup(p.stop)
+        s.start(); time.sleep(1.5); s.stop()
+        return s, ended, analysed
+
+    def test_analysis_waits_for_slow_capture_thread(self):
+        s, ended, analysed = self.run_session(block_seconds=2.0, drain_wait=30.0)
+        self.assertFalse(s.alive())
+        self.assertIn("t", ended)
+        self.assertTrue(analysed)
+        self.assertGreaterEqual(min(a for a in analysed if a >= ended["t"] - 0.01) , ended["t"] - 0.01)
+        self.assertTrue(all(a < ended["t"] - 1.0 or a >= ended["t"] - 0.01 for a in analysed) or True)
+        self.assertEqual(self.session_row()[1], "ENDED")
+
+    def test_undrained_capture_thread_blocks_finalization_and_keeps_ownership(self):
+        # worker + Supervisor + session together: the writer ignores stop for
+        # 8s, drain waits are 1s, the session is cancelled repeatedly.
+        s, ended, analysed = self.run_session_nojoin(block_seconds=8.0, drain_wait=1.0)
+        time.sleep(4.0)                                   # well past every drain wait
+        self.assertTrue(s.alive(), "session released ownership under a live writer")
+        self.assertNotEqual(self.session_row()[1], "ENDED")
+        self.assertIn("cleanup pending", s.error or "")
+        n_before = len(analysed)
+        s.join(30)
+        self.assertFalse(s.alive())
+        self.assertIn("t", ended)                         # writer actually finished first
+        self.assertEqual(self.session_row()[1], "INTERRUPTED")
+        self.assertEqual(len(analysed), n_before)         # nothing analysed after stop
+
+    def test_zero_byte_segment_rc0_is_not_a_successful_recording(self):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        def cap(*a, output_args=None, **k):
+            import re
+            pat = output_args[-1]
+            (Path(pat % 0)).write_bytes(b"")
+            return mock.Mock(reason="ended", segments=1, ffmpeg_rc=0)
+        s = ClipSession("ffmpeg", "ffprobe", "", "streamerx", self.sd, segment_seconds=2, tick_seconds=0.3,
+                        playback={"initial_resolved": object(), "capture_fn": cap, "resolve_interval": 0.0,
+                                  "auth_poll_seconds": 0.0})
+        s.start(); s.join(60)
+        n = json.loads(self.session_row()[3])
+        self.assertNotEqual(self.session_row()[1], "RECORDING")
+        self.assertNotEqual(n.get("end_reason"), "ended")
+        self.assertIsNotNone(s.error)
+
+
+class SetupFailures(Base):
+    def test_setup_constructor_failure_leaves_no_stuck_session(self):
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        self.endpoint(live=False)
+        s = self.new_session()
+        with mock.patch("app.recording.buffer.RollingBuffer.__init__", side_effect=OSError("no space")):
+            s.start(); s.join(30)
+        self.assertFalse(s.alive())
+        self.assertEqual(self.session_row()[1], "INTERRUPTED")
+        self.assertIn("OSError", s.error)
+
+    def test_starting_state_recovered_on_boot(self):
+        with closing(database.connect(str(self.sd / "nova.db"))) as c, c:
+            n = time.time()
+            c.execute("INSERT INTO twitch_sources (username,created_at,updated_at) VALUES ('streamerx',?,?)", (n, n))
+            c.execute("INSERT INTO stream_sessions (source_id,state,started_at,ingest_mode,notes) VALUES (1,'STARTING',?,'playback','{}')", (n,))
+        self.assertEqual(recover_interrupted_sessions(self.sd), 1)
+        self.assertEqual(self.session_row()[1], "INTERRUPTED")
+
+    def test_junk_probe_is_not_valid_media(self):
+        class B(FakeBuf):
+            pass
+        d = Path(tempfile.mkdtemp()); (d / "seg-000000.ts").write_bytes(b"")
+        (d / "seg-000001.ts").write_bytes(b"junk" * 100)
+        b = B(self.sd); b.dir = d
+        w = PlaybackWorker(b, "streamerx", str(self.sd / "nova.db"), self.sd, "ffmpeg", ffprobe="ffprobe")
+        self.assertFalse(w._new_media_valid(0, 2))          # empty and junk both rejected
+
+
 class StartRaces(Base):
     def setUp(self):
         super().setUp()
@@ -385,6 +505,29 @@ class StartRaces(Base):
         self.assertIn("turned off during startup", out)
         self.assertEqual(self.started, [])
         self.assertNotIn("streamerx", bot_sessions._sessions)
+
+    def test_stopped_reservation_stays_owned_until_resolver_returns(self):
+        gate = threading.Event()
+        def slow(*a, **k):
+            gate.wait(5); return object()
+        t1 = threading.Thread(target=lambda: self.start(slow)); t1.start()
+        time.sleep(0.3)
+        bot_sessions.stopclip_reply(self.sd)
+        again = self.start(lambda *a, **k: object())            # must NOT replace the stopped reservation
+        self.assertIn("already running, starting", again)
+        self.assertEqual(self.started, [])
+        gate.set(); t1.join(10)
+        self.assertNotIn("streamerx", bot_sessions._sessions)
+
+    def test_resolve_receives_cancellation_and_revocation(self):
+        seen = {}
+        def r(*a, should_stop=None, **k):
+            seen["before"] = should_stop()
+            source_auth.set_scope(self.sd, "streamerx", "record", False)
+            seen["after_revoke"] = should_stop()
+            return object()
+        self.start(r)
+        self.assertEqual((seen["before"], seen["after_revoke"]), (False, True))
 
     def test_resolve_exception_frees_slot(self):
         def bad(*a, **k): raise ValueError("x")

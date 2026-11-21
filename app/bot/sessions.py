@@ -141,7 +141,11 @@ class _Reservation:
         self._stopping.set()
 
     def alive(self):
-        return False
+        # owned until released in the starter's finally: a stopped
+        # reservation cannot be replaced while its resolver still runs
+        return not self._released
+
+    _released = False
 
 
 def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
@@ -179,11 +183,15 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
 
     def release():
         with _lock:
+            res._released = True
             if _sessions.get(username) is res:
                 del _sessions[username]
     try:
         resolved = (resolve_fn or tp.resolve)(
-            username, authorized=True, **(hooks or {}))
+            username, authorized=True,
+            should_stop=lambda: res._stopping.is_set() or not
+            source_auth.allowed(state_dir, username, "record"),
+            **(hooks or {}))
     except tp.PlaybackRefused as exc:
         release()
         why = {"offline": "the channel is offline or unknown",
@@ -202,16 +210,21 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
     try:
         with _lock:
             if _sessions.get(username) is not res or res._stopping.is_set():
-                return ("Start cancelled before launch (a stop arrived or the "
-                        "slot changed). Nothing is recording.")
-            if not source_auth.allowed(state_dir, username, "record"):
-                del _sessions[username]
-                return (f"Recording authorization for {username} was turned "
-                        "off during startup. Nothing is recording.")
-            session = session_factory(ffmpeg, ffprobe, "", username,
-                                      state_dir, playback=pb)
-            session.start()
-            _sessions[username] = session
+                msg = ("Start cancelled before launch (a stop arrived or the "
+                       "slot changed). Nothing is recording.")
+            elif not source_auth.allowed(state_dir, username, "record"):
+                msg = (f"Recording authorization for {username} was turned "
+                       "off during startup. Nothing is recording.")
+            else:
+                msg = None
+                session = session_factory(ffmpeg, ffprobe, "", username,
+                                          state_dir, playback=pb)
+                session.start()
+                res._released = True
+                _sessions[username] = session
+        if msg is not None:
+            release()
+            return msg
     except BaseException:
         release()
         raise

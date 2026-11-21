@@ -41,7 +41,8 @@ class PlaybackWorker:
                  max_gap_seconds: float = 300.0,
                  resolve_interval: float = tp.MIN_INTERVAL_SEC,
                  resolve_fn=None, capture_fn=None, opener=None, host_ok=None,
-                 auth_poll_seconds: float = 2.0, sleep=asyncio.sleep):
+                 auth_poll_seconds: float = 2.0, sleep=asyncio.sleep,
+                 on_recording=None, probe=None, ffprobe=None):
         self.buffer, self.channel = buffer, channel
         self.db_path, self.state_dir, self.ffmpeg = db_path, state_dir, ffmpeg
         self.initial = initial_resolved
@@ -57,6 +58,10 @@ class PlaybackWorker:
         self.opener, self.host_ok = opener, host_ok
         self.auth_poll = auth_poll_seconds
         self._sleep = sleep
+        self.on_recording = on_recording
+        self.ffprobe = ffprobe
+        self.probe = probe or self._ffprobe_ok
+        self._signalled = False
         self.reconnects = 0
         self.gap_seconds = 0.0
         self.captured_segments = 0
@@ -64,6 +69,8 @@ class PlaybackWorker:
         self.end_reason = "not_started"
         self.finished = False
         self.error_text = None
+        self._active = 0
+        self._active_lock = __import__("threading").Lock()
         self.session_name = f"playback-{buffer.session_id}"
         self._auth_at = 0.0
         self._auth_ok = False
@@ -81,7 +88,20 @@ class PlaybackWorker:
         return self.record_ok()
 
     # -- one blocking cycle (runs in a thread) -------------------------
+    def capture_thread_active(self) -> bool:
+        with self._active_lock:
+            return self._active > 0
+
     def _cycle(self, stop) -> str:
+        with self._active_lock:
+            self._active += 1
+        try:
+            return self._cycle_inner(stop)
+        finally:
+            with self._active_lock:
+                self._active -= 1
+
+    def _cycle_inner(self, stop) -> str:
         """-> 'ended' | 'continue' | 'stopped' | 'revoked' | 'retry'.
         Raises RuntimeError on terminal refusals."""
         stop_or_revoked = lambda: stop() or not self.record_ok()
@@ -112,8 +132,10 @@ class PlaybackWorker:
         except tp.PlaybackRefused as e:
             return self._refused(e.kind)
         seq_after = self.buffer.next_seq()
-        wrote = seq_after > seq_before
+        wrote = seq_after > seq_before and self._new_media_valid(seq_before, seq_after)
         self.captured_segments += res.segments if wrote else 0
+        if wrote:
+            self._signal_recording()
         log.info("playback cycle %d channel=%s reason=%s segments=%d",
                  self.cycles, self.channel, res.reason, res.segments)
         if res.reason == "stopped":
@@ -132,6 +154,51 @@ class PlaybackWorker:
         if res.reason in ("media_cap", "deadline"):
             return "continue"
         return "retry"       # ffmpeg_exit
+
+    def _ffprobe_ok(self, path) -> bool:
+        """A finalized segment counts only if it is non-empty and probeable
+        with positive duration (filename advancement alone proves nothing)."""
+        import json, subprocess, os
+        try:
+            if os.path.getsize(path) <= 0:
+                return False
+            ffprobe = self.ffprobe or "ffprobe"
+            out = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "json", str(path)], capture_output=True, timeout=30)
+            return float(json.loads(out.stdout)["format"]["duration"]) > 0
+        except Exception:
+            return False
+
+    def _signal_recording(self) -> None:
+        if self._signalled or not self.on_recording:
+            return
+        self._signalled = True
+        try:
+            self.on_recording()
+        except Exception:
+            log.exception("on_recording callback failed")
+
+    def _closed_media_ready(self) -> bool:
+        """During a live cycle: a segment that is no longer the newest (so
+        closed by the segmenter) is non-empty and probeable."""
+        d = getattr(self.buffer, "dir", None)
+        if d is None:
+            return False
+        files = sorted(d.glob("seg-*.ts"))
+        return any(self.probe(f) for f in files[:-1])
+
+    def _new_media_valid(self, seq_before, seq_after) -> bool:
+        d = getattr(self.buffer, "dir", None)
+        if d is None:                       # test doubles without files
+            return True
+        for seq in range(seq_before, seq_after):
+            f = d / f"seg-{seq:06d}.ts"
+            # the newest file may still be open for writing by a segmenter
+            # that has already exited; ffmpeg has exited here, so all are final
+            if f.exists() and self.probe(f):
+                return True
+        return False
 
     def _refused(self, kind: str) -> str:
         if kind == "offline":
@@ -162,6 +229,9 @@ class PlaybackWorker:
                     while not task.done():
                         ctx.heartbeat()
                         self.buffer.enforce_storage_cap()
+                        if not self._signalled and self.on_recording:
+                            if await asyncio.to_thread(self._closed_media_ready):
+                                self._signal_recording()
                         await asyncio.wait({task}, timeout=1.0)
                     outcome = task.result()   # RuntimeError/OSError propagate
                     task = None
@@ -197,15 +267,19 @@ class PlaybackWorker:
                 # drain the owned capture thread (bounded) before declaring done
                 deadline = time.monotonic() + 60.0
                 while not task.done() and time.monotonic() < deadline:
-                    await asyncio.wait({task}, timeout=0.5)
+                    try:
+                        await asyncio.wait({task}, timeout=0.5)
+                    except asyncio.CancelledError:
+                        continue            # repeated cancel must not abandon the writer
                 if not task.done():
                     self.end_reason = "failed"
-                    self.error_text = "capture thread did not stop in time"
+                    self.error_text = "capture thread did not stop in time (cleanup pending)"
                 else:
                     task.exception() if not task.cancelled() else None
             try:
-                self.buffer.enforce_storage_cap()
-                self.buffer.reconcile(self.db_path)
+                if not self.capture_thread_active():     # never touch the buffer under a live writer
+                    self.buffer.enforce_storage_cap()
+                    self.buffer.reconcile(self.db_path)
             except Exception as exc:
                 if self.end_reason != "failed":
                     self.end_reason = "failed"
