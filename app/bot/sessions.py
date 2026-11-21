@@ -217,11 +217,34 @@ def _discard_failed_start(username: str, session) -> None:
         del _sessions[username]
 
 
-def session_terminal(username: str, attempt_id) -> str:
-    """Typed terminal reason of the exact session ('' when none/unknown)."""
+def session_terminal(username: str, attempt_id, state_dir=None) -> str:
+    """Typed terminal reason of the exact attempt: from the live session
+    object while registered, else from its durable row (notes.terminal,
+    written at completion) so a crash before the next tick loses nothing."""
     with _lock:
         s = _match(username, attempt_id)
-        return (getattr(s, "terminal_kind", None) or "") if s is not None else ""
+    if s is not None:
+        k = getattr(s, "terminal_kind", None)
+        if k:
+            return k
+    if state_dir is None:
+        return ""
+    try:
+        import json as _j
+        import sqlite3
+        from ..core import schedule as _sc
+        sid = _sc.find_session_id(state_dir, attempt_id)
+        if sid is None:
+            return ""
+        c = sqlite3.connect(f"file:{Path(state_dir) / 'nova.db'}?mode=ro", uri=True, timeout=5)
+        try:
+            r = c.execute("SELECT notes FROM stream_sessions WHERE id=?", (sid,)).fetchone()
+        finally:
+            c.close()
+        k = (_j.loads(r[0]).get("terminal") if r and r[0] else "") or ""
+        return k if isinstance(k, str) else ""
+    except Exception:
+        return ""
 
 
 def startclip_reply(state_dir: Path, username: str, ffmpeg: str,

@@ -254,7 +254,52 @@ class ClipSession:
             # This is the only positive proof of termination.
             self._mark_drained()
 
+    _inflight = 0
+
+    @property
+    def _inflight_lock(self):
+        lk = self.__dict__.get("_inflight_lk")
+        if lk is None:
+            lk = self.__dict__.setdefault("_inflight_lk", threading.Lock())
+        return lk
+
+    async def _owned(self, fn, *args):
+        """Run blocking work in a thread that is COUNTED thread-side: the
+        count drops only when the thread function really returns, whatever
+        happened to the awaiting coroutine (cancellation, repeated cancel)."""
+        with self._inflight_lock:
+            self._inflight += 1
+
+        def run():
+            try:
+                return fn(*args)
+            finally:
+                with self._inflight_lock:
+                    self._inflight -= 1
+        return await asyncio.to_thread(run)
+
+    def _owner_drained(self, task=None) -> bool:
+        """Positive attestation by every owner: the recorder task finished,
+        the worker attests no process/thread of its own remains, and no
+        session-owned executor work is outstanding."""
+        w = getattr(self, "_worker", None)
+        if w is None or not hasattr(w, "drained"):
+            return False
+        try:
+            if task is not None and not task.done():
+                return False
+            with self._inflight_lock:
+                if self._inflight:
+                    return False
+            return bool(w.drained())
+        except Exception:
+            return False
+
     def _mark_drained(self) -> None:
+        """Persist the terminal outcome always; persist drained=true ONLY if
+        every owner attested (never inferred from reaching this point)."""
+        proven = bool(getattr(self, "_owners_drained", False)) and \
+            self._owner_drained(getattr(self, "_task", None))
         sid = getattr(self, "_session_id", None)
         if sid is not None:
             try:
@@ -266,7 +311,11 @@ class ClipSession:
                         n = json.loads(row[0]) if row and row[0] else {}
                     except Exception:
                         n = {}
-                    n["drained"] = True
+                    if proven:
+                        n["drained"] = True
+                    tk = self.terminal_kind
+                    if tk:
+                        n["terminal"] = tk
                     c.execute("UPDATE stream_sessions SET notes=? WHERE id=?",
                               (json.dumps(n), sid))
                     c.commit()
@@ -274,7 +323,8 @@ class ClipSession:
                     c.close()
             except Exception:
                 log.exception("could not record drained session")
-        self._finalized = True
+        if proven:
+            self._finalized = True
 
     @staticmethod
     def _mark_state(db_path, session_id, state, error=None) -> None:
@@ -371,18 +421,19 @@ class ClipSession:
                      restart=False)],  # a session's recorder completes;
             HealthRegistry())          # live-feed restart is future work
         task = asyncio.create_task(sup.run())
+        self._task = task
         crashed = False
         finishing = False
         try:
             while not self._stopping.is_set():
                 await asyncio.sleep(self.tick_seconds)
-                await asyncio.to_thread(detector.process_new_segments)
-                await asyncio.to_thread(clipper.process_pending)
+                await self._owned(detector.process_new_segments)
+                await self._owned(clipper.process_pending)
                 if not finishing:
                     # edit/QC is heavy; never block the recorder loop
                     finishing = True
                     try:
-                        await asyncio.to_thread(
+                        await self._owned(
                             self._finish_clips, session_id, work,
                             self.state_dir / "runtime")
                     finally:
@@ -422,32 +473,48 @@ class ClipSession:
                     await asyncio.wait_for(task, timeout=20)
             except Exception:
                 pass
-            # a playback capture thread may still be writing segments:
-            # this session stays ALIVE and OWNS the slot until it is actually
-            # drained. Never analyze, clip or finalize under a live writer.
-            if self.playback is not None and hasattr(worker, "capture_thread_active"):
-                if worker.capture_thread_active():
+            # Ownership: this session stays ALIVE and OWNS the slot until EVERY
+            # owner attests it is drained (recorder task, worker processes and
+            # threads, session executor work). Teardown failures are retried,
+            # never skipped; never analyze or finalize under a live writer.
+            worker_was_live = False
+            attested = False
+            while True:
+                if self._owner_drained(task):
+                    attested = True
+                    break
+                if not task.done() or not (getattr(worker, "drained", lambda: False)()):
+                    worker_was_live = True
                     self.phase = "cleanup-pending"
-                    self.error = ("capture thread still running after stop; "
+                    self.error = ("recorder or helper still running after stop; "
                                   "cleanup pending, analysis skipped")
                     self._mark_state(db_path, session_id, "INTERRUPTED")
-                    while worker.capture_thread_active():
-                        try:
-                            await asyncio.sleep(0.2)
-                        except asyncio.CancelledError:
-                            continue
-                    self.phase = "interrupted"
-                    self.error = ("capture thread drained late; session "
-                                  "interrupted, analysis skipped")
-                    self._mark_state(db_path, session_id, "INTERRUPTED")
-                    skip_finalize = True
+                ens = getattr(worker, "ensure_stopped", None)
+                if ens is not None:
+                    try:
+                        await ens()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass            # retried next round; ownership is kept
+                try:
+                    await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    continue
+            if worker_was_live:
+                self.phase = "interrupted"
+                self.error = ("cleanup completed late; session interrupted, "
+                              "analysis skipped")
+                self._mark_state(db_path, session_id, "INTERRUPTED")
+                skip_finalize = True
+            self._owners_drained = attested
             # finalize: analyze what remains, clip, finish
             if not skip_finalize:
                 self.phase = "finalizing"
                 try:
-                    await asyncio.to_thread(detector.process_new_segments)
-                    await asyncio.to_thread(clipper.process_pending)
-                    await asyncio.to_thread(
+                    await self._owned(detector.process_new_segments)
+                    await self._owned(clipper.process_pending)
+                    await self._owned(
                         self._finish_clips, session_id, work,
                         self.state_dir / "runtime")
                     conn = connect(db_path)

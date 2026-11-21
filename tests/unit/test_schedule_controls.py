@@ -458,6 +458,45 @@ class PolicyTests(Base):
         with self.assertRaises(ValueError):
             sched.add(self.d, "kaicenat", t0, None, now=self.now, day_end=t1)
 
+    def test_stopped_session_without_proof_never_rearms(self):
+        for stage in ("LAUNCHED", "RECORDING", "STOPPING"):
+            self.setUp()
+            sid, _, _ = self.day()
+            self.tick(self.now)
+            aid = self.w.starts[0][1]
+            if stage != "LAUNCHED":
+                self.w.confirmed.add(aid)
+                self.tick(self.now + 20)
+            if stage == "STOPPING":
+                sched.cancel(self.d, sid, now=self.now + 25)
+                self.w.stop_raises = 99
+                self.tick(self.now + 30)
+            self.w.s[aid]["running"] = False
+            self.w.s[aid]["drained"] = False            # owners did not attest
+            for k in range(1, 30):
+                self.tick(self.now + 60 + 120 * k)
+            self.assertEqual(len(self.w.starts), 1, stage)
+            self.assertEqual(self.attempts(sid)[0][1], "UNCERTAIN", stage)
+            self.assertEqual(sched.quarantined(self.d)[0]["username"], "kaicenat", stage)
+            self.w.s[aid]["drained"] = True              # now proven
+            self.tick(self.now + 5000)
+            self.assertNotEqual(self.attempts(sid)[0][1], "UNCERTAIN", stage)
+
+    def test_restart_applies_persisted_terminal_before_eligibility(self):
+        for kind, want in (("challenge", "BLOCKED"), ("restricted", "BLOCKED"),
+                           ("unauthorized", "AWAITING_AUTH")):
+            self.setUp()
+            sid, _, _ = self.day()
+            self.tick(self.now)
+            aid = self.w.starts[0][1]
+            self.w.s.clear()                              # crash before the next tick
+            sched.reconcile(self.d, now=self.now + 50, terminated=lambda u, a: True,
+                            terminal=lambda u, a: kind)
+            self.assertEqual(self.plan(sid)[0], want, kind)
+            for k in range(1, 8):
+                self.tick(self.now + 100 * k)
+            self.assertEqual(len(self.w.starts), 1, kind)   # restart did not retry
+
     def test_ordinary_early_end_still_retries(self):
         sid, _, _ = self.day()
         self.tick(self.now)

@@ -136,10 +136,25 @@ class FFmpegRunner:
         proc = FFmpegProcess(args=[self.ffmpeg_path, *args],
                              session_id=session_id,
                              timeout_seconds=timeout)
-        async with self._sem:
-            await proc.start()
-            self.processes[proc.session_id + ":" + str(proc.pid)] = proc
+        self.starting = getattr(self, "starting", 0) + 1
+        try:
+            async with self._sem:
+                try:
+                    await proc.start()
+                finally:
+                    # register even if the caller was cancelled mid-start
+                    if proc.pid is not None or proc._proc is not None:
+                        self.processes[proc.session_id + ":" + str(proc.pid)] = proc
+        finally:
+            self.starting -= 1
         return proc
+
+    starting = 0
+
+    def live_processes(self) -> int:
+        """Tracked recorder processes still running. Positive-attestation
+        input: a stop that raised leaves this above zero."""
+        return sum(1 for p in self.processes.values() if p.running)
 
     async def stop_session(self, session_id: str) -> None:
         for key, proc in list(self.processes.items()):

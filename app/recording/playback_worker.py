@@ -88,6 +88,27 @@ class PlaybackWorker:
         return self.record_ok()
 
     # -- one blocking cycle (runs in a thread) -------------------------
+    def drained(self) -> bool:
+        """The ONLY attestation for this worker: no capture/helper thread is
+        active (every blocking call of this worker is counted)."""
+        return not self.capture_thread_active()
+
+    async def ensure_stopped(self) -> None:
+        self._stop_req = True
+
+    async def _bg(self, fn):
+        """Run a blocking helper in a thread that is counted as owned work."""
+        with self._active_lock:
+            self._active += 1
+
+        def run():
+            try:
+                return fn()
+            finally:
+                with self._active_lock:
+                    self._active -= 1
+        return await asyncio.to_thread(run)
+
     def capture_thread_active(self) -> bool:
         with self._active_lock:
             return self._active > 0
@@ -234,7 +255,7 @@ class PlaybackWorker:
                         ctx.heartbeat()
                         self.buffer.enforce_storage_cap()
                         if not self._signalled and self.on_recording:
-                            if await asyncio.to_thread(self._closed_media_ready):
+                            if await self._bg(self._closed_media_ready):
                                 self._signal_recording()
                         await asyncio.wait({task}, timeout=1.0)
                     outcome = task.result()   # RuntimeError/OSError propagate

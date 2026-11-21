@@ -451,7 +451,7 @@ class BotService:
             error=_sess.session_error,
             writer_active=lambda u: _sess.writer_active(sd, u),
             terminated=lambda u, a: _sess.session_terminated(sd, u, a),
-            terminal=_sess.session_terminal,
+            terminal=lambda u, a: _sess.session_terminal(u, a, sd),
             content_qualified=lambda u: self._content_qualified(u),
             record_allowed=lambda u: _auth.allowed(sd, u, "record"))
         while True:
@@ -529,7 +529,8 @@ class BotService:
         from . import sessions as _s2
         _n = _schedmod.reconcile(
             self._state_dir(),
-            terminated=lambda u, a: _s2.session_terminated(self._state_dir(), u, a))
+            terminated=lambda u, a: _s2.session_terminated(self._state_dir(), u, a),
+            terminal=lambda u, a: _s2.session_terminal(u, a, self._state_dir()))
         if _n:
             log.warning("ended %d interrupted schedule window(s) MISSED", _n)
         from . import handoff as _handoff

@@ -39,6 +39,15 @@ class RecordingWorker:
         self._started_at = 0.0
         self.session_name = f"record-{buffer.session_id}"
 
+    def drained(self) -> bool:
+        """The ONLY attestation for this worker: no tracked recorder process
+        is running and none is mid-start."""
+        return self.runner.live_processes() == 0 and self.runner.starting == 0
+
+    async def ensure_stopped(self) -> None:
+        """Retry the stop (it may have failed once); raises if it fails again."""
+        await self.runner.stop_session(self.session_name)
+
     async def _start(self, start_number: int):
         self._started_at = time.monotonic()
         proc = await self.runner.run(

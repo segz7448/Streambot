@@ -391,7 +391,7 @@ class Ops:
         self.content_qualified = content_qualified or (lambda user: False)
 
 
-def reconcile(state_dir, now: float | None = None, terminated=None) -> int:
+def reconcile(state_dir, now: float | None = None, terminated=None, terminal=None) -> int:
     """Startup, one transaction. The old sessions' threads died with the
     process, but their recorder children may not have: an open attempt
     whose streamer still shows a live writer becomes UNRESOLVED and its
@@ -401,6 +401,8 @@ def reconcile(state_dir, now: float | None = None, terminated=None) -> int:
     possible repeats."""
     now = now if now is not None else time.time()
     terminated = terminated or (lambda user, aid: False)
+    terminal = terminal or (lambda user, aid: "")
+    outcomes = {}      # schedule_id -> persisted typed terminal outcome
     n = 0
     with txn(state_dir) as c:
         c.execute("UPDATE schedule_notices SET sending_at=NULL,repeat=1 WHERE "
@@ -418,6 +420,16 @@ def reconcile(state_dir, now: float | None = None, terminated=None) -> int:
             else:
                 c.execute("UPDATE schedule_attempts SET state='INTERRUPTED',note=?,"
                           "updated_at=? WHERE id=?", ("service restarted", now, a["id"]))
+                k = terminal(a["username"], a["id"])
+                if k in BLOCKING_KINDS or k == "unauthorized":
+                    outcomes[a["schedule_id"]] = k
+        for sid_, k in outcomes.items():
+            # a persisted blocked/unauthorized completion wins over eligibility
+            p_ = c.execute("SELECT * FROM clip_schedules WHERE id=? AND state IN "
+                           "('ACTIVE','UNCERTAIN')", (sid_,)).fetchone()
+            if p_ is not None and sid_ not in held:
+                for t in _after_attempt(c, sid_, now, "restart", k):
+                    _notice(c, sid_, t, now)
         for p in c.execute("SELECT * FROM clip_schedules WHERE state IN "
                            "('ACTIVE','UNCERTAIN')").fetchall():
             if p["id"] in held:
@@ -612,6 +624,20 @@ def _retry_later(c, p, cur, now, reason, delay, eligible) -> None:
                 "missed.", now)
 
 
+def _hold_unproven(state_dir, a, now) -> None:
+    """The session object stopped running but its owners have not attested
+    that every child/thread is drained: fence, never rearm."""
+    with txn(state_dir) as c:
+        if _set_attempt(c, a["id"], ("LAUNCHED", "RECORDING", "STOPPING"), "UNCERTAIN", now,
+                        "session stopped without proof its recorder/threads drained"):
+            c.execute("UPDATE clip_schedules SET state='UNCERTAIN',note=?,updated_at=? "
+                      "WHERE id=? AND state IN ('ACTIVE','SCHEDULED')",
+                      ("owned work not proven finished", now, a["schedule_id"]))
+            _notice(c, a["schedule_id"], f"Schedule #{a['schedule_id']} for {a['username']}: "
+                    "the session stopped but I cannot prove its recorder finished. That "
+                    "streamer is fenced and nothing will restart until it is proven.", now)
+
+
 def _step_attempt(state_dir, ops: Ops, a, now) -> None:
     user, aid, st = a["username"], a["id"], a["state"]
     if st in ("INTENT", "UNCERTAIN", "UNRESOLVED"):
@@ -639,7 +665,8 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
             # positive proof: the exact session finished (drained) or never started
             _set_attempt(c, aid, ("INTENT", "UNCERTAIN", "UNRESOLVED"), "INTERRUPTED", now,
                          "verified: exact session finalized")
-            for t in _after_attempt(c, a["schedule_id"], now, "verified idle after a lost launch"):
+            for t in _after_attempt(c, a["schedule_id"], now, "verified idle after a lost launch",
+                                    ops.terminal(user, aid)):
                 _notice(c, a["schedule_id"], t, now)
         return
     running = ops.running(user, aid)
@@ -664,6 +691,9 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
         a = {**a, "state": "STOPPING", "stop_by": reason, "stopping_at": now}
     if st == "STOPPING":
         if not running:
+            if not ops.terminated(user, aid):
+                _hold_unproven(state_dir, a, now)
+                return
             with txn(state_dir) as c:
                 _set_attempt(c, aid, ("STOPPING",), "ENDED", now)
                 for t in _after_attempt(c, a["schedule_id"], now, a["stop_by"] or "stopped",
@@ -688,6 +718,9 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
                         "Check /sessions.", now)
         return
     if not running:
+        if not ops.terminated(user, aid):
+            _hold_unproven(state_dir, a, now)
+            return
         with txn(state_dir) as c:
             err = _err_class(ops.error(user, aid))
             _set_attempt(c, aid, ("LAUNCHED", "RECORDING"), "ENDED", now,
