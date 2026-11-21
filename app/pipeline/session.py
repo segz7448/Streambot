@@ -420,13 +420,13 @@ class ClipSession:
                          time.time(), session_id))
                     conn.commit()
                     conn.close()
+                    self.phase = "interrupted" if crashed else "ended"
                 except Exception as exc:
                     log.error("session finalize failed: %s", exc.__class__.__name__)
                     # sanitized (class name only), durable, never left STARTING/RECORDING
                     self.phase = "interrupted"
                     self.error = f"finalize failed: {exc.__class__.__name__}"
                     self._mark_state(db_path, session_id, "INTERRUPTED", self.error)
-                self.phase = "ended"
 
 
 def recover_interrupted_sessions(state_dir: Path) -> int:

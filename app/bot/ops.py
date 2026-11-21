@@ -477,73 +477,74 @@ def deliver_one_clip(state_dir: Path, clip_id: int,
 def _deliver_one_clip_locked(state_dir: Path, clip_id: int,
                              deliver_fn=None) -> str:
     """Body of deliver_one_clip, called with the per-clip lock held."""
+    import contextlib as _contextlib
     import os as _os
     import time as _time
     from ..core.database import connect
-    conn = connect(str(state_dir / "nova.db"))
-    row = conn.execute(
-        "SELECT file_path, duration_seconds, status FROM clips"
-        " WHERE id=?", (clip_id,)).fetchone()
-    if row is None:
-        conn.close()
-        return "missing"
-    path, dur, status = row
-    if status != "HELD":
-        conn.close()
-        return "not_held"
-    if journal_result(state_dir, clip_id, "deliver") is not None:
-        # sent earlier, crash before DB update: reconcile, no resend
-        conn.execute(
-            "UPDATE clips SET status='DELIVERED', delivered_at=?"
-            " WHERE id=?", (_time.time(), clip_id))
-        conn.commit()
-        conn.close()
-        return "reconciled"
-    prior = [e for e in journal_uncertain(state_dir)
-             if e["update_id"] == clip_id
-             and e.get("command") == "deliver"]
-    if prior:
-        conn.close()
-        return "skipped_uncertain"  # may already be sent; never resend
-    if deliver_fn is None:
-        try:
-            from ..distribution.telegram_delivery import (
-                deliver_clip_sync)
-            from ..core.tokensrc import source as _tsrc
-            if _tsrc() == "none":
-                raise KeyError("no Telegram token source")
-            token_path = _os.environ.get("NOVA_TOKEN_FILE", "")
-        except (KeyError, ImportError, RuntimeError) as exc:
-            log.warning("delivery of clip %s unavailable before send:"
-                        " %s", clip_id, exc)
+    with _contextlib.closing(connect(str(state_dir / "nova.db"))) as conn:
+        row = conn.execute(
+            "SELECT file_path, duration_seconds, status FROM clips"
+            " WHERE id=?", (clip_id,)).fetchone()
+        if row is None:
             conn.close()
-            return "unavailable"
-        deliver_fn = lambda p, caption: deliver_clip_sync(
-            token_path, str(state_dir), p, caption)
-    try:
-        mid = deliver_fn(path, f"NOVA clip #{clip_id} ({dur:.0f}s)")
-        journal_record(state_dir, clip_id, "deliver", f"message {mid}")
-        conn.execute(
-            "UPDATE clips SET status='DELIVERED', delivered_at=?"
-            " WHERE id=?", (_time.time(), clip_id))
-        conn.commit()
-        conn.close()
-        return "delivered"
-    except Exception as exc:
-        try:
-            from ..distribution.telegram_delivery import NoAdminError
-            no_admin = isinstance(exc, NoAdminError)
-        except ImportError:
-            no_admin = False
-        if no_admin:
-            # raised before any send: nothing can have reached Telegram
-            log.warning("delivery of clip %s unavailable: %s",
-                        clip_id, exc)
+            return "missing"
+        path, dur, status = row
+        if status != "HELD":
             conn.close()
-            return "unavailable"
-        journal_mark_uncertain(state_dir, clip_id, "deliver", str(path))
-        conn.close()
-        return "uncertain"
+            return "not_held"
+        if journal_result(state_dir, clip_id, "deliver") is not None:
+            # sent earlier, crash before DB update: reconcile, no resend
+            conn.execute(
+                "UPDATE clips SET status='DELIVERED', delivered_at=?"
+                " WHERE id=?", (_time.time(), clip_id))
+            conn.commit()
+            conn.close()
+            return "reconciled"
+        prior = [e for e in journal_uncertain(state_dir)
+                 if e["update_id"] == clip_id
+                 and e.get("command") == "deliver"]
+        if prior:
+            conn.close()
+            return "skipped_uncertain"  # may already be sent; never resend
+        if deliver_fn is None:
+            try:
+                from ..distribution.telegram_delivery import (
+                    deliver_clip_sync)
+                from ..core.tokensrc import source as _tsrc
+                if _tsrc() == "none":
+                    raise KeyError("no Telegram token source")
+                token_path = _os.environ.get("NOVA_TOKEN_FILE", "")
+            except (KeyError, ImportError, RuntimeError) as exc:
+                log.warning("delivery of clip %s unavailable before send:"
+                            " %s", clip_id, exc)
+                conn.close()
+                return "unavailable"
+            deliver_fn = lambda p, caption: deliver_clip_sync(
+                token_path, str(state_dir), p, caption)
+        try:
+            mid = deliver_fn(path, f"NOVA clip #{clip_id} ({dur:.0f}s)")
+            journal_record(state_dir, clip_id, "deliver", f"message {mid}")
+            conn.execute(
+                "UPDATE clips SET status='DELIVERED', delivered_at=?"
+                " WHERE id=?", (_time.time(), clip_id))
+            conn.commit()
+            conn.close()
+            return "delivered"
+        except Exception as exc:
+            try:
+                from ..distribution.telegram_delivery import NoAdminError
+                no_admin = isinstance(exc, NoAdminError)
+            except ImportError:
+                no_admin = False
+            if no_admin:
+                # raised before any send: nothing can have reached Telegram
+                log.warning("delivery of clip %s unavailable: %s",
+                            clip_id, exc)
+                conn.close()
+                return "unavailable"
+            journal_mark_uncertain(state_dir, clip_id, "deliver", str(path))
+            conn.close()
+            return "uncertain"
 
 
 def auto_deliver_clips(state_dir: Path, clip_ids,

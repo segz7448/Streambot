@@ -93,3 +93,25 @@ class OpsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeliverConnectionOwnership(unittest.TestCase):
+    def test_unexpected_exception_still_closes_connection(self):
+        import sqlite3, time
+        from contextlib import closing
+        from app.core import database
+        d = Path(tempfile.mkdtemp())
+        with closing(database.connect(str(d / "nova.db"))) as c:
+            database.migrate(c)
+            c.execute("INSERT INTO clips(id,file_path,status,created_at) VALUES(1,'x','HELD',?)", (time.time(),))
+        opened = []
+        real = database.connect
+        def spy(path):
+            conn = real(path); opened.append(conn); return conn
+        with mock.patch("app.core.database.connect", spy), \
+             mock.patch.object(ops, "journal_result", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                ops._deliver_one_clip_locked(d, 1, deliver_fn=lambda p, c: 1)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")                    # closed
