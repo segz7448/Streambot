@@ -37,18 +37,48 @@ RETENTION_SECONDS = 24 * 3600
 MAX_UPLOADS_BYTES = 2 * 1024 * 1024 * 1024
 
 
+_PREFIX_REL = Path("prefix/data/data/com.termux/files/usr/bin")
+
+
+def _prefix_bin_candidates() -> list[Path]:
+    """Directories that may hold the relocated termux ffmpeg/ffprobe.
+    HOME-independent: a deployment's HOME differs from the command-job
+    HOME, so the install root is also derived from this file's own
+    location (<root>/<tree>/app/bot/media.py -> <root>/prefix/...),
+    from the working directory's ancestors, and last from HOME."""
+    cands: list[Path] = []
+    roots = list(Path(__file__).resolve().parents)
+    roots += list(Path.cwd().resolve().parents)
+    roots.append(Path.cwd().resolve())
+    for r in roots:
+        for base in (r, r / "instinct-clip"):
+            c = base / _PREFIX_REL
+            if c not in cands:
+                cands.append(c)
+    try:
+        c = Path.home() / "instinct-clip" / _PREFIX_REL
+        if c not in cands:
+            cands.append(c)
+    except (RuntimeError, KeyError):
+        pass
+    return cands
+
+
+def _find_tool(name: str, env: str) -> str:
+    if os.environ.get(env):
+        return os.environ[env]
+    for d in _prefix_bin_candidates():
+        if (d / name).is_file():
+            return str(d / name)
+    return shutil.which(name) or name
+
+
 def ffmpeg_paths() -> tuple[str, str]:
     """Device ffmpeg lives in the relocated termux prefix; allow env
-    override and fall back to PATH for off-device tests."""
-    home = Path.home()
-    prefix = home / "instinct-clip/prefix/data/data/com.termux/files/usr/bin"
-    ff = os.environ.get("NOVA_FFMPEG") or (
-        str(prefix / "ffmpeg") if (prefix / "ffmpeg").exists()
-        else shutil.which("ffmpeg") or "ffmpeg")
-    fp = os.environ.get("NOVA_FFPROBE") or (
-        str(prefix / "ffprobe") if (prefix / "ffprobe").exists()
-        else shutil.which("ffprobe") or "ffprobe")
-    return ff, fp
+    override, find the prefix independent of $HOME, and fall back to
+    PATH for off-device tests."""
+    return _find_tool("ffmpeg", "NOVA_FFMPEG"), _find_tool(
+        "ffprobe", "NOVA_FFPROBE")
 
 
 def cleanup_uploads(uploads: Path, now: float | None = None) -> int:

@@ -128,7 +128,8 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
                       edit_fn: Callable = edit_clip,
                       qc_fn: Callable = check_media,
                       validate_fn: Callable = validate_recording,
-                      runtime_dir: str = ".nova-runtime") -> dict:
+                      runtime_dir: str = ".nova-runtime",
+                      final_probe_fn: Callable = probe) -> dict:
     """Run detect -> size -> plan -> extract -> edit -> QC over a local
     recording. Returns an evidence dict; never fabricates a clip: when
     no candidate is detected the result says so and nothing is
@@ -221,8 +222,22 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     # title names the detected kind, the registered source label and
     # the duration (a synthetic fixture's label appears verbatim),
     # never a job-payload claim.
-    admitted_title = (f"{best['kind']} clip from {source_label} "
-                      f"({duration:.0f}s)")
+    # The duration in the title is the FINAL measured duration of the
+    # edited file (ffprobe), never the requested/planned window: the
+    # edit step can change length. If the measurement fails the
+    # duration is omitted from the title rather than guessed.
+    measured = None
+    try:
+        measured = float(final_probe_fn(ffprobe, edited).get(
+            "format", {}).get("duration", 0) or 0)
+    except Exception:
+        measured = None
+    if measured is not None and measured > 0:
+        duration = measured
+        admitted_title = (f"{best['kind']} clip from {source_label} "
+                          f"({duration:.0f}s)")
+    else:
+        admitted_title = f"{best['kind']} clip from {source_label}"
     # Atomic HELD-to-admission outbox, the same durable path the
     # session pipeline uses: the candidate event (with its stored
     # title), the HELD clip row and the admission job (kind
@@ -266,7 +281,7 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
 
     memory.remember(
         "clip", f"retrospective:{clip_row_id}",
-        f"{duration:.0f}s {preset.name} clip from {source_label} "
+        f"{preset.name} clip from {source_label} "
         f"({best['kind']})", "mode C pipeline", confidence="observed")
     result["status"] = "held"
     result["detail"] = ("clip passed QC and is recorded as HELD; "

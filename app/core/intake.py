@@ -88,7 +88,8 @@ import sqlite3
 import time
 from datetime import datetime
 from typing import Callable, Optional
-from zoneinfo import ZoneInfo
+from datetime import datetime as _dt, timedelta as _td, tzinfo as _tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.core.database import connect
 
@@ -194,6 +195,67 @@ def _is_real_number(value: object) -> bool:
         and math.isfinite(value)
 
 
+def _nth_sunday(year: int, month: int, n: int) -> _dt:
+    d = _dt(year, month, 1)
+    d += _td(days=(6 - d.weekday()) % 7)
+    return d + _td(weeks=n - 1)
+
+
+class _USPacific(_tzinfo):
+    """Built-in America/Los_Angeles rules (US DST since 2007: second
+    Sunday of March 02:00 to first Sunday of November 02:00 local).
+    Used only when the host has no tz database (the AGT Android phone
+    ships none). Not valid for dates before 2007."""
+    _STD = _td(hours=-8)
+    _DST = _td(hours=-7)
+
+    def _dst_range(self, year: int):
+        return (_nth_sunday(year, 3, 2) + _td(hours=2),
+                _nth_sunday(year, 11, 1) + _td(hours=2))
+
+    def utcoffset(self, dt):
+        if dt is None:
+            return None
+        start, end = self._dst_range(dt.year)
+        naive = dt.replace(tzinfo=None)
+        if start <= naive < end:
+            # ambiguous hour 01:00-02:00 on fall-back day: fold picks
+            if naive >= end - _td(hours=1) and getattr(dt, "fold", 0) == 0:
+                return self._DST
+            if naive >= end - _td(hours=1):
+                return self._STD
+            return self._DST
+        return self._STD
+
+    def dst(self, dt):
+        return _td(hours=1) if self.utcoffset(dt) == self._DST else _td(0)
+
+    def tzname(self, dt):
+        return "PDT" if self.dst(dt) else "PST"
+
+    def fromutc(self, dt):
+        naive = dt.replace(tzinfo=None)
+        start, end = self._dst_range(naive.year)
+        if start - self._STD <= naive < end - self._DST:
+            return (naive + self._DST).replace(tzinfo=self)
+        out = (naive + self._STD).replace(tzinfo=self)
+        if end - self._DST <= naive < end - self._STD:
+            out = out.replace(fold=1)
+        return out
+
+
+def resolve_timezone(name: str):
+    """IANA zone via the host database; America/Los_Angeles (the
+    provisional default) falls back to built-in rules when the host has
+    no tz data. Any other missing zone raises (fail fast at startup)."""
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        if name == "America/Los_Angeles":
+            return _USPacific()
+        raise
+
+
 class ClipIntakeAuthority:
     """One authority per database file. Each decision opens its own
     connection, so threads and processes can share the instance safely; the
@@ -209,7 +271,7 @@ class ClipIntakeAuthority:
                  _clock: Optional[Callable[[], float]] = None,
                  _migrations: Optional[list[tuple[int, str]]] = None):
         self.db_path = db_path
-        self._tz = ZoneInfo(timezone)  # raises on an unknown timezone
+        self._tz = resolve_timezone(timezone)  # raises on an unknown timezone
         self._clock = _clock or time.time
         conn = connect(db_path)
         try:
