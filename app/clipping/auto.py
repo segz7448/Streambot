@@ -124,8 +124,13 @@ class AutoClipper:
                         "UPDATE candidate_events SET status='REJECTED' WHERE id=?",
                         (event["id"],))
                     continue
-                out = (f"{self.out_dir}/clip-{self.buffer.session_id}-"
-                       f"{event['id']}.mp4")
+                # unique, never-reused raw path: a deterministic path
+                # would let a concurrent or stale producer clobber the
+                # input another finalizer is about to seal
+                from .seal import seal_file, unique_path
+                out = str(unique_path(
+                    self.out_dir,
+                    f"clip-{self.buffer.session_id}-{event['id']}", ".mp4"))
                 try:
                     res = self.extract_fn(self.ffmpeg, self.buffer,
                                           event["at"], out,
@@ -153,12 +158,27 @@ class AutoClipper:
                     # (never the segment length, which understates it).
                     path, clip_seconds = res, (
                         self.pre_seconds + self.post_seconds)
+                # durable sealed completion evidence committed WITH the
+                # PENDING row, computed after the extractor child exited;
+                # recovery eligibility requires it. A seal failure fails
+                # the event rather than publishing unsealed input.
+                try:
+                    seal_sha, seal_bytes = seal_file(path)
+                except Exception as exc:
+                    log.warning("clip seal failed for event %s: %s",
+                                event["id"], exc)
+                    conn.execute(
+                        "UPDATE candidate_events SET status='FAILED'"
+                        " WHERE id=?", (event["id"],))
+                    continue
                 conn.execute(
                     "INSERT OR IGNORE INTO clips (event_id, session_id,"
-                    " file_path, duration_seconds, status, created_at)"
-                    " VALUES (?,?,?,?,?,?)",
+                    " file_path, duration_seconds, status, created_at,"
+                    " sealed_sha256, sealed_bytes, sealed_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
                     (event["id"], self.buffer.session_id, str(path),
-                     float(clip_seconds), "PENDING", time.time()))
+                     float(clip_seconds), "PENDING", time.time(),
+                     seal_sha, seal_bytes, time.time()))
                 conn.execute(
                     "UPDATE candidate_events SET status='CLIPPED' WHERE id=?",
                     (event["id"],))

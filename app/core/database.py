@@ -149,6 +149,17 @@ MIGRATIONS: list[tuple[int, str]] = [
         attempt_token TEXT
     );
     """),
+    (4, """
+    -- Sealed-input recovery: durable producer completion evidence
+    -- (digest/size committed with the PENDING row) and owner-token
+    -- claims shared by the original finalizer and recovery. Rows
+    -- without seal evidence are legacy and stay fenced.
+    ALTER TABLE clips ADD COLUMN sealed_sha256 TEXT;
+    ALTER TABLE clips ADD COLUMN sealed_bytes INTEGER;
+    ALTER TABLE clips ADD COLUMN sealed_at REAL;
+    ALTER TABLE clips ADD COLUMN recovery_owner TEXT;
+    ALTER TABLE clips ADD COLUMN claimed_at REAL;
+    """),
 ]
 
 JOB_STATES = (

@@ -1,7 +1,10 @@
-"""Boot recovery of PENDING clips from interrupted sessions: narrow,
-writer-safe, idempotent, no flush. Existing PENDING rows are finished
-only with positive writer-death proof and current record authorization;
-nothing else is touched and no auto-delivery happens."""
+"""Sealed-input recovery of PENDING clips from interrupted sessions.
+
+Eligibility is sealed PENDING rows only; input is a private snapshot
+verified against the producer's committed digest; claims are owner-token
+CAS; terminal state is HELD with zero admission jobs; legacy/unsealed
+and interrupted RECOVERING rows stay fenced.
+"""
 import json
 import tempfile
 import unittest
@@ -9,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.bot import source_auth
+from app.clipping.seal import seal_file
 from app.core.database import connect, migrate
 from app.pipeline import session as ps
 
@@ -33,19 +37,14 @@ class FinalizeTests(unittest.TestCase):
         conn.commit()
         conn.close()
         source_auth.set_scope(self.dir, "someuser", "record", True)
-        # raw media for the PENDING clip
         self.work = self.dir / "sessions" / "someuser"
         self.work.mkdir(parents=True)
-        # sessions that recovery may touch own a durable writer manifest
-        # (initialized before session work, exactly as _run_inner does);
-        # the real proof gate requires it to exist
-        from app.bot import restartproof as _rp
-        assert _rp.init_registry(self.work / f"writers-{self.sid}.json")
         (self.dir / "runtime").mkdir()
         self.raw = self.work / "raw-1.ts"
         self.raw.write_bytes(b"\x47" * 4096)
+        self.seal_sha, self.seal_bytes = seal_file(self.raw)
 
-    def _add_clip(self, status="PENDING"):
+    def _add_clip(self, status="PENDING", sealed=True, owner=None):
         conn = connect(str(self.dir / "nova.db"))
         cur = conn.execute(
             "INSERT INTO candidate_events (session_id, detected_at, kind)"
@@ -53,18 +52,23 @@ class FinalizeTests(unittest.TestCase):
         ev = cur.lastrowid
         cur = conn.execute(
             "INSERT INTO clips (event_id, session_id, file_path,"
-            " duration_seconds, status, created_at)"
-            " VALUES (?,?,?,?,?,0)",
-            (ev, self.sid, str(self.raw), 30.0, status))
-        conn.commit()
+            " duration_seconds, status, created_at, sealed_sha256,"
+            " sealed_bytes, sealed_at, recovery_owner)"
+            " VALUES (?,?,?,?,?,0,?,?,?,?)",
+            (ev, self.sid, str(self.raw), 30.0, status,
+             self.seal_sha if sealed else None,
+             self.seal_bytes if sealed else None,
+             1.0 if sealed else None, owner))
         cid = cur.lastrowid
+        conn.commit()
         conn.close()
         return cid
 
     def _clip(self, cid):
         conn = connect(str(self.dir / "nova.db"))
-        r = conn.execute("SELECT status, duration_seconds, file_path"
-                         " FROM clips WHERE id=?", (cid,)).fetchone()
+        r = conn.execute(
+            "SELECT status, duration_seconds, file_path, recovery_owner"
+            " FROM clips WHERE id=?", (cid,)).fetchone()
         conn.close()
         return r
 
@@ -76,13 +80,8 @@ class FinalizeTests(unittest.TestCase):
         return rows
 
     def _patches(self):
-        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime, watermark=None,
-                      pre_spawn=None, on_spawn=None):
-            # honor the two-phase registration contract like the real one
-            import os
-            tok = pre_spawn() if pre_spawn is not None else None
-            if on_spawn is not None:
-                on_spawn(os.getpid(), os.getpid(), tok)
+        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime,
+                      watermark=None, pre_spawn=None, on_spawn=None):
             Path(dst).write_bytes(b"\x00" * 2048)
         qc = mock.Mock(ok=True)
         return [mock.patch("app.editing.editor.edit_clip", fake_edit),
@@ -90,105 +89,177 @@ class FinalizeTests(unittest.TestCase):
                 mock.patch("app.qc.verify.probe",
                            lambda *a, **k: {"format": {"duration": "28.5"}})]
 
-    def test_pending_clip_finished_with_proof_and_auth(self):
+    def test_sealed_clip_recovered_to_held_no_admission(self):
         cid = self._add_clip()
         for p in self._patches():
             p.start()
         self.addCleanup(mock.patch.stopall)
         with mock.patch("app.bot.ops.auto_deliver_clips") as ad:
-            n = ps.finalize_interrupted_sessions(
-                self.dir, "ffmpeg", "ffprobe",
-                writer_proof=lambda d, u, s: (True, "proven"))
+            n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg",
+                                                 "ffprobe")
         self.assertEqual(n, 1)
-        status, dur, path = self._clip(cid)
+        status, dur, path, owner = self._clip(cid)
         self.assertEqual(status, "HELD")
-        self.assertAlmostEqual(dur, 28.5)   # ffprobe-measured, not guessed
+        self.assertAlmostEqual(dur, 28.5)
+        self.assertIsNone(owner)             # claim released by the CAS
+        self.assertIn("clip-recovery-", Path(path).name)  # unique output
         self.assertTrue(Path(path).exists())
-        ad.assert_not_called()              # no boot-time flush
-        # HOLD-ONLY: boot recovery never enqueues an admission; the clip
-        # waits HELD for the normal owner flows
-        self.assertEqual(self._jobs(), [])
-        # the edit child was registered into the session's writer registry
-        reg = self.work / f"writers-{self.sid}.json"
-        doc = json.loads(reg.read_text())
-        self.assertEqual(doc.get("v"), 1)
-        self.assertTrue(any("pid" in it for it in doc["writers"]))
+        self.assertEqual(self.raw.read_bytes(), b"\x47" * 4096)  # untouched
+        ad.assert_not_called()
+        self.assertEqual(self._jobs(), [])   # HOLD-only, no admission
 
-    def test_no_proof_leaves_clip_pending(self):
-        cid = self._add_clip()
+    def test_unsealed_pending_stays_fenced(self):
+        cid = self._add_clip(sealed=False)
         for p in self._patches():
             p.start()
         self.addCleanup(mock.patch.stopall)
-        n = ps.finalize_interrupted_sessions(
-            self.dir, "ffmpeg", "ffprobe",
-            writer_proof=lambda d, u, s: (False, "leader still alive"))
+        n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
         self.assertEqual(n, 0)
         self.assertEqual(self._clip(cid)[0], "PENDING")
-        self.assertEqual(self._jobs(), [])
 
-    def test_revoked_authorization_leaves_clip_pending(self):
-        cid = self._add_clip()
-        source_auth.set_scope(self.dir, "someuser", "record", False)
+    def test_interrupted_recovering_stays_fenced(self):
+        # a dead owner's claim is never reclaimed by a later run
+        cid = self._add_clip(status="RECOVERING", owner="recovery-dead00")
         for p in self._patches():
             p.start()
         self.addCleanup(mock.patch.stopall)
-        n = ps.finalize_interrupted_sessions(
-            self.dir, "ffmpeg", "ffprobe",
-            writer_proof=lambda d, u, s: (True, "proven"))
+        n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
         self.assertEqual(n, 0)
-        self.assertEqual(self._clip(cid)[0], "PENDING")
+        status, _d, _p, owner = self._clip(cid)
+        self.assertEqual(status, "RECOVERING")
+        self.assertEqual(owner, "recovery-dead00")
+
+    def test_tampered_input_fenced_and_claim_released(self):
+        cid = self._add_clip()
+        self.raw.write_bytes(b"\x00" * 4096)   # no longer matches seal
+        for p in self._patches():
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
+        self.assertEqual(n, 0)
+        status, _d, _p, owner = self._clip(cid)
+        self.assertEqual(status, "PENDING")  # fenced, claim released
+        self.assertIsNone(owner)
+
+    def test_authorization_revoked_mid_edit_returns_pending(self):
+        c1 = self._add_clip()
+        c2 = self._add_clip()
+        edits = []
+
+        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime,
+                      watermark=None, pre_spawn=None, on_spawn=None):
+            edits.append(dst)
+            Path(dst).write_bytes(b"\x00" * 2048)
+            if len(edits) == 1:
+                source_auth.set_scope(self.dir, "someuser", "record",
+                                      False)
+        qc = mock.Mock(ok=True)
+        for p in [mock.patch("app.editing.editor.edit_clip", fake_edit),
+                  mock.patch("app.qc.verify.check_media",
+                             lambda *a, **k: qc),
+                  mock.patch("app.qc.verify.probe",
+                             lambda *a, **k:
+                                 {"format": {"duration": "28.5"}})]:
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
+        # post-edit auth check inside the final transaction: the edit
+        # that SPANNED the revocation must not reach HELD either
+        self.assertEqual(n, 0)
+        self.assertEqual(self._clip(c1)[0], "PENDING")
+        self.assertIsNone(self._clip(c1)[3])
+        self.assertFalse(Path(edits[0]).exists())  # our output removed
+        self.assertEqual(self._clip(c2)[0], "PENDING")
+        self.assertIsNone(self._clip(c2)[3])
 
     def test_idempotent_second_run(self):
         cid = self._add_clip()
         for p in self._patches():
             p.start()
         self.addCleanup(mock.patch.stopall)
-        proof = lambda d, u, s: (True, "proven")
-        n1 = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe",
-                                              writer_proof=proof)
-        n2 = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe",
-                                              writer_proof=proof)
+        n1 = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
+        n2 = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
         self.assertEqual((n1, n2), (1, 0))
-        self.assertEqual(self._jobs(), [])       # hold-only, no admission
+        self.assertEqual(self._jobs(), [])
 
-    def test_authorization_rechecked_between_clips(self):
-        # a long edit can span a revocation: the second clip must NOT be
-        # finished after record authorization is withdrawn mid-run
-        c1 = self._add_clip()
-        c2 = self._add_clip()
-        edits = []
-        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime, watermark=None,
-                      pre_spawn=None, on_spawn=None):
-            edits.append(dst)
-            Path(dst).write_bytes(b"\x00" * 2048)
-            if len(edits) == 1:
-                # revoke while the first edit is "running"
-                source_auth.set_scope(self.dir, "someuser", "record", False)
-        qc = mock.Mock(ok=True)
-        for p in [mock.patch("app.editing.editor.edit_clip", fake_edit),
-                  mock.patch("app.qc.verify.check_media", lambda *a, **k: qc),
-                  mock.patch("app.qc.verify.probe",
-                             lambda *a, **k: {"format": {"duration": "28.5"}})]:
-            p.start()
-        self.addCleanup(mock.patch.stopall)
-        n = ps.finalize_interrupted_sessions(
-            self.dir, "ffmpeg", "ffprobe",
-            writer_proof=lambda d, u, s: (True, "proven"))
-        self.assertEqual(n, 1)
-        self.assertEqual(self._clip(c1)[0], "HELD")
-        self.assertEqual(self._clip(c2)[0], "PENDING")
-
-    def test_non_pending_clips_untouched(self):
-        held = self._add_clip(status="HELD")
+    def test_authorization_off_leaves_pending(self):
+        cid = self._add_clip()
+        source_auth.set_scope(self.dir, "someuser", "record", False)
         for p in self._patches():
             p.start()
         self.addCleanup(mock.patch.stopall)
-        n = ps.finalize_interrupted_sessions(
-            self.dir, "ffmpeg", "ffprobe",
-            writer_proof=lambda d, u, s: (True, "proven"))
+        n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
         self.assertEqual(n, 0)
-        self.assertEqual(self._clip(held)[0], "HELD")
-        self.assertEqual(self._jobs(), [])
+        self.assertEqual(self._clip(cid)[0], "PENDING")
+
+    def test_held_and_other_states_untouched(self):
+        cid = self._add_clip(status="HELD")
+        for p in self._patches():
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe")
+        self.assertEqual(n, 0)
+        self.assertEqual(self._clip(cid)[0], "HELD")
+
+
+class ClaimRaceTests(unittest.TestCase):
+    """Two finalizers claiming the same PENDING clip: exactly one wins;
+    the loser never edits, never overwrites, never double-HELDs."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        conn = connect(str(self.dir / "nova.db"))
+        migrate(conn)
+        conn.execute("INSERT INTO twitch_sources (username, created_at,"
+                     " updated_at) VALUES (?,0,0)", ("someuser",))
+        src = conn.execute("SELECT id FROM twitch_sources").fetchone()[0]
+        conn.execute(
+            "INSERT INTO stream_sessions (source_id, state, ingest_mode,"
+            " notes) VALUES (?,?,?,?)",
+            (src, "RECORDING", "feed", "{}"))
+        self.sid = conn.execute("SELECT id FROM stream_sessions").fetchone()[0]
+        conn.execute(
+            "INSERT INTO candidate_events (session_id, detected_at, kind)"
+            " VALUES (?,0,'moment')", (self.sid,))
+        ev = conn.execute("SELECT id FROM candidate_events").fetchone()[0]
+        raw = self.dir / "raw.ts"
+        raw.write_bytes(b"\x47" * 4096)
+        from app.clipping.seal import seal_file
+        sha, size = seal_file(raw)
+        cur = conn.execute(
+            "INSERT INTO clips (event_id, session_id, file_path,"
+            " duration_seconds, status, created_at, sealed_sha256,"
+            " sealed_bytes, sealed_at) VALUES (?,?,?,?,?,0,?,?,1.0)",
+            (ev, self.sid, str(raw), 30.0, "PENDING", sha, size))
+        self.cid = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+    def test_exactly_one_claim_wins(self):
+        import threading
+        results = {}
+
+        def run(name):
+            conn = connect(str(self.dir / "nova.db"))
+            try:
+                results[name] = ps._claim_clip(conn, self.cid, name)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=run, args=(f"owner-{i}",))
+                   for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(results.values()), 1)
+        winner = [k for k, v in results.items() if v][0]
+        conn = connect(str(self.dir / "nova.db"))
+        row = conn.execute("SELECT status, recovery_owner FROM clips"
+                           " WHERE id=?", (self.cid,)).fetchone()
+        conn.close()
+        self.assertEqual(row[0], "RECOVERING")
+        self.assertEqual(row[1], winner)
 
 
 if __name__ == "__main__":

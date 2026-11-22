@@ -186,12 +186,18 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
         duration = min(duration, max(MIN_CLIP_SECONDS, available - start))
     result["clip_duration_seconds"] = round(duration, 1)
 
-    raw = str(work / "clip-raw.mp4")
+    # unique, never-reused paths: fixed names let two concurrent manual
+    # runs clobber each other's raw/edited files. Retrospective rows are
+    # inserted HELD (never PENDING), so they are not recovery-eligible
+    # and need no seal evidence; the uniqueness fix is for the producers
+    # themselves.
+    from .seal import unique_path
+    raw = str(unique_path(work, "clip-raw", ".mp4"))
     extract_fn(ffmpeg, src_path, raw, start, duration)
     result["extracted"] = Path(raw).exists()
 
     preset = PRESETS.get(plan.preset, PRESETS["vertical"])
-    edited = str(work / "clip-edited.mp4")
+    edited = str(unique_path(work, "clip-edited", ".mp4"))
     edit_fn(ffmpeg, raw, edited, preset, None, 0.5, runtime_dir,
             watermark=plan.watermark or None)
     result["edited"] = Path(edited).exists()

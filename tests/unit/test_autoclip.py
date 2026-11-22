@@ -35,6 +35,12 @@ def _seed_event(db, detected_at, kind, conf):
     conn.close()
 
 
+def _realish_extract(*a, **k):
+    out = Path(a[3])
+    out.write_bytes(b"\x00" * 256)
+    return out
+
+
 class AutoClipTests(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()
@@ -53,7 +59,7 @@ class AutoClipTests(unittest.TestCase):
                            extract_fn=extract_fn)
 
     def test_extracts_above_threshold(self):
-        produced = self._clipper(lambda *a, **k: Path("/tmp/clip.mp4"))\
+        produced = self._clipper(_realish_extract)\
             .process_pending()
         self.assertEqual(produced, 1)
         conn = connect(self.db)
@@ -68,7 +74,7 @@ class AutoClipTests(unittest.TestCase):
         conn.execute("UPDATE candidate_events SET confidence=0.1")
         conn.commit()
         conn.close()
-        produced = self._clipper(lambda *a, **k: Path("/tmp/clip.mp4"))\
+        produced = self._clipper(_realish_extract)\
             .process_pending()
         self.assertEqual(produced, 0)
         conn = connect(self.db)
@@ -95,7 +101,7 @@ class AutoClipTests(unittest.TestCase):
         conn.close()
 
     def test_processed_once(self):
-        clipper = self._clipper(lambda *a, **k: Path("/tmp/clip.mp4"))
+        clipper = self._clipper(_realish_extract)
         self.assertEqual(clipper.process_pending(), 1)
         self.assertEqual(clipper.process_pending(), 0)
 
@@ -112,7 +118,7 @@ class AutoClipTests(unittest.TestCase):
         # each produce a clip of the same content; the higher-scored event
         # wins and the other is marked MERGED, never silently dropped.
         self._add_event(101.5, "scene_change", 0.8)
-        produced = self._clipper(lambda *a, **k: Path("/tmp/clip.mp4"))\
+        produced = self._clipper(_realish_extract)\
             .process_pending()
         self.assertEqual(produced, 1)
         conn = connect(self.db)
@@ -125,7 +131,7 @@ class AutoClipTests(unittest.TestCase):
 
     def test_distinct_moments_not_merged(self):
         self._add_event(140.0, "audio_spike", 0.9)
-        produced = self._clipper(lambda *a, **k: Path("/tmp/clip.mp4"))\
+        produced = self._clipper(_realish_extract)\
             .process_pending()
         self.assertEqual(produced, 2)
         conn = connect(self.db)
@@ -144,7 +150,7 @@ class AutoClipTests(unittest.TestCase):
 
         clipper = AutoClipper(FakeBuffer(), self.db, BrokeProvider(),
                               "ffmpeg", self.td.name, min_score=0.6,
-                              extract_fn=lambda *a, **k: Path("/tmp/c.mp4"))
+                              extract_fn=_realish_extract)
         self.assertEqual(clipper.process_pending(), 0)
         conn = connect(self.db)
         self.assertEqual(conn.execute(
@@ -195,6 +201,85 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class SealEvidenceTests(unittest.TestCase):
+    """Producer sealing: unique never-reused raw paths and durable
+    digest/size evidence committed WITH the PENDING row."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.db = str(Path(self.td.name) / "t.db")
+        conn = connect(self.db)
+        migrate(conn)
+        conn.close()
+        _seed_event(self.db, 100.0, "audio_spike", 0.9)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_pending_row_carries_seal_evidence(self):
+        produced = AutoClipper(FakeBuffer(), self.db, HeuristicProvider(),
+                               "ffmpeg", self.td.name, min_score=0.6,
+                               extract_fn=_realish_extract).process_pending()
+        self.assertEqual(produced, 1)
+        conn = connect(self.db)
+        row = conn.execute(
+            "SELECT file_path, sealed_sha256, sealed_bytes, sealed_at"
+            " FROM clips").fetchone()
+        conn.close()
+        path = Path(row["file_path"])
+        self.assertTrue(path.exists())
+        import hashlib
+        self.assertEqual(row["sealed_sha256"],
+                         hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(row["sealed_bytes"], path.stat().st_size)
+        self.assertIsNotNone(row["sealed_at"])
+
+    def test_paths_unique_across_concurrent_producers(self):
+        # the deterministic-path flaw: two producers select the SAME
+        # PENDING event before either extracts, then extract
+        # concurrently - unique paths keep them from clobbering the
+        # input a finalizer is about to seal
+        import threading
+        barrier = threading.Barrier(2)
+        paths = []
+        def grab(*a, **k):
+            out = Path(a[3])
+            paths.append(out)
+            barrier.wait(10)          # both inside extraction at once
+            out.write_bytes(b"\x00" * 256)
+            return out
+        clippers = [
+            AutoClipper(FakeBuffer(), self.db, HeuristicProvider(),
+                        "ffmpeg", self.td.name, min_score=0.6,
+                        extract_fn=grab)
+            for _ in range(2)]
+        threads = [threading.Thread(target=c.process_pending)
+                   for c in clippers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(paths), 2)
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertTrue(all(p.exists() for p in paths))
+
+    def test_unsealable_output_fails_event_not_silent(self):
+        # an extractor that creates no file must fail the event, never
+        # publish unsealed input
+        produced = AutoClipper(FakeBuffer(), self.db, HeuristicProvider(),
+                               "ffmpeg", self.td.name, min_score=0.6,
+                               extract_fn=lambda *a, **k: Path(a[3]))            .process_pending()
+        self.assertEqual(produced, 0)
+        conn = connect(self.db)
+        self.assertEqual(conn.execute(
+            "SELECT status FROM candidate_events").fetchone()[0],
+            "FAILED")
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM clips WHERE sealed_sha256 IS NOT NULL"
+        ).fetchone()[0], 0)
+        conn.close()
+
+
 class ClipDurationRecordTests(unittest.TestCase):
     """Regression: clips.duration_seconds must record the real extracted
     window, not the buffer's segment length. The session finish path,
@@ -221,7 +306,7 @@ class ClipDurationRecordTests(unittest.TestCase):
     def test_real_extractor_duration_recorded(self):
         clipper = AutoClipper(FakeBuffer(), self.db, HeuristicProvider(),
                               "ffmpeg", self.td.name, min_score=0.6,
-                              extract_fn=lambda *a, **k: (Path("/tmp/c.mp4"),
+                              extract_fn=lambda *a, **k: (_realish_extract(*a, **k),
                                                           27.5))
         self.assertEqual(clipper.process_pending(), 1)
         self.assertEqual(self._duration(), 27.5)
@@ -231,7 +316,7 @@ class ClipDurationRecordTests(unittest.TestCase):
         # the intended pre+post window is the estimate, never 5s segments
         clipper = AutoClipper(FakeBuffer(), self.db, HeuristicProvider(),
                               "ffmpeg", self.td.name, min_score=0.6,
-                              extract_fn=lambda *a, **k: Path("/tmp/c.mp4"))
+                              extract_fn=_realish_extract)
         self.assertEqual(clipper.process_pending(), 1)
         self.assertEqual(self._duration(), 30.0)
 
