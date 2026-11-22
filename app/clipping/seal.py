@@ -135,17 +135,29 @@ def fsync_tree(path) -> None:
 def take_verified_snapshot_bounded(src, snapshot_dir, expected_sha256: str,
                                    expected_bytes: int,
                                    max_seconds: float = 120.0):
-    """Bounded private snapshot: copies at most expected_bytes from the
-    source, aborts if the source delivers MORE than the sealed size or
-    the copy exceeds the time cap, verifies copied size AND digest
-    against the producer's pre-existing committed evidence, fsyncs the
-    snapshot file and directory, and unlinks the snapshot on every
-    failure path. Returns the snapshot path or None."""
+    """Bounded private snapshot with a COOPERATIVE time bound. The byte
+    cap is hard: at most expected_bytes are copied and any extra source
+    byte fences the clip. The time cap is NOT a hard wall: a blocking
+    phase (a single read, write, flush or fsync) cannot be preempted,
+    so the deadline is re-checked AFTER every blocking phase and a late
+    result is REJECTED and cleaned up rather than reported as within
+    budget. The remaining limit is honest: one phase can overrun the
+    cap by its own duration. Copied size AND digest are verified
+    against the producer's pre-existing committed evidence, the
+    snapshot file and directory are fsynced, and the owned partial
+    snapshot is unlinked on every failure or late path. Returns the
+    snapshot path or None."""
     import time as _time
     src = Path(src)
     Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
     snap = unique_path(snapshot_dir, "snapshot", src.suffix or ".bin")
     deadline = _time.monotonic() + max_seconds
+
+    def late(phase: str) -> None:
+        if _time.monotonic() > deadline:
+            raise TimeoutError(f"snapshot {phase} finished after the "
+                               "time cap; result rejected")
+
     try:
         try:
             st = src.stat()
@@ -157,19 +169,19 @@ def take_verified_snapshot_bounded(src, snapshot_dir, expected_sha256: str,
         h = hashlib.sha256()
         with open(src, "rb") as fin, open(snap, "wb") as fout:
             while copied < expected_bytes:
-                if _time.monotonic() > deadline:
-                    raise TimeoutError("snapshot copy exceeded time cap")
                 chunk = fin.read(min(1 << 20, expected_bytes - copied))
                 if not chunk:
                     break
                 h.update(chunk)
                 fout.write(chunk)
                 copied += len(chunk)
+                late("read")
             if fin.read(1):
                 # Source grew past the sealed size: do not trust it.
                 raise ValueError("source larger than sealed bytes")
             fout.flush()
             os.fsync(fout.fileno())
+            late("flush+fsync")
         if copied != expected_bytes or h.hexdigest() != expected_sha256:
             snap.unlink(missing_ok=True)
             return None
@@ -178,6 +190,7 @@ def take_verified_snapshot_bounded(src, snapshot_dir, expected_sha256: str,
             os.fsync(dfd)
         finally:
             os.close(dfd)
+        late("directory fsync")
         return snap
     except Exception:
         snap.unlink(missing_ok=True)

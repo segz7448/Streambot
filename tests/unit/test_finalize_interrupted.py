@@ -264,3 +264,47 @@ class ClaimRaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PostCommitAncillaryTests(FinalizeTests):
+    """The durable HELD commit is the publication point: an ancillary
+    failure after it (memory note, admission bookkeeping) must preserve
+    the committed output, row state and reported result. Cleanup of the
+    owned output is only for unpublished pre-commit failures."""
+
+    def test_recovery_remember_failure_preserves_committed(self):
+        cid = self._add_clip()
+        for p in self._patches():
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch("app.intelligence.memory.Memory.remember",
+                        side_effect=OSError("boom")):
+            n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg",
+                                                 "ffprobe")
+        status, dur, path, owner = self._clip(cid)
+        self.assertEqual(n, 1)
+        self.assertEqual(status, "HELD")
+        self.assertTrue(Path(path).exists())
+
+    def test_live_finalize_with_admission_remember_failure(self):
+        # normal finalization path: admission may already be committed
+        # in the same transaction when the ancillary failure lands
+        source_auth.set_scope(self.dir, "someuser", "repost", True)
+        cid = self._add_clip()
+        for p in self._patches():
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        conn = connect(str(self.dir / "nova.db"))
+        with mock.patch("app.intelligence.memory.Memory.remember",
+                        side_effect=OSError("boom")):
+            held = ps.finish_pending_clips(
+                conn, state_dir=self.dir, session_id=self.sid,
+                source_label="someuser", out_dir=self.work,
+                runtime_dir=self.dir / "runtime",
+                ffmpeg="ffmpeg", ffprobe="ffprobe",
+                enqueue_admission=True)
+        conn.close()
+        status, dur, path, owner = self._clip(cid)
+        self.assertEqual(held, [cid])
+        self.assertEqual(status, "HELD")
+        self.assertTrue(Path(path).exists())

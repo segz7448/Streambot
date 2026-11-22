@@ -809,13 +809,24 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                 except Exception:
                     conn.rollback()
                     raise
-                mem.remember(
-                    "clip", f"session:{session_id}:{clip_id}",
-                    f"{final_dur:.0f}s {plan.preset} clip from "
-                    f"{source_label}", "mode A session",
-                    confidence="observed")
+                # PUBLICATION COMMIT POINT: the row is durably HELD and
+                # the admission outbox (when enabled) is committed in
+                # the same transaction. Everything below is ancillary:
+                # it must never roll back, unlink or fail the published
+                # clip. Cleanup of the owned output is only for
+                # unpublished pre-commit failures (handled above).
                 finished += 1
                 held_ids.append(clip_id)
+                try:
+                    mem.remember(
+                        "clip", f"session:{session_id}:{clip_id}",
+                        f"{final_dur:.0f}s {plan.preset} clip from "
+                        f"{source_label}", "mode A session",
+                        confidence="observed")
+                except Exception as exc:
+                    log.warning("post-commit memory note failed for "
+                                "clip %s (clip stays HELD, output "
+                                "preserved): %s", clip_id, exc)
             else:
                 conn.execute(
                     "UPDATE clips SET status='QC_FAILED',"
