@@ -75,6 +75,7 @@ class PlaybackWorker:
         self.session_name = f"playback-{buffer.session_id}"
         self._auth_at = 0.0
         self._auth_ok = False
+        self.stop_cause = None   # 'scope' (record off) or 'gate' (title)
 
     # -- authorization -------------------------------------------------
     def record_ok(self) -> bool:
@@ -82,9 +83,11 @@ class PlaybackWorker:
         if now - self._auth_at >= self.auth_poll:
             # record scope AND a current GTA6 title match: both are
             # rechecked while running, so a title change ends the capture
-            self._auth_ok = (
-                source_auth.allowed(self.state_dir, self.channel, "record")
-                and content_gate.check(self.channel).ok)
+            scope = source_auth.allowed(self.state_dir, self.channel, "record")
+            gate = scope and content_gate.check(self.channel).ok
+            self.stop_cause = None if gate else (
+                "scope" if not scope else "gate")
+            self._auth_ok = gate
             self._auth_at = now
         return self._auth_ok
 
@@ -266,7 +269,9 @@ class PlaybackWorker:
                     outcome = task.result()   # RuntimeError/OSError propagate
                     task = None
                     if outcome in ("ended", "stopped", "revoked"):
-                        self.end_reason = outcome
+                        self.end_reason = ("gate_closed" if outcome == "revoked"
+                                           and self.stop_cause == "gate"
+                                           else outcome)
                         return
                     if outcome == "continue":
                         self.gap_seconds += self.resolve_interval

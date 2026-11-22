@@ -49,7 +49,9 @@ class World:
             self.user_before(aid)
         if self.mode == "not_started":
             return "not_started", "Not started: the channel is offline or unknown."
-        if self.mode in ("blocked", "unauthorized"):
+        if self.mode == "qualification":
+            self.qualified = False   # the title changed between pre-check and start
+        if self.mode in ("blocked", "unauthorized", "qualification"):
             return self.mode, f"refused ({self.mode})"
         if self.mode == "raise_registered":
             self.s[aid] = dict(running=True, stopping=False, error="")
@@ -364,7 +366,8 @@ class PolicyTests(Base):
     def test_terminal_outcome_after_launch_survives_to_plan(self):
         for kind, want in (("restricted", "BLOCKED"), ("challenge", "BLOCKED"),
                            ("blocked", "BLOCKED"), ("quality", "BLOCKED"),
-                           ("invalid", "BLOCKED"), ("unauthorized", "AWAITING_AUTH")):
+                           ("invalid", "BLOCKED"), ("unauthorized", "AWAITING_AUTH"),
+                           ("qualification", "AWAITING_QUALIFICATION")):
             self.setUp()
             sid, _, _ = self.day()
             self.tick(self.now)
@@ -372,6 +375,7 @@ class PolicyTests(Base):
             self.w.confirmed.add(aid)
             self.tick(self.now + 30)
             self.w.terminal[aid] = kind
+            self.w.qualified = kind != "qualification"   # same gate as the session's
             self.w.finish(aid, "RuntimeError: playback refused")
             self.tick(self.now + 60)
             self.assertEqual(self.plan(sid)[0], want, kind)
@@ -402,6 +406,18 @@ class PolicyTests(Base):
         self.tick(t1 + 10)
         self.assertEqual(self.w.starts, [])
         self.assertEqual(self.plan(sid)[0], "MISSED")
+
+    def test_gate_refusal_at_launch_waits_without_churn_and_is_not_rights(self):
+        sid, _, _ = self.day()
+        self.w.mode = "qualification"
+        t = self.now
+        while t < self.now + 6 * 3600:
+            self.tick(t)
+            t += 300
+        self.assertEqual(len(self.w.starts), 1)            # no retry churn
+        self.assertEqual(self.plan(sid)[0], "AWAITING_QUALIFICATION")
+        self.assertNotEqual(self.plan(sid)[0], "AWAITING_AUTH")
+        self.assertTrue(any("live title" in n for n in self.notices()))
 
     def test_grant_wait_plan_is_open_visible_cancellable_and_blocks_overlap(self):
         sid, t0, t1 = self.day()
@@ -484,12 +500,14 @@ class PolicyTests(Base):
 
     def test_restart_applies_persisted_terminal_before_eligibility(self):
         for kind, want in (("challenge", "BLOCKED"), ("restricted", "BLOCKED"),
-                           ("unauthorized", "AWAITING_AUTH")):
+                           ("unauthorized", "AWAITING_AUTH"),
+                           ("qualification", "AWAITING_QUALIFICATION")):
             self.setUp()
             sid, _, _ = self.day()
             self.tick(self.now)
             aid = self.w.starts[0][1]
             self.w.s.clear()                              # crash before the next tick
+            self.w.qualified = kind != "qualification"
             sched.reconcile(self.d, now=self.now + 50, terminated=lambda u, a: True,
                             terminal=lambda u, a: kind)
             self.assertEqual(self.plan(sid)[0], want, kind)

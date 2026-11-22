@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -53,32 +54,45 @@ class ClipSession:
         self.phase = "starting"
         # live http(s) feeds are re-gated while running; a local recording
         # is a fixture, not live capture
-        self._live_gated = str(feed).startswith(("http://", "https://"))
+        self._live_gated = re.match(r"^[a-z][a-z0-9+.\-]*://",
+                                    str(feed).strip().lower()) is not None
         self._gate_at = 0.0
+        self._gate_ok = True     # last real gate result (retained, not assumed)
+        self._gate_closed = False
 
     @property
     def terminal_kind(self):
         """Typed reason the playback worker stopped for good (restricted,
         challenge, blocked, unauthorized, quality, invalid), 'unauthorized'
         when recording authorization was revoked mid-run, else None."""
+        if self._gate_closed:
+            return "qualification"
         w = getattr(self, "_worker", None)
         if w is None:
             return None
         kind = getattr(w, "terminal_kind", None)
         if kind:
             return kind
+        if getattr(w, "end_reason", None) == "gate_closed":
+            return "qualification"
         if getattr(w, "end_reason", None) == "revoked":
             return "unauthorized"
         return None
 
     def _gate_still_ok(self, poll: float = 30.0) -> bool:
+        """Blocking (the provider may be slow): run it through _owned, never
+        on the event loop. Between polls the LAST real result is returned, so
+        a False is never forgotten. The poll interval is a lower bound on
+        how often the provider is asked, not a wall-clock guarantee."""
         import time as _t
         from ..core import content_gate
         now = _t.monotonic()
-        if now - self._gate_at < poll:
-            return True
-        self._gate_at = now
-        return content_gate.check(self.source_label).ok
+        if self._gate_at and now - self._gate_at < poll:
+            return self._gate_ok
+        ok = content_gate.check(self.source_label).ok
+        self._gate_ok = ok
+        self._gate_at = _t.monotonic()
+        return ok
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -440,7 +454,19 @@ class ClipSession:
         try:
             while not self._stopping.is_set():
                 await asyncio.sleep(self.tick_seconds)
+                if self.playback is None and self._live_gated:
+                    # check BEFORE and after each expensive step; the result
+                    # is retained, so a closed gate stops downstream work
+                    if not await self._owned(self._gate_still_ok):
+                        self._gate_closed = True
+                        self.error = "live title gate closed; capture ended"
+                        break
                 await self._owned(detector.process_new_segments)
+                if (self.playback is None and self._live_gated
+                        and not self._gate_ok):
+                    self._gate_closed = True
+                    self.error = "live title gate closed; capture ended"
+                    break
                 await self._owned(clipper.process_pending)
                 if not finishing:
                     # edit/QC is heavy; never block the recorder loop
@@ -451,11 +477,6 @@ class ClipSession:
                             self.state_dir / "runtime")
                     finally:
                         finishing = False
-                if (self.playback is None and self._live_gated
-                        and not self._gate_still_ok()):
-                    # live feed: the GTA6 title stopped matching or went stale
-                    self.error = "GTA6 title gate closed; capture ended"
-                    break
                 if self.playback is not None and getattr(worker, "finished", False):
                     # the Supervisor swallows service crashes and idles until
                     # stopped, so the playback worker reports its own end

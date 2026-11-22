@@ -48,7 +48,7 @@ class Base(unittest.TestCase):
         self.td = TemporaryDirectory()
         from app.core import content_gate as _cg
         import time as _t
-        _cg.set_provider((lambda u: ('GTA 6 live', _t.time())) if getattr(self, 'qualified', True) else None)
+        _cg.set_provider((lambda u: _cg.Evidence(u, 'GTA 6 live', _t.time(), True)) if getattr(self, 'qualified', True) else None)
         self.addCleanup(_cg.set_provider, None)
         self.dir = Path(self.td.name)
         env = mock.patch.dict("os.environ", {"NOVA_STATE_DIR": str(self.dir)})
@@ -106,7 +106,7 @@ class LoopTests(Base):
 
     def _run_loop_once(self, send):
         if getattr(self, "qualified", True):
-            from app.core import content_gate as _cg; _cg.set_provider(lambda u: ("GTA 6 live", time.time()))
+            from app.core import content_gate as _cg; _cg.set_provider(lambda u: _cg.Evidence(u, "GTA 6 live", time.time(), True))
         self.svc.app = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=send))
 
         async def stop(_s):

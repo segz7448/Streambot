@@ -97,7 +97,7 @@ class Base(unittest.TestCase):
         tp._last.clear()
         from app.core import content_gate as _cg
         import time as _t
-        _cg.set_provider(lambda u: ('GTA 6 live', _t.time()))
+        _cg.set_provider(lambda u: _cg.Evidence(u, 'GTA 6 live', _t.time(), True))
         self.addCleanup(_cg.set_provider, None)
         self.sd = Path(tempfile.mkdtemp())
         conn = database.connect(str(self.sd / "nova.db")); database.migrate(conn); conn.close()
@@ -270,6 +270,32 @@ class WorkerPolicy(Base):
             return mock.Mock(reason="media_cap", segments=1)
         w = self.worker(resolve, cap); self.run_w(w)
         self.assertEqual((w.end_reason, len(calls)), ("revoked", 1))
+
+    def test_title_change_ends_running_playback_with_truthful_reason(self):
+        from app.core import content_gate as cg
+        calls = []
+        def resolve(*a, **k):
+            calls.append(1); return object()
+        def cap(*a, **k):
+            # the title stops matching while the capture runs; the record
+            # scope itself stays ON
+            cg.set_provider(lambda u: cg.Evidence(u, "just chatting", time.time(), True))
+            return mock.Mock(reason="media_cap", segments=1)
+        source_auth.set_scope(self.sd, "streamerx", "record", True)
+        w = self.worker(resolve, cap); self.run_w(w)
+        self.assertEqual((w.end_reason, len(calls)), ("gate_closed", 1))
+        self.assertTrue(source_auth.allowed(self.sd, "streamerx", "record"))
+        self.assertEqual(w.stop_cause, "gate")
+
+    def test_scope_revocation_still_reports_revoked(self):
+        calls = []
+        def resolve(*a, **k):
+            calls.append(1); return object()
+        def cap(*a, **k):
+            source_auth.set_scope(self.sd, "streamerx", "record", False)
+            return mock.Mock(reason="media_cap", segments=1)
+        w = self.worker(resolve, cap); self.run_w(w)
+        self.assertEqual((w.end_reason, w.stop_cause), ("revoked", "scope"))
 
 
 class Lifecycle(Base):

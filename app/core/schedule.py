@@ -318,6 +318,14 @@ def _after_attempt(c, plan_id, now, why: str, terminal: str = "") -> list[str]:
                 "off, so the session stopped. I will wait and resume only if you turn "
                 f"recording on for this streamer (/sourceauth {p['username']} record on, "
                 "only with their permission)."]
+    if terminal == "qualification":
+        c.execute("UPDATE clip_schedules SET state='AWAITING_QUALIFICATION',note=?,"
+                  "updated_at=? WHERE id=?",
+                  ("the selected stream's current live title no longer matches GTA 6", now, plan_id))
+        return [f"Schedule #{plan_id} for {p['username']}: the stream's current live "
+                "title no longer matches GTA 6 (or could not be read), so the session "
+                "stopped. Recording rights are unchanged. I will resume only while the "
+                "title matches and the window is open."]
     if now >= p["end_at"]:
         return _finish(c, p, now)
     c.execute("UPDATE clip_schedules SET state='SCHEDULED',next_try_at=?,note=?,"
@@ -421,7 +429,7 @@ def reconcile(state_dir, now: float | None = None, terminated=None, terminal=Non
                 c.execute("UPDATE schedule_attempts SET state='INTERRUPTED',note=?,"
                           "updated_at=? WHERE id=?", ("service restarted", now, a["id"]))
                 k = terminal(a["username"], a["id"])
-                if k in BLOCKING_KINDS or k == "unauthorized":
+                if k in BLOCKING_KINDS or k in ("unauthorized", "qualification"):
                     outcomes[a["schedule_id"]] = k
         for sid_, k in outcomes.items():
             # a persisted blocked/unauthorized completion wins over eligibility
@@ -511,10 +519,10 @@ def tick(state_dir, ops: Ops, now: float | None = None) -> None:
             with txn(state_dir) as c:
                 if c.execute("UPDATE clip_schedules SET state='AWAITING_QUALIFICATION',note=?,"
                              "updated_at=? WHERE id=? AND state='SCHEDULED'",
-                             ("cannot verify the content is GTA6", now, p["id"])).rowcount:
+                             ("the selected stream's current live title is unavailable or does not match GTA 6", now, p["id"])).rowcount:
                     _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: you asked "
-                            "for GTA6 only and I cannot verify what this streamer is playing, "
-                            "so I am not recording automatically. Nothing started. The "
+                            "for GTA6 only and the selected stream's current live title is unavailable "
+                            "or does not match GTA 6, so I am not recording automatically. Nothing started. The "
                             "schedule stays on file and I will not record anything else.", now)
             continue
         _launch(state_dir, ops, p, now)
@@ -598,6 +606,15 @@ def _launch(state_dir, ops: Ops, p, now) -> None:
                         "I will wait and resume only if you turn recording on "
                         f"(/sourceauth {p['username']} record on, only with their "
                         "permission). I am not retrying in the meantime.", now)
+        elif kind == "qualification":
+            _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, reply)
+            c.execute("UPDATE clip_schedules SET state='AWAITING_QUALIFICATION',note=?,"
+                      "updated_at=? WHERE id=? AND state='ACTIVE'", (reply[:200], now, p["id"]))
+            if cur["state"] == "ACTIVE":
+                _notice(c, p["id"], f"Schedule #{p['id']} for {p['username']}: the "
+                        "selected stream's current live title does not match GTA 6 (or "
+                        "could not be read), so nothing started. Recording rights are "
+                        "unchanged. I will start only while the title matches.", now)
         else:
             _set_attempt(c, aid, ("INTENT",), "NOT_STARTED", now, reply)
             _retry_later(c, p, cur, now, reply, _backoff(cur["fails"] + 1), eligible)
