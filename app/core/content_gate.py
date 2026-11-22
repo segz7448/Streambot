@@ -131,6 +131,7 @@ def check(username: str, now=time.time) -> Result:
         fn, gen = _provider, _gen
         _seq += 1
         seq = _seq
+    guard = None
     if fn is None:
         res, ev = Result(False, "no_source"), None
     else:
@@ -138,33 +139,36 @@ def check(username: str, now=time.time) -> Result:
             ev = fn(u)
         except Exception as exc:  # noqa: BLE001 - any failure is a closed gate
             res, ev = Result(False, "unavailable"), None
-            can = getattr(exc, "can_retain", None)
-            if callable(can) and can() is True:
-                # transport-only failure: no new answer arrived. Keep judging
-                # the last PASSING evidence by its original fetch time, so it
-                # still goes stale at MAX_TITLE_AGE_S. A newer negative answer
-                # (offline/mismatch/wrong channel) cleared it, so it never
-                # overrides one; terminal refusals never set this flag.
-                with _lock:
-                    kept = _good.get(u)
-                if kept is not None:
-                    try:
-                        held = _judge(u, kept, now())
-                    except Exception:  # noqa: BLE001
-                        held = Result(False, "invalid")
-                    if held.ok:
-                        res, ev = held, kept
+            guard = getattr(exc, "retention_guard", None)
+            # transport-only failure: no new answer arrived. The last PASSING
+            # evidence may be re-judged by its ORIGINAL fetch time (so it
+            # still expires at MAX_TITLE_AGE_S), but only inside the
+            # publication critical section below, together with the
+            # terminal-latch check.
         else:
             try:
                 res = _judge(u, ev, now())
             except Exception:  # noqa: BLE001
                 res = Result(False, "invalid")
+    tnow = now() if guard is not None else None
     with _lock:
         if gen != _gen:
             return Result(False, "unavailable")   # provider changed in flight
         if _pub.get(u, 0) > seq:
             newer = _last.get(u)                  # a newer check already won
             return newer[0] if newer else Result(False, "unavailable")
+        if guard is not None:
+            # Lock order: _lock (here) then twitch_title._lock (in guard).
+            # Terminal eligibility and publication share one section.
+            try:
+                with guard() as eligible:
+                    kept = _good.get(u) if eligible else None
+                    if kept is not None:
+                        held = _judge(u, kept, tnow)
+                        if held.ok:
+                            res, ev = held, kept
+            except Exception:  # noqa: BLE001
+                res, ev = Result(False, "unavailable"), None
         _last[u] = (res, ev)
         _pub[u] = seq
         if res.ok and ev is not None:

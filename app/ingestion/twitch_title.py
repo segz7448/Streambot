@@ -83,10 +83,15 @@ class TitleUnavailable(Exception):
         # by its ORIGINAL fetch time, so it still expires at the age limit.
         self.retain = retain
 
-    def can_retain(self) -> bool:
-        """Evaluated by the gate at decision time: a global refusal latch
-        always wins over retention, however it was set meanwhile."""
-        return self.retain is True and latched() is None
+    def retention_guard(self):
+        """Context manager for the gate's retained-result publication.
+        Holds this module's lock (the one _set_latch takes to install a
+        latch) for the whole block, so a latch is either installed before
+        the block (yields False, terminal wins) or waits until the block
+        has published. Lock order: content_gate._lock, then
+        twitch_title._lock. No network under either lock; only a local
+        latch-file read."""
+        return _RetentionGuard(self.retain is True)
 
 
 TERMINAL = ("blocked", "challenge", "restricted")
@@ -182,6 +187,27 @@ def _write(path: str, doc: dict) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+class _RetentionGuard:
+    def __init__(self, eligible: bool):
+        self._eligible = eligible
+        self._held = False
+
+    def __enter__(self) -> bool:
+        _lock.acquire()
+        self._held = True
+        try:
+            return self._eligible and latched() is None
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *a):
+        if self._held:
+            self._held = False
+            _lock.release()
+        return False
 
 
 def _set_latch(kind: str, now: float) -> bool:

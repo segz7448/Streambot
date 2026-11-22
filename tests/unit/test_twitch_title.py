@@ -511,6 +511,43 @@ class RetainTransportOnly(TitleProvider):
         self.m.t += 1
         self.assertFalse(cg.check("slowchan", now=self.m).ok)
 
+    def test_latch_between_transport_error_and_publication_wins(self):
+        import threading
+        paused, resume = threading.Event(), threading.Event()
+        state = {"slow": 0}
+
+        def op(req, timeout, limit, deadline, should_stop):
+            login = json.loads(req.data.decode())["variables"]["login"]
+            if login == "fastchan":
+                return (429, b"")
+            state["slow"] += 1
+            if state["slow"] == 1:
+                return (200, doc(login="slowchan"))
+            raise tp.PlaybackRefused("error", "deadline reached")
+        cg.set_provider(lambda u: tt.fetch(u, opener=op, clock=self.m,
+                                           mono=self.m))
+        self.assertTrue(cg.check("slowchan", now=self.m).ok)
+        self.m.t += 20
+        hit = {"n": 0}
+
+        def seam():
+            hit["n"] += 1
+            if hit["n"] == 1:      # after the transport error, before publish
+                paused.set()
+                resume.wait(5)
+            return self.m()
+        out = {}
+        th = threading.Thread(target=lambda: out.setdefault(
+            "r", cg.check("slowchan", now=seam)))
+        th.start()
+        self.assertTrue(paused.wait(5))
+        self.assertFalse(cg.check("fastchan", now=self.m).ok)
+        self.assertEqual(tt.latched(), "blocked")
+        resume.set()
+        th.join(5)
+        self.assertFalse(out["r"].ok, out["r"].reason)
+        self.assertFalse(cg.check_cached("slowchan", now=self.m).ok)
+
     def test_provider_replacement_drops_kept_evidence(self):
         op = Op((200, doc()), tp.PlaybackRefused("error", "x"))
         check = self.gate(op)
