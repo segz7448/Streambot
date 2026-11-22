@@ -104,7 +104,8 @@ class FFmpegRunner:
     """Creates and tracks FFmpeg/FFprobe processes for one installation."""
 
     def __init__(self, ffmpeg_path: str, ffprobe_path: Optional[str] = None,
-                 max_concurrent: int = 1):
+                 max_concurrent: int = 1, pre_spawn=None, on_spawn=None):
+        self.pre_spawn, self.on_spawn = pre_spawn, on_spawn
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path or ffmpeg_path.replace(
             "ffmpeg", "ffprobe")
@@ -137,10 +138,34 @@ class FFmpegRunner:
                              session_id=session_id,
                              timeout_seconds=timeout)
         self.starting = getattr(self, "starting", 0) + 1
+        token = None
+        if self.pre_spawn is not None:
+            try:
+                token = self.pre_spawn()
+            except Exception:
+                token = None
+            if token is None:
+                self.starting -= 1
+                # a writer that cannot be recorded is never spawned
+                raise FFmpegError("writer spawn intent not recordable")
         try:
             async with self._sem:
                 try:
                     await proc.start()
+                    if self.on_spawn is not None and proc.pid is not None:
+                        # shares this process's group: no pgid recorded;
+                        # the per-pid start-time record is the proof input
+                        try:
+                            bound = self.on_spawn(proc.pid, None, token)
+                        except Exception:
+                            bound = False
+                        if not bound:
+                            try:
+                                await proc.stop(grace=1.0)
+                            except Exception:
+                                pass
+                            raise FFmpegError(
+                                "writer identity not recorded; writer terminated")
                 finally:
                     # register even if the caller was cancelled mid-start
                     if proc.pid is not None or proc._proc is not None:

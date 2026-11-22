@@ -179,7 +179,7 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
             max_media_seconds: float, deadline_sec: float,
             opener=None, host_ok=None, should_stop=None, timeout: float = 15.0,
             grace: float = 10.0, clock=time.monotonic, sleep=time.sleep,
-            output_args=None) -> PumpResult:
+            output_args=None, pre_spawn=None, on_spawn=None) -> PumpResult:
     """Capture to out_path (single MPEG-TS file), or pass ``output_args``
     (list placed after the input, ending in the output target) for e.g. a
     segmenter. ``should_stop()`` is polled before every request and write."""
@@ -190,12 +190,30 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
     t_end = clock() + deadline_sec
     dl = time.monotonic() + deadline_sec
     out = output_args or ["-c", "copy", "-f", "mpegts", out_path]
+    # durable spawn intent BEFORE the child exists; a writer that cannot
+    # be recorded is never spawned (restart death proof depends on it)
+    token = None
+    if pre_spawn is not None:
+        token = pre_spawn()
+        if token is None:
+            raise ValueError("writer spawn intent not recordable; not spawning")
     proc = subprocess.Popen(
         [ffmpeg, "-hide_banner", "-loglevel", "error", "-protocol_whitelist",
          "pipe", "-f", "mpegts", "-i", "pipe:0", "-t",
          str(int(max_media_seconds))] + out,
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE, start_new_session=True)
+    if on_spawn is not None:
+        # the writer leads its own process group: pgid == pid. Binding the
+        # intent to the child's identity MUST succeed; otherwise the owned
+        # child is terminated (its own whole group) and the spawn fails.
+        try:
+            bound = on_spawn(proc.pid, proc.pid, token)
+        except Exception:
+            bound = False
+        if not bound:
+            _terminate(proc, grace)
+            raise RuntimeError("writer identity not recorded; writer terminated")
     ring = bytearray()
 
     def drain():

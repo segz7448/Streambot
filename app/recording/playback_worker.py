@@ -43,7 +43,8 @@ class PlaybackWorker:
                  resolve_interval: float = tp.MIN_INTERVAL_SEC,
                  resolve_fn=None, capture_fn=None, opener=None, host_ok=None,
                  auth_poll_seconds: float = 2.0, sleep=asyncio.sleep,
-                 on_recording=None, probe=None, ffprobe=None):
+                 on_recording=None, probe=None, ffprobe=None, pre_spawn=None,
+                 on_spawn=None):
         self.buffer, self.channel = buffer, channel
         self.db_path, self.state_dir, self.ffmpeg = db_path, state_dir, ffmpeg
         self.initial = initial_resolved
@@ -57,6 +58,7 @@ class PlaybackWorker:
         self.resolve_fn = resolve_fn or tp.resolve
         self.capture_fn = capture_fn or hls_pump.capture
         self.opener, self.host_ok = opener, host_ok
+        self.pre_spawn, self.on_spawn = pre_spawn, on_spawn
         self.auth_poll = auth_poll_seconds
         self._sleep = sleep
         self.on_recording = on_recording
@@ -157,7 +159,8 @@ class PlaybackWorker:
                 resolved, self.ffmpeg, "", max_media_seconds=self.cycle_media,
                 deadline_sec=self.cycle_deadline, opener=self.opener,
                 host_ok=self.host_ok, should_stop=stop_or_revoked,
-                output_args=self.buffer.segmenter_output_args(self.buffer.next_seq()))
+                output_args=self.buffer.segmenter_output_args(self.buffer.next_seq()),
+                pre_spawn=self.pre_spawn, on_spawn=self.on_spawn)
         except tp.PlaybackRefused as e:
             return self._refused(e.kind)
         seq_after = self.buffer.next_seq()
