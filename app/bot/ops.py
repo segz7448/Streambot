@@ -136,7 +136,11 @@ def _journal_read(state_dir: Path) -> dict:
     return locked_read(state_dir / JOURNAL, {})
 
 
-SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries", "publish")
+SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries", "publish",
+                # /recoverclips starts a tracked background recovery; a
+                # stranded one is marked UNCERTAIN and the owner is
+                # asked to re-send - boot never blind-replays recovery
+                "recoverclips")
 
 
 JOURNAL_MAX_AGE_S = 7 * 86400

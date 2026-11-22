@@ -11,6 +11,7 @@ import logging
 import sqlite3
 import re
 import threading
+import time
 from pathlib import Path
 
 from ..core import content_gate
@@ -554,39 +555,209 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
             + " /stopclip ends the session.")
 
 
-def recoverclips_reply(state_dir: Path, ffmpeg: str, ffprobe: str) -> str:
-    """/recoverclips: explicitly finish SEALED PENDING clips left by
-    interrupted sessions, to HELD for owner review. Owner-invoked only
-    (the router is admin-gated); no automatic boot wiring calls this.
-    Nothing is delivered or queued for upload. Legacy/unsealed clips
-    and previously-interrupted recovery claims stay fenced; no capture
-    is resumed and no writer is declared dead."""
+def _interrupted_unfinished(conn) -> dict:
+    """{clip_id: sealed?} for unfinished clips of interrupted sessions."""
+    return {r[0]: bool(r[1]) for r in conn.execute(
+        "SELECT c.id, c.sealed_sha256 IS NOT NULL FROM clips c"
+        " JOIN stream_sessions s ON s.id = c.session_id"
+        " WHERE s.state='INTERRUPTED'"
+        " AND c.status IN ('PENDING','RECOVERING')").fetchall()}
+
+
+def recoverclips_reply(state_dir: Path, ffmpeg: str, ffprobe: str, *,
+                       should_continue=None) -> str:
+    """Synchronous recovery worker (runs on the background thread via
+    RecoveryTracker, never on the command loop): finish SEALED PENDING
+    clips left by interrupted sessions to HELD for owner review. No
+    automatic boot wiring calls this. Nothing is delivered or queued
+    for upload. Legacy/unsealed clips and previously-interrupted
+    recovery claims stay fenced; no capture is resumed and no writer is
+    declared dead. The report is derived from ACTUAL per-clip row
+    states after the run, so failed edits/QC and fenced remainders are
+    stated, never hidden behind 'nothing to do'."""
     from ..core.database import connect
     from ..pipeline.session import finalize_interrupted_sessions
     state_dir = Path(state_dir)
-    held = finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe)
-    fenced = 0
     db = state_dir / "nova.db"
+    eligible: dict = {}
     if db.exists():
         conn = connect(str(db))
         try:
-            fenced = conn.execute(
-                "SELECT count(*) FROM clips c JOIN stream_sessions s"
-                " ON s.id = c.session_id WHERE s.state='INTERRUPTED'"
-                " AND c.status IN ('PENDING','RECOVERING')").fetchone()[0]
+            eligible = _interrupted_unfinished(conn)
         finally:
             conn.close()
+    if not eligible:
+        return ("Recovery: nothing to do - no interrupted sessions "
+                "with unfinished clips.")
+    held = finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
+                                         should_continue=should_continue)
+    return _recovery_outcome_text(state_dir, held, eligible)
+
+
+def _recovery_outcome_text(state_dir: Path, held: int,
+                           eligible: dict) -> str:
+    """Structured per-run outcome for the EXACT clips that were
+    unfinished when this run started - derived from their actual row
+    states afterwards, never from global counts."""
+    from ..core.database import connect
+    state_dir = Path(state_dir)
+    conn = connect(str(state_dir / "nova.db"))
+    try:
+        after = {r[0]: r[1] for r in conn.execute(
+            "SELECT id, status FROM clips WHERE id IN ("
+            + ",".join(str(int(i)) for i in eligible) + ")").fetchall()}
+    finally:
+        conn.close()
+    recovered = sum(1 for i in eligible if after.get(i) == "HELD")
+    failed = sum(1 for i in eligible
+                 if after.get(i) in ("FAILED", "QC_FAILED"))
+    fenced = sum(1 for i in eligible
+                 if after.get(i) in ("PENDING", "RECOVERING"))
+    if recovered != held:
+        # HELD via a non-standard path (e.g. idempotent re-claim):
+        # report the helper's own count, never a derived guess
+        recovered = held
     lines = []
-    if held:
+    if recovered:
         lines.append(
-            f"Recovery: {held} clip(s) from interrupted sessions "
+            f"Recovery: {recovered} clip(s) from interrupted sessions "
             "finished to HELD for your review (/deliveries). "
             "Nothing was delivered or queued for upload.")
+    if failed:
+        lines.append(
+            f"{failed} clip(s) could not be finished (edit or quality "
+            "check failed) - now marked failed; future runs do not "
+            "retry them.")
     if fenced:
         lines.append(
             f"{fenced} clip(s) remain fenced (legacy/unsealed input, "
-            "authorization off, or a previously interrupted recovery) - "
-            "left untouched, not retried.")
+            "input no longer matching the producer's sealed digest, "
+            "authorization off, or a previously interrupted recovery). "
+            "They are left untouched; eligible sealed clips are "
+            "re-checked on each run.")
     if not lines:
-        return "Recovery: nothing to do - no interrupted sessions with recoverable clips."
+        return "Recovery: ran, but no clip changed state - see /logs."
     return "\n".join(lines)
+
+
+class RecoveryTracker:
+    """At most ONE background recovery run per service: /recoverclips
+    returns a quick ack while edits (minutes per clip) run on a daemon
+    thread, so the command loop (stopclip, sourceauth, status) is never
+    blocked. The completion result is handed to notify() (the service
+    queues it into the durable notice outbox); it is also kept for
+    status(). A stranded /recoverclips is NEVER
+    blind-replayed at boot (SIDE_EFFECTING in ops): the owner is asked
+    to re-send instead."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running_since = None
+        self._last_result = None
+        self._thread = None
+        self._started = threading.Event()
+        self._cancel = threading.Event()
+
+    def begin(self, state_dir, ffmpeg, ffprobe, notify) -> str:
+        with self._lock:
+            if self._running_since is not None:
+                waited = int(time.time() - self._running_since)
+                return (f"Recovery is already running ({waited}s). "
+                        "You'll get the result when it finishes.")
+            self._running_since = time.time()
+            self._started.clear()
+            self._cancel.clear()
+        self._thread = threading.Thread(
+            target=self._run, args=(Path(state_dir), ffmpeg, ffprobe,
+                                    notify),
+            daemon=True, name="recoverclips")
+        self._thread.start()
+        # handshake: return only once the worker has actually STARTED
+        # the recovery call, never waiting for the (possibly long) work
+        self._started.wait(5)
+        return ("Recovery started in the background: finishing clips "
+                "from interrupted sessions to HELD for your review. "
+                "Nothing is delivered or queued for upload; you'll get "
+                "the result here when it finishes.")
+
+    def request_cancel(self) -> None:
+        """Service shutdown: ask the run to stop between clips. The
+        current clip finishes its own atomic step; unfinished clips
+        stay PENDING for a later run."""
+        self._cancel.set()
+
+    def _run(self, state_dir, ffmpeg, ffprobe, notify) -> None:
+        try:
+            result = self._execute(state_dir, ffmpeg, ffprobe)
+        except Exception as exc:
+            # the helper commits per clip and never rolls back committed
+            # media; a top-level failure is reported, not hidden
+            result = (f"Recovery stopped early ({exc.__class__.__name__}"
+                      "). Already-finished clips stay HELD; nothing was "
+                      "delivered. Re-send /recoverclips to continue.")
+        with self._lock:
+            self._running_since = None
+            self._last_result = result
+        try:
+            notify(result)
+        except Exception:
+            _log.warning("recovery result notification failed")
+
+    def _execute(self, state_dir, ffmpeg, ffprobe) -> str:
+        # the tracked run ALWAYS invokes the recovery call (the ack
+        # handshake marks exactly that point), even when there is
+        # nothing to recover; the outcome text is derived from actual
+        # row states afterwards
+        from ..core.database import connect
+        from ..pipeline.session import finalize_interrupted_sessions
+        state_dir = Path(state_dir)
+        db = state_dir / "nova.db"
+        eligible: dict = {}
+        if db.exists():
+            conn = connect(str(db))
+            try:
+                eligible = _interrupted_unfinished(conn)
+            finally:
+                conn.close()
+        self._started.set()
+        # positional: per-clip authorization between units (cooperative
+        # cancel at shutdown); the callee default keeps older signatures
+        held = finalize_interrupted_sessions(
+            state_dir, ffmpeg, ffprobe,
+            lambda: not self._cancel.is_set())
+        if not eligible:
+            return ("Recovery: nothing to do - no interrupted sessions "
+                    "with unfinished clips.")
+        return _recovery_outcome_text(state_dir, held, eligible)
+
+    def status(self) -> str:
+        with self._lock:
+            if self._running_since is not None:
+                waited = int(time.time() - self._running_since)
+                suffix = " (stopping after the current clip)" \
+                    if self._cancel.is_set() else ""
+                return f"Recovery is running ({waited}s so far){suffix}."
+            if self._last_result is not None:
+                return self._last_result
+            return "No recovery has run since this service started."
+
+
+_RECOVERY_TRACKER = RecoveryTracker()
+
+
+def recovery_tracker() -> RecoveryTracker:
+    """The service-wide tracker (one background run at a time)."""
+    return _RECOVERY_TRACKER
+
+
+def recoverclips_reply_tracked(state_dir: Path, ffmpeg: str,
+                               ffprobe: str, notify=None, *,
+                               _tracker=None) -> str:
+    """/recoverclips via the service: quick ack; the real work runs in
+    the background (see RecoveryTracker). notify(result_text) is called
+    once when the run finishes; the service wires it to the paired
+    admin."""
+    tracker = _tracker if _tracker is not None else _RECOVERY_TRACKER
+    if notify is None:
+        notify = lambda _text: None
+    return tracker.begin(state_dir, ffmpeg, ffprobe, notify)

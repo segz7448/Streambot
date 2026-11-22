@@ -766,6 +766,19 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
 
 # ---- durable notice outbox (at-most-one in flight, repeats are labelled) --
 
+def queue_notice(state_dir, text: str, schedule_id: int | None = None) -> int:
+    """Durable outbox insert for a non-schedule notice (e.g. a background
+    recovery result): delivered by the service's notice consumer with the
+    same claim/send/mark-sent/release-and-label-repeat reconciliation as
+    schedule notices. Never sends anything itself, so it is safe from any
+    thread and offline."""
+    with txn(state_dir) as c:
+        cur = c.execute("INSERT INTO schedule_notices (schedule_id,text,"
+                        "created_at) VALUES (?,?,?)",
+                        (schedule_id, text, time.time()))
+        return cur.lastrowid
+
+
 def claim_notice(state_dir, now: float | None = None):
     now = now if now is not None else time.time()
     with txn(state_dir) as c:

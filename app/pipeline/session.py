@@ -885,7 +885,8 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
     return held_ids
 
 
-def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe, *,
+def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
+                                  should_continue=None,
                                   writer_proof=None) -> int:
     """Sealed-input recovery for sessions left INTERRUPTED: finish the
     clips whose raw input carries durable producer seal evidence so the
@@ -928,6 +929,11 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe, *,
             "  AND c.sealed_sha256 IS NOT NULL)").fetchall()
         total = 0
         for sid, username in rows:
+            if should_continue is not None and not should_continue():
+                # shutdown requested: stop between sessions; unfinished
+                # clips stay PENDING for a later run
+                log.warning("recovery stopped early (shutdown requested)")
+                break
             if not source_auth.allowed(state_dir, username, "record"):
                 log.warning("recovery skipped for session %s (%s): "
                             "record authorization is off", sid, username)
@@ -970,6 +976,7 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe, *,
                         f"clip-recovery-{cid}-{_t}.mp4",
                     input_resolver=snapshot_resolver,
                     auth_on_conn=auth_now,
+                    per_clip_authorization=should_continue,
                     require_sealed=True)
             finally:
                 # snapshots are private working copies: removed on every

@@ -228,10 +228,26 @@ class BotService:
         return source_auth.sourceauth_reply(self._state_dir(), args)
 
     def _recoverclips(self) -> str:
+        # quick ack only: the tracked background run does the work, so a
+        # long edit never holds the single-concurrency command loop
+        # behind it (stopclip/sourceauth/status stay responsive)
         from . import media as bot_media
         from . import sessions as sess
         ff, fp = bot_media.ffmpeg_paths()
-        return sess.recoverclips_reply(self._state_dir(), ff, fp)
+        return sess.recoverclips_reply_tracked(self._state_dir(), ff,
+                                               fp, notify=self._notify)
+
+    def _notify(self, text: str) -> None:
+        # enqueue the background result into the durable notice outbox;
+        # the service's notice consumer delivers it to the paired admin
+        # with claim/send/mark-sent semantics (retried after failure and
+        # reconciled after a restart, never lost). Queueing only: safe
+        # from the worker thread and offline, never raises.
+        from ..core import schedule as _sched
+        try:
+            _sched.queue_notice(self._state_dir(), text)
+        except Exception:
+            log.exception("recovery result notice could not be queued")
 
     def _stopclip(self) -> str:
         from . import sessions as sess
@@ -530,6 +546,8 @@ class BotService:
             await asyncio.sleep(30)
 
     async def _stop_handoff_consumer(self, _app) -> None:
+        from . import sessions as _sess
+        _sess.recovery_tracker().request_cancel()
         for name in ("_sched_task", "_pollwatch_task", "_handoff_task"):
             task = getattr(self, name, None)
             if task is not None:
@@ -574,9 +592,9 @@ class BotService:
         # proof-based recovery over interrupted sessions, and process-
         # visibility completeness on Android is unresolved, so no
         # recovery/overwrite path may run here. finalize_interrupted_
-        # sessions stays in the tree (with its tests) unwired for a
-        # future round; interrupted sessions keep their PENDING clips
-        # fenced for manual review.
+        # sessions is NOT run here: recovery only runs on the
+        # owner's explicit /recoverclips command; interrupted
+        # sessions keep their PENDING clips fenced until then.
         from ..core import schedule as _schedmod
         from . import sessions as _s2
         # restartproof proof OR leg removed here as well (see above):

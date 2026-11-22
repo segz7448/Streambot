@@ -47,6 +47,38 @@ async def deliver_clip(token: str, store: PairingStore, video_path: str,
     raise last  # type: ignore[misc]
 
 
+async def notify_admin_text(token: str, store: PairingStore, text: str,
+                            attempts: int = 3) -> int:
+    """Send one plain-text message to the paired owner. Same owner
+    scoping and transient-retry shape as deliver_clip."""
+    admin = store.admin_id()
+    if admin is None:
+        raise NoAdminError("no paired admin; run /pair first")
+    request = HTTPXRequest(connect_timeout=30, read_timeout=60,
+                           write_timeout=60, pool_timeout=30)
+    bot = Bot(token=token, request=request)
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            async with bot:
+                message = await bot.send_message(chat_id=admin,
+                                                 text=text)
+            return message.message_id
+        except (TimedOut, NetworkError) as exc:
+            last = exc
+            await asyncio.sleep(2 * (attempt + 1))
+    raise last  # type: ignore[misc]
+
+
+def notify_admin_text_sync(token_path: str, state_dir: str,
+                           text: str) -> int:
+    from ..core.tokensrc import read_token
+    token = read_token(token_path)
+    import os
+    store = PairingStore(os.path.join(state_dir, "admin.json"))
+    return asyncio.run(notify_admin_text(token, store, text))
+
+
 def deliver_clip_sync(token_path: str, state_dir: str, video_path: str,
                       caption: str = "") -> int:
     from ..core.tokensrc import read_token
