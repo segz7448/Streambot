@@ -275,18 +275,18 @@ class TitleProvider(unittest.TestCase):
         self.assertEqual(len(op.calls), 1)        # no additional request
 
     def test_crash_between_response_and_commit_stays_closed(self):
-        real_close, real_set = tt._fence_close, tt._set_latch
+        real_set = tt._set_latch
 
         def die(*a, **k):
-            raise SystemExit("process killed")
-        tt._fence_close = lambda name: None       # a dead process cleans nothing
-        tt._set_latch = die
+            raise SystemExit("orderly exit during commit")
+        tt._set_latch = die                       # real finalizer runs
         try:
             op = Op((429, b""), (200, doc()))
             with self.assertRaises(SystemExit):
                 self.fetch(op)
         finally:
-            tt._fence_close, tt._set_latch = real_close, real_set
+            tt._set_latch = real_set
+        self.assertEqual(len(self.fences()), 1)
         self.assertFalse(os.path.exists(tt.latch_path()))
         self.restart()
         with self.assertRaises(tt.TitleUnavailable) as c:

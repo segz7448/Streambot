@@ -283,7 +283,7 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                     raise TitleUnavailable("latched")
             return hit[0]
         fence = _fence_open()                   # raises no_state: no request
-        keep = False                            # True: commit failed, keep fence
+        done = False        # True only after a positively completed commit
         body = json.dumps({
             "operationName": "StreamTitle", "query": _QUERY,
             "variables": {"login": login}}).encode()
@@ -306,34 +306,39 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                 ev = _parse(doc, login, clock())
             except TitleUnavailable as exc:
                 if exc.kind in TERMINAL:
-                    keep = not _set_latch(exc.kind, clock())
+                    done = _set_latch(exc.kind, clock()) is True
                 else:
                     wait = REJECT_BACKOFF_S if exc.kind == "rejected" \
                         else ERROR_BACKOFF_S
                     with _lock:
                         _backoff[login] = mono() + wait
+                    done = True
                 raise
             except tp.PlaybackRefused as exc:
                 if exc.kind in TERMINAL:
-                    keep = not _set_latch(exc.kind, clock())
+                    done = _set_latch(exc.kind, clock()) is True
                     raise TitleUnavailable(exc.kind) from None
                 with _lock:
                     _backoff[login] = mono() + ERROR_BACKOFF_S
+                done = True
                 raise TitleUnavailable("transport") from None
             except Exception:
                 with _lock:
                     _backoff[login] = mono() + ERROR_BACKOFF_S
+                done = True
                 raise TitleUnavailable("error") from None
             with _lock:
                 if latched():             # a refusal (any channel) won the race
+                    done = True
                     raise TitleUnavailable("latched")
                 _cache[login] = (ev, mono())
                 _backoff.pop(login, None)
+                done = True
             return ev
         except BaseException:
             raise
         finally:
-            if not keep:
+            if done:                    # interrupted/unexpected exits keep it
                 _fence_close(fence)
 
 
