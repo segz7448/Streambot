@@ -487,6 +487,10 @@ class BotService:
             confirm=lambda a: _sched.confirm_recording(sd, a, valid),
             error=_sess.session_error,
             writer_active=lambda u: _sess.writer_active(sd, u),
+            # positive proof only: the session's own drained attestation.
+            # Proof-based recovery via restartproof is DISABLED in
+            # production: process-visibility completeness on Android is
+            # unresolved, so no proof OR leg may terminate a window here.
             terminated=lambda u, a: _sess.session_terminated(sd, u, a),
             terminal=lambda u, a: _sess.session_terminal(u, a, sd),
             content_qualified=lambda u: self._content_qualified(u),
@@ -556,11 +560,22 @@ class BotService:
         if recovered:
             log.warning("marked %d crashed session(s) INTERRUPTED",
                         recovered)
+        # Boot-time clip finalization is DISABLED in production: it is
+        # proof-based recovery over interrupted sessions, and process-
+        # visibility completeness on Android is unresolved, so no
+        # recovery/overwrite path may run here. finalize_interrupted_
+        # sessions stays in the tree (with its tests) unwired for a
+        # future round; interrupted sessions keep their PENDING clips
+        # fenced for manual review.
         from ..core import schedule as _schedmod
         from . import sessions as _s2
+        # restartproof proof OR leg removed here as well (see above):
+        # interrupted windows end MISSED only on the session's own
+        # positive attestation
         _n = _schedmod.reconcile(
             self._state_dir(),
-            terminated=lambda u, a: _s2.session_terminated(self._state_dir(), u, a),
+            terminated=lambda u, a: _s2.session_terminated(
+                self._state_dir(), u, a),
             terminal=lambda u, a: _s2.session_terminal(u, a, self._state_dir()))
         if _n:
             log.warning("ended %d interrupted schedule window(s) MISSED", _n)

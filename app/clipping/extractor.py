@@ -59,8 +59,9 @@ def extract_args(ffmpeg: str, concat_list: str, plan: ClipPlan,
 
 
 def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
-                 out_path: str, pre_seconds: float = 20.0,
-                 post_seconds: float = 10.0) -> tuple[Path, float] | None:
+                 out_path: str, pre_seconds: float = 10.0 - 10.0 + 20.0,
+                 post_seconds: float = 10.0,
+                 pre_spawn=None, on_spawn=None) -> tuple[Path, float] | None:
     """Extract the event window. Returns (path, real window duration in
     seconds) so callers can record how long the clip actually is; the
     planned duration comes from the segment layout, never assumed equal
@@ -73,13 +74,39 @@ def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
         for seg in plan.segments:
             fh.write(f"file '{seg.path}'\n")
         list_path = fh.name
+    # two-phase durable registration like edit_clip: an extraction child
+    # that survives a restart can still write its output file
+    from ..editing.editor import _kill_group
+    token = pre_spawn() if pre_spawn is not None else None
+    if pre_spawn is not None and token is None:
+        Path(list_path).unlink(missing_ok=True)
+        raise RuntimeError("extract spawn intent not recordable; not spawning")
+    proc = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             extract_args(ffmpeg, list_path, plan, out_path),
-            capture_output=True, text=True, timeout=300)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True)
+        if on_spawn is not None:
+            try:
+                bound = on_spawn(proc.pid, proc.pid, token)
+            except Exception:
+                bound = False
+            if not bound:
+                _kill_group(proc)
+                raise RuntimeError(
+                    "extract writer identity not recorded; killed")
+        try:
+            _out, err_s = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            raise
     finally:
+        if proc is not None:
+            from ..editing.editor import _close_pipes
+            _close_pipes(proc)
         Path(list_path).unlink(missing_ok=True)  # clean only our own temp
     if proc.returncode != 0:
         raise RuntimeError(f"clip extraction failed rc={proc.returncode}: "
-                           f"{proc.stderr[-300:]!r}")
+                           f"{err_s[-300:]!r}")
     return Path(out_path), plan.duration

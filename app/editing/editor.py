@@ -79,21 +79,109 @@ def edit_args(ffmpeg: str, src: str, out: str, preset: OutputPreset,
     return args
 
 
+def _close_pipes(proc) -> None:
+    """Close any pipes still open on the child so no fd reaches a
+    destructor unclosed (ResourceWarning)."""
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
+
+def _group_alive(pgid: int) -> bool:
+    """True unless the group is verifiably EMPTY. Any uncertainty
+    (permission, transient errors) is treated as alive: group cleanup
+    must never declare success on a guess."""
+    import os
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+
+
+def _kill_group(proc) -> None:
+    """Best-effort teardown of the spawned child's own process group (the
+    child leads it: start_new_session=True). A dead leader is NOT a dead
+    group: after the leader exits we verify the group is empty and
+    escalate to SIGKILL while any member survives. This is group cleanup
+    only; it does not establish arbitrary-descendant containment, and
+    callers verify outcomes instead of trusting this best-effort pass."""
+    import os
+    import signal
+    import time
+    pgid = proc.pid
+    try:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                break                    # group verifiably empty
+            except PermissionError:
+                break                    # cannot signal: nothing more to do
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    proc.wait(timeout=0.1)
+                except Exception:
+                    pass
+                if not _group_alive(pgid):
+                    break
+            if not _group_alive(pgid):
+                break
+    finally:
+        _close_pipes(proc)
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+
 def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
               subtitle_path: str | None = None, focus_x: float = 0.5,
               runtime_dir: str = ".nova-runtime",
-              watermark: str | None = None) -> Path:
+              watermark: str | None = None,
+              pre_spawn=None, on_spawn=None) -> Path:
     env = dict(os.environ)
     if subtitle_path or watermark:
         # drawtext and libass both resolve fonts through fontconfig;
         # relocated prefixes ship a fontconfig that points at paths
         # which no longer exist (device-verified on the owner's AGT phone)
         env.update(ensure_fontconfig_env(ffmpeg, runtime_dir))
-    proc = subprocess.run(
+    # two-phase durable registration (when hooks are given): intent
+    # BEFORE spawn, identity bound right after; an unrecordable writer is
+    # never spawned and an unbindable one is killed with its whole group,
+    # because a surviving edit child can still write its output file
+    token = pre_spawn() if pre_spawn is not None else None
+    if pre_spawn is not None and token is None:
+        raise RuntimeError("edit spawn intent not recordable; not spawning")
+    proc = subprocess.Popen(
         edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x,
                   watermark=watermark),
-        capture_output=True, text=True, timeout=600, env=env)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        start_new_session=True)
+    if on_spawn is not None:
+        try:
+            bound = on_spawn(proc.pid, proc.pid, token)
+        except Exception:
+            bound = False
+        if not bound:
+            _kill_group(proc)
+            raise RuntimeError("edit writer identity not recorded; killed")
+    try:
+        try:
+            out_s, err_s = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            raise
+    finally:
+        _close_pipes(proc)
     if proc.returncode != 0:
         raise RuntimeError(f"edit failed rc={proc.returncode}: "
-                           f"{proc.stderr[-300:]!r}")
+                           f"{err_s[-300:]!r}")
     return Path(out)
