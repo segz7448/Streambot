@@ -52,8 +52,8 @@ class PlaybackWorker:
                  resolve_interval: float = tp.MIN_INTERVAL_SEC,
                  resolve_fn=None, capture_fn=None, opener=None, host_ok=None,
                  auth_poll_seconds: float = 2.0, sleep=asyncio.sleep,
-                 on_recording=None, probe=None, ffprobe=None, pre_spawn=None,
-                 on_spawn=None, mono=time.monotonic):
+                 on_recording=None, probe=None, ffprobe=None,
+                 mono=time.monotonic, pre_spawn=None, on_spawn=None):
         self.buffer, self.channel = buffer, channel
         self.db_path, self.state_dir, self.ffmpeg = db_path, state_dir, ffmpeg
         self.initial = initial_resolved
