@@ -51,6 +51,10 @@ class ClipSession:
         self.error: str | None = None
         self.clips_finished = 0
         self.phase = "starting"
+        # live http(s) feeds are re-gated while running; a local recording
+        # is a fixture, not live capture
+        self._live_gated = str(feed).startswith(("http://", "https://"))
+        self._gate_at = 0.0
 
     @property
     def terminal_kind(self):
@@ -66,6 +70,15 @@ class ClipSession:
         if getattr(w, "end_reason", None) == "revoked":
             return "unauthorized"
         return None
+
+    def _gate_still_ok(self, poll: float = 30.0) -> bool:
+        import time as _t
+        from ..core import content_gate
+        now = _t.monotonic()
+        if now - self._gate_at < poll:
+            return True
+        self._gate_at = now
+        return content_gate.check(self.source_label).ok
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -438,6 +451,11 @@ class ClipSession:
                             self.state_dir / "runtime")
                     finally:
                         finishing = False
+                if (self.playback is None and self._live_gated
+                        and not self._gate_still_ok()):
+                    # live feed: the GTA6 title stopped matching or went stale
+                    self.error = "GTA6 title gate closed; capture ended"
+                    break
                 if self.playback is not None and getattr(worker, "finished", False):
                     # the Supervisor swallows service crashes and idles until
                     # stopped, so the playback worker reports its own end

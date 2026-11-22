@@ -95,6 +95,10 @@ class Base(unittest.TestCase):
 
     def setUp(self):
         tp._last.clear()
+        from app.core import content_gate as _cg
+        import time as _t
+        _cg.set_provider(lambda u: ('GTA 6 live', _t.time()))
+        self.addCleanup(_cg.set_provider, None)
         self.sd = Path(tempfile.mkdtemp())
         conn = database.connect(str(self.sd / "nova.db")); database.migrate(conn); conn.close()
         self.addCleanup(shutil.rmtree, self.sd, True)

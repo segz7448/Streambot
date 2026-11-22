@@ -181,11 +181,10 @@ class BotService:
         from . import ops
         return ops.stoprelay_reply(self._state_dir())
 
-    _content_qualified_fn = None   # no GTA6 verifier exists: gate stays closed
-
     def _content_qualified(self, user):
-        fn = self._content_qualified_fn
-        return bool(fn(user)) if fn else False
+        # the shared GTA6 title gate; no title source ships, so it is closed
+        from ..core import content_gate
+        return content_gate.qualified(user)
 
     def _state_dir(self) -> Path:
         return Path(os.environ.get("NOVA_STATE_DIR",

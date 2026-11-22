@@ -12,6 +12,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from ..core import content_gate
 from ..distribution.relay import validate_feed
 from ..pipeline.session import ClipSession
 
@@ -44,6 +45,18 @@ def _feed_for(state_dir: Path, username: str) -> str | None:
 
 
 _tl = threading.local()
+
+
+def _gate_refusal(username: str) -> str | None:
+    """Shared GTA6 boundary for every live-capture start. None when the
+    selected streamer's CURRENT title matches; otherwise the refusal text
+    (fail closed). A manual or scheduled start only decides timing."""
+    res = content_gate.check(username)
+    if res.ok:
+        return None
+    _tl.refusal = "qualification"
+    return (f"Not started: {content_gate.describe(res.reason)}, so I cannot "
+            f"confirm {username} is playing GTA 6. Nothing is recording.")
 _log = logging.getLogger(__name__)
 
 
@@ -269,6 +282,10 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
                 f"feeds/{username}.mp4. Nothing is recording. "
                 "Continuous capture of arbitrary Twitch channels is "
                 "not available without one (architecture boundary).")
+    if str(feed_spec).startswith(("http://", "https://")):
+        refused = _gate_refusal(username)   # live capture: GTA6 title gate,
+        if refused is not None:             # before any feed validation
+            return refused
     try:
         feed = validate_feed(feed_spec, state_dir / "feeds")
     except ValueError as exc:
@@ -294,6 +311,10 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
                 return (f"The previous session for {username} is still "
                         "finalizing its clips. Try again in a moment - "
                         "nothing was started.")
+        if feed.startswith(("http://", "https://")):
+            refused = _gate_refusal(username)   # recheck at the launch point
+            if refused is not None:
+                return refused
         session = session_factory(ffmpeg, ffprobe, feed, username,
                                   state_dir)
         _bind(session)
@@ -404,6 +425,9 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
         return (f"Recording is not authorized for {username} (default OFF). "
                 f"Nothing started. Only with the streamer's permission: "
                 f"/sourceauth {username} record on")
+    refused = _gate_refusal(username)       # before any network or media
+    if refused is not None:
+        return refused
     res = _Reservation()
     res._sched_token = getattr(_tl, "attempt", None)
     with _lock:
@@ -449,6 +473,8 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
             elif not source_auth.allowed(state_dir, username, "record"):
                 msg = (f"Recording authorization for {username} was turned "
                        "off during startup. Nothing is recording.")
+            elif (refused := _gate_refusal(username)) is not None:
+                msg = refused      # title stopped matching during startup
             else:
                 msg = None
                 session = session_factory(ffmpeg, ffprobe, "", username,

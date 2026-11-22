@@ -46,6 +46,10 @@ class _Fake:
 class Base(unittest.TestCase):
     def setUp(self):
         self.td = TemporaryDirectory()
+        from app.core import content_gate as _cg
+        import time as _t
+        _cg.set_provider((lambda u: ('GTA 6 live', _t.time())) if getattr(self, 'qualified', True) else None)
+        self.addCleanup(_cg.set_provider, None)
         self.dir = Path(self.td.name)
         env = mock.patch.dict("os.environ", {"NOVA_STATE_DIR": str(self.dir)})
         env.start(); self.addCleanup(env.stop)
@@ -102,7 +106,7 @@ class LoopTests(Base):
 
     def _run_loop_once(self, send):
         if getattr(self, "qualified", True):
-            self.svc._content_qualified_fn = lambda u: True
+            from app.core import content_gate as _cg; _cg.set_provider(lambda u: ("GTA 6 live", time.time()))
         self.svc.app = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=send))
 
         async def stop(_s):

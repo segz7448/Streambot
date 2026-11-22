@@ -23,6 +23,7 @@ import asyncio
 import time
 
 from ..bot import source_auth
+from ..core import content_gate
 from ..core.logging import get_logger
 from ..ingestion import hls_pump, twitch_playback as tp
 
@@ -79,7 +80,11 @@ class PlaybackWorker:
     def record_ok(self) -> bool:
         now = time.monotonic()
         if now - self._auth_at >= self.auth_poll:
-            self._auth_ok = source_auth.allowed(self.state_dir, self.channel, "record")
+            # record scope AND a current GTA6 title match: both are
+            # rechecked while running, so a title change ends the capture
+            self._auth_ok = (
+                source_auth.allowed(self.state_dir, self.channel, "record")
+                and content_gate.check(self.channel).ok)
             self._auth_at = now
         return self._auth_ok
 
