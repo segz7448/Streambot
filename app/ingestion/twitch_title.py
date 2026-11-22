@@ -18,10 +18,17 @@ Evidence rules (all fail closed, enforced again by content_gate):
     offline channel returns ``live=False``, so the gate says not_live;
   * a missing user, malformed or empty shape, or a non-string/blank title
     while live raises (the gate then reports "unavailable");
-  * 401/403/429, a challenge or integrity response, a redirect, a non-JSON
-    body, or a transport error raises. Nothing is retried or worked around:
-    after a block/restriction/challenge this module makes NO request for
-    BLOCK_BACKOFF_S, after another error for ERROR_BACKOFF_S;
+  * ACCESS REFUSAL IS TERMINAL: HTTP 401/403/429, a GraphQL error that
+    says unauthorized/forbidden/rate-limited/challenge/integrity/captcha, or
+    a shared PlaybackRefused of kind blocked/challenge/restricted latches this
+    source closed. The latch is written to disk (0600, a typed kind and a
+    time only), so an ordinary process restart does not clear it, and NO
+    request is made again, ever, by any timer or scheduler. Only an explicit,
+    authorized ``reset_latch(authorized=True)`` (or deleting the latch file)
+    clears it; nothing in the service calls that. Nothing is worked around;
+  * a redirect, a non-JSON body, a 5xx or a transport error is transient:
+    bounded retry after ERROR_BACKOFF_S; a query the endpoint rejects for
+    another reason after REJECT_BACKOFF_S;
   * no cookies, no impersonation, no proxy rotation, no integrity forging.
 
 Rate: at most one request per channel per MIN_INTERVAL_S; inside that window
@@ -32,6 +39,7 @@ Audio, video and segments are never requested here.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -41,8 +49,8 @@ from ..core.content_gate import Evidence
 from . import twitch_playback as tp
 
 MIN_INTERVAL_S = 15.0
-BLOCK_BACKOFF_S = 600.0
 ERROR_BACKOFF_S = 30.0
+REJECT_BACKOFF_S = 300.0
 TIMEOUT_S = 15.0
 _LOGIN = re.compile(r"^[a-z0-9_]{3,25}$")
 
@@ -59,14 +67,80 @@ class TitleUnavailable(Exception):
         self.kind = kind
 
 
+TERMINAL = ("blocked", "challenge", "restricted")
+_CHALLENGE_WORDS = ("integrity", "challenge", "captcha", "kasada")
+_BLOCK_WORDS = ("unauthorized", "unauthenticated", "forbidden", "toomanyrequests",
+                "too many requests", "rate limit", "ratelimit", "rate_limit",
+                "access denied", "not authorized")
+LATCH_FILE = "title_source_latch.json"
+_latch_path_override = None      # tests
+_latched = None                  # in-memory copy of the kind, once set
+
 _lock = threading.Lock()
 _cache: dict = {}        # login -> (Evidence, monotonic fetched)
 _backoff: dict = {}      # login -> monotonic deadline
 _locks: dict = {}        # login -> per-channel lock (serialises a burst)
 
 
+def latch_path() -> str:
+    if _latch_path_override:
+        return _latch_path_override
+    state = os.environ.get("NOVA_STATE_DIR") or os.path.expanduser("~/.nova-clip")
+    return os.path.join(state, LATCH_FILE)
+
+
+def latched():
+    """The latched refusal kind, or None. Checks the file on every call so a
+    restart (or another process) sees the same latch; the in-memory copy
+    keeps it closed even if the file cannot be written or read."""
+    global _latched
+    if _latched:
+        return _latched
+    try:
+        with open(latch_path(), "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        kind = doc.get("kind") if isinstance(doc, dict) else None
+        _latched = kind if kind in TERMINAL else "blocked"
+    except FileNotFoundError:
+        return None
+    except Exception:           # unreadable/corrupt latch file: stay closed
+        _latched = "blocked"
+    return _latched
+
+
+def _set_latch(kind: str, now: float) -> None:
+    global _latched
+    _latched = kind if kind in TERMINAL else "blocked"
+    path = latch_path()
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"kind": _latched, "at": int(now)}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass                    # the in-memory latch still holds
+
+
+def reset_latch(*, authorized: bool = False) -> bool:
+    """Explicit, authorized clear of the refusal latch. Never called by the
+    service, a timer or the scheduler."""
+    global _latched
+    if authorized is not True:
+        return False
+    _latched = None
+    try:
+        os.remove(latch_path())
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    return True
+
+
 def reset() -> None:
-    """Forget cache and backoff (tests)."""
+    """Forget cache and backoff (tests). Does NOT clear the latch."""
     with _lock:
         _cache.clear()
         _backoff.clear()
@@ -84,8 +158,10 @@ def _parse(doc, login: str, now: float) -> Evidence:
     errs = doc.get("errors")
     if errs:
         txt = json.dumps(errs).lower()
-        if any(w in txt for w in ("integrity", "challenge", "captcha", "kasada")):
+        if any(w in txt for w in _CHALLENGE_WORDS):
             raise TitleUnavailable("challenge")
+        if any(w in txt for w in _BLOCK_WORDS):
+            raise TitleUnavailable("blocked")
         raise TitleUnavailable("rejected")
     data = doc.get("data")
     user = data.get("user") if isinstance(data, dict) else None
@@ -114,7 +190,11 @@ def fetch(channel: str, *, opener=None, clock=time.time,
     login = (channel or "").strip().lstrip("@").lower()
     if not _LOGIN.match(login):
         raise TitleUnavailable("invalid")
+    if latched():
+        raise TitleUnavailable("latched")           # no request, ever
     with _chan_lock(login):
+        if latched():
+            raise TitleUnavailable("latched")
         t = mono()
         with _lock:
             until = _backoff.get(login, 0.0)
@@ -143,12 +223,18 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                 raise TitleUnavailable("not_json") from None
             ev = _parse(doc, login, clock())
         except TitleUnavailable as exc:
-            wait = BLOCK_BACKOFF_S if exc.kind in ("blocked", "challenge") \
-                else ERROR_BACKOFF_S
-            with _lock:
-                _backoff[login] = mono() + wait
+            if exc.kind in TERMINAL:
+                _set_latch(exc.kind, clock())
+            else:
+                wait = REJECT_BACKOFF_S if exc.kind == "rejected" \
+                    else ERROR_BACKOFF_S
+                with _lock:
+                    _backoff[login] = mono() + wait
             raise
         except tp.PlaybackRefused as exc:
+            if exc.kind in TERMINAL:
+                _set_latch(exc.kind, clock())
+                raise TitleUnavailable(exc.kind) from None
             with _lock:
                 _backoff[login] = mono() + ERROR_BACKOFF_S
             raise TitleUnavailable("transport") from None

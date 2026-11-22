@@ -1,5 +1,8 @@
 """Anonymous live-title provider (synthetic responses only; no network)."""
 import json
+import os
+import stat
+import tempfile
 import time
 import unittest
 
@@ -36,11 +39,22 @@ class Clock:
 
 class TitleProvider(unittest.TestCase):
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        tt._latch_path_override = os.path.join(self.tmp.name, "state", tt.LATCH_FILE)
+        tt._latched = None
         tt.reset()
         self.m = Clock()
 
     def tearDown(self):
         cg.set_provider(None)
+        tt.reset()
+        tt._latched = None
+        tt._latch_path_override = None
+        self.tmp.cleanup()
+
+    def restart(self):
+        """Simulate an ordinary process restart: memory gone, file stays."""
+        tt._latched = None
         tt.reset()
 
     def fetch(self, op, ch="Lacy"):
@@ -92,38 +106,145 @@ class TitleProvider(unittest.TestCase):
         cg.set_provider(lambda u: tt.fetch(u, opener=Op((200, b"x")), mono=self.m))
         self.assertEqual(cg.check("lacy").reason, "unavailable")
 
-    def test_block_statuses_back_off_without_retry(self):
+    def test_access_refusal_latches_terminally_no_timed_retry(self):
         for code in (401, 403, 429):
+            tt._latched = None
+            tt.reset_latch(authorized=True)
             tt.reset()
-            op = Op((code, b""), (200, doc()))
-            with self.assertRaises(tt.TitleUnavailable):
-                self.fetch(op)
-            self.m.t += tt.BLOCK_BACKOFF_S - 1
+            op = Op((code, b""), (200, doc()), (200, doc()))
             with self.assertRaises(tt.TitleUnavailable) as c:
                 self.fetch(op)
-            self.assertEqual(c.exception.kind, "backoff")
-            self.assertEqual(len(op.calls), 1)       # no request in the window
-            self.m.t += 2
-            self.assertTrue(self.fetch(op).live)     # only after the window
+            self.assertEqual(c.exception.kind, "blocked")
+            for dt in (1, 601, 86400 * 30):          # timers never reopen it
+                self.m.t += dt
+                with self.assertRaises(tt.TitleUnavailable) as c:
+                    self.fetch(op, "Other_Chan")      # any channel
+                self.assertEqual(c.exception.kind, "latched")
+            self.assertEqual(len(op.calls), 1, code)  # exactly one request
 
-    def test_challenge_backs_off(self):
-        body = json.dumps({"errors": [{"message": "failed integrity check"}]}).encode()
+    def test_latch_survives_restart_and_has_private_mode(self):
+        op = Op((403, b""), (200, doc()))
+        with self.assertRaises(tt.TitleUnavailable):
+            self.fetch(op)
+        path = tt.latch_path()
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        with open(path) as fh:
+            body = fh.read()
+        self.assertEqual(set(json.loads(body)), {"kind", "at"})
+        self.restart()
+        with self.assertRaises(tt.TitleUnavailable) as c:
+            self.fetch(op)
+        self.assertEqual(c.exception.kind, "latched")
+        self.assertEqual(len(op.calls), 1)
+        # provider path through the gate stays closed too
+        cg.set_provider(lambda u: tt.fetch(u, opener=op, mono=self.m))
+        self.assertEqual(cg.check("lacy").reason, "unavailable")
+        self.assertEqual(len(op.calls), 1)
+
+    def test_graphql_errors_latch(self):
+        cases = {"challenge": ["failed integrity check", "Captcha required"],
+                 "blocked": ["Forbidden", "TooManyRequests", "rate limit exceeded",
+                             "unauthenticated", "Unauthorized"]}
+        for kind, msgs in cases.items():
+            for msg in msgs:
+                tt._latched = None
+                tt.reset_latch(authorized=True)
+                tt.reset()
+                body = json.dumps({"errors": [{"message": msg}]}).encode()
+                op = Op((200, body), (200, doc()))
+                with self.assertRaises(tt.TitleUnavailable) as c:
+                    self.fetch(op)
+                self.assertEqual(c.exception.kind, kind, msg)
+                self.m.t += 10 ** 6
+                with self.assertRaises(tt.TitleUnavailable) as c:
+                    self.fetch(op)
+                self.assertEqual(c.exception.kind, "latched", msg)
+                self.assertEqual(len(op.calls), 1, msg)
+
+    def test_shared_typed_refusals_latch(self):
+        for kind in ("blocked", "challenge", "restricted"):
+            tt._latched = None
+            tt.reset_latch(authorized=True)
+            tt.reset()
+            op = Op(tp.PlaybackRefused(kind, "https://x/?token=SECRETVALUE"),
+                    (200, doc()))
+            with self.assertRaises(tt.TitleUnavailable) as c:
+                self.fetch(op)
+            self.assertEqual(c.exception.kind, kind)
+            self.assertNotIn("SECRET", repr(c.exception))
+            self.restart()
+            self.m.t += 10 ** 6
+            with self.assertRaises(tt.TitleUnavailable) as c:
+                self.fetch(op)
+            self.assertEqual(c.exception.kind, "latched")
+            self.assertEqual(len(op.calls), 1, kind)
+
+    def test_unreadable_latch_file_stays_closed(self):
+        os.makedirs(os.path.dirname(tt.latch_path()))
+        with open(tt.latch_path(), "w") as fh:
+            fh.write("{not json")
+        op = Op((200, doc()))
+        with self.assertRaises(tt.TitleUnavailable) as c:
+            self.fetch(op)
+        self.assertEqual(c.exception.kind, "latched")
+        self.assertEqual(op.calls, [])
+
+    def test_unwritable_state_dir_still_latches_in_memory(self):
+        tt._latch_path_override = "/proc/definitely/not/writable/latch.json"
+        op = Op((429, b""), (200, doc()))
+        with self.assertRaises(tt.TitleUnavailable):
+            self.fetch(op)
+        with self.assertRaises(tt.TitleUnavailable) as c:
+            self.fetch(op)
+        self.assertEqual(c.exception.kind, "latched")
+        self.assertEqual(len(op.calls), 1)
+
+    def test_only_explicit_authorized_reset_clears(self):
+        op = Op((429, b""), (200, doc()))
+        with self.assertRaises(tt.TitleUnavailable):
+            self.fetch(op)
+        tt.reset()                                    # test helper: not a reset
+        self.assertFalse(tt.reset_latch())
+        self.assertFalse(tt.reset_latch(authorized=1))
+        self.assertIsNotNone(tt.latched())
+        self.assertTrue(tt.reset_latch(authorized=True))
+        self.assertIsNone(tt.latched())
+        self.assertTrue(self.fetch(op).live)
+
+    def test_transient_failures_do_not_latch_and_retry_bounded(self):
+        for ans in ((500, b""), (302, b""), (200, b"junk"),
+                    tp.PlaybackRefused("error", "x"), RuntimeError("boom")):
+            tt.reset()
+            op = Op(ans, (200, doc()))
+            with self.assertRaises(tt.TitleUnavailable):
+                self.fetch(op)
+            self.assertIsNone(tt.latched())
+            with self.assertRaises(tt.TitleUnavailable) as c:   # inside window
+                self.fetch(op)
+            self.assertEqual(c.exception.kind, "backoff")
+            self.assertEqual(len(op.calls), 1)
+            self.m.t += tt.ERROR_BACKOFF_S + 1
+            self.assertTrue(self.fetch(op).live)
+
+    def test_rejected_query_has_longer_backoff_no_latch(self):
+        body = json.dumps({"errors": [{"message": "unknown field"}]}).encode()
         op = Op((200, body), (200, doc()))
         with self.assertRaises(tt.TitleUnavailable) as c:
             self.fetch(op)
-        self.assertEqual(c.exception.kind, "challenge")
+        self.assertEqual(c.exception.kind, "rejected")
+        self.assertIsNone(tt.latched())
+        self.m.t += tt.ERROR_BACKOFF_S + 1
         with self.assertRaises(tt.TitleUnavailable):
             self.fetch(op)
         self.assertEqual(len(op.calls), 1)
+        self.m.t += tt.REJECT_BACKOFF_S
+        self.assertTrue(self.fetch(op).live)
 
-    def test_transport_error_short_backoff_and_no_leak(self):
-        op = Op(tp.PlaybackRefused("error", "https://x/?token=SECRETVALUE"),
-                (200, doc()))
+    def test_transport_error_no_leak(self):
+        op = Op(tp.PlaybackRefused("error", "https://x/?token=SECRETVALUE"))
         with self.assertRaises(tt.TitleUnavailable) as c:
             self.fetch(op)
         self.assertNotIn("SECRET", repr(c.exception) + str(c.exception.__cause__))
-        self.m.t += tt.ERROR_BACKOFF_S + 1
-        self.assertTrue(self.fetch(op).live)
 
     def test_rate_limit_reuses_evidence_with_original_time(self):
         op = Op((200, doc()), (200, doc(title="Minecraft")))
