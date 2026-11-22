@@ -41,6 +41,38 @@ log = get_logger("recording.playback")
 TERMINAL = {"restricted", "challenge", "blocked", "unauthorized", "quality",
             "invalid"}
 
+# Fixed schema for cycle diagnostics: closed enums and bounded finite
+# numbers only, so the diagnostic path can never carry secret-bearing or
+# unbounded free text (no raw stderr, no refusal detail, no str() of
+# arbitrary objects).
+_CAPTURE_REASONS = frozenset(
+    {"ended", "media_cap", "deadline", "stopped", "ffmpeg_exit"})
+_REFUSAL_KINDS = frozenset(
+    {"unauthorized", "invalid", "offline", "restricted", "challenge",
+     "blocked", "quality", "error"})
+
+
+def _safe_kind(exc) -> str:
+    kind = getattr(exc, "kind", None)
+    return kind if kind in _REFUSAL_KINDS else "error"
+
+
+def _bounded_int(res, name, lo=-1_000_000, hi=1_000_000_000):
+    v = getattr(res, name, None)
+    if isinstance(v, bool) or not isinstance(v, int) or not (lo <= v <= hi):
+        return "?"
+    return str(v)
+
+
+def _bounded_float(res, name, hi=1_000_000.0):
+    v = getattr(res, name, None)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return "?"
+    v = float(v)
+    if not (0.0 <= v <= hi) or v != v or v == float("inf"):
+        return "?"
+    return "%.1fs" % v
+
 
 class PlaybackWorker:
     def __init__(self, buffer, channel: str, db_path: str, state_dir,
@@ -86,6 +118,14 @@ class PlaybackWorker:
         self.end_reason = "not_started"
         self.finished = False
         self.error_text = None
+        # Last cycle's nonsecret failure evidence as a FIXED SCHEMA: stage
+        # and refusal kind from closed enums, capture reason from the pump's
+        # closed enum, and bounded finite numeric counters only. No raw
+        # stderr, refusal detail or any other free text ever appears here,
+        # so nothing secret-bearing can leak through this path. Surfaced in
+        # terminal errors so a retry-class failure is diagnosable instead
+        # of a bare constant.
+        self.last_cycle_diag = None
         self._active = 0
         self._active_lock = __import__("threading").Lock()
         self.session_name = f"playback-{buffer.session_id}"
@@ -168,6 +208,7 @@ class PlaybackWorker:
                     opener=self.opener, host_ok=self.host_ok,
                     min_interval=self.resolve_interval, should_stop=stop_or_revoked)
         except tp.PlaybackRefused as e:
+            self.last_cycle_diag = "resolve refused kind=" + _safe_kind(e)
             return self._refused(e.kind)
         if not self._recheck():
             return "revoked"
@@ -183,7 +224,9 @@ class PlaybackWorker:
                 output_args=self.buffer.segmenter_output_args(self.buffer.next_seq()),
                 pre_spawn=self.pre_spawn, on_spawn=self.on_spawn)
         except tp.PlaybackRefused as e:
+            self.last_cycle_diag = "capture refused kind=" + _safe_kind(e)
             return self._refused(e.kind)
+        self._note_cycle_diag(res)
         seq_after = self.buffer.next_seq()
         wrote = seq_after > seq_before and self._new_media_valid(seq_before, seq_after)
         self.captured_segments += res.segments if wrote else 0
@@ -253,6 +296,25 @@ class PlaybackWorker:
                 return True
         return False
 
+    def _note_cycle_diag(self, res) -> None:
+        """Record the finished cycle's fixed-schema diagnostic. Only enum
+        members and bounded finite numbers are emitted; anything else
+        (partial doubles, Mocks, strings-in-numeric-fields, junk) degrades
+        to a placeholder. MUST NEVER RAISE: a diagnostic failure must not
+        change capture behavior or turn a success into a crash."""
+        try:
+            reason = getattr(res, "reason", None)
+            if reason not in _CAPTURE_REASONS:
+                reason = "unknown"
+            self.last_cycle_diag = (
+                "capture reason=%s ffmpeg_rc=%s segments=%s media=%s bytes=%s"
+                % (reason, _bounded_int(res, "ffmpeg_rc"),
+                   _bounded_int(res, "segments"),
+                   _bounded_float(res, "media_seconds"),
+                   _bounded_int(res, "bytes_written")))
+        except Exception:
+            self.last_cycle_diag = "capture diag-unavailable"
+
     terminal_kind = None      # typed reason for a terminal refusal (read by the scheduler)
 
     def _refused(self, kind: str) -> str:
@@ -297,7 +359,10 @@ class PlaybackWorker:
                     # output media, and none is attempted here
                     if self.single_cycle:
                         if outcome == "retry":
-                            raise RuntimeError("single capture attempt failed; no retry")
+                            raise RuntimeError(
+                                "single capture attempt failed; no retry: "
+                                + (self.last_cycle_diag
+                                   or "no diagnostic recorded"))
                         self.end_reason = "single_cycle_complete"
                         return  # never reconnect/re-resolve in acceptance mode
                     if outcome in ("ended", "stopped", "revoked"):

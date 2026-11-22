@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 from . import sessions, source_auth
+from ..ingestion import twitch_playback as tp
 from ..pipeline.session import ClipSession
 
 
@@ -63,7 +64,6 @@ def _run(sd, ffmpeg, ffprobe, target, seconds, *, monitor=None,
         # Existing launcher owns reservation, current title gate, source scope
         # checks and a single resolve. No schedule, retry or alternate route.
         if start_fn is None:
-            from ..ingestion import twitch_playback as tp
             def resolve_once(*args, **kwargs):
                 prior = kwargs.get("should_stop", lambda: False)
                 kwargs["should_stop"] = lambda: expired.is_set() or time.monotonic() >= deadline or prior()
@@ -100,9 +100,19 @@ def _run(sd, ffmpeg, ffprobe, target, seconds, *, monitor=None,
         timer.join()
     session = owned[0]
     proven = bool(getattr(session, "_finalized", False))
+    # Nonsecret failure evidence for the operator job output, fixed schema
+    # only: a failure boolean plus the worker's closed-enum cycle
+    # diagnostic (stage/refusal kind/reason/ffmpeg rc/counters). No raw
+    # session error text, stderr or refusal detail is ever emitted here.
+    worker = getattr(session, "_worker", None)
+    diag = getattr(worker, "last_cycle_diag", None)
+    if not isinstance(diag, str) or len(diag) > 200:
+        diag = None
     return {"launched": True, "session_id": getattr(session, "_session_id", None),
             "terminated": proven, "monitor_fault": fault,
             "clips_finished": session.clips_finished,
+            "session_failed": bool(getattr(session, "error", None)),
+            "capture_diag": diag,
             "reason": "finished" if proven else "termination_unproven"}
 
 
