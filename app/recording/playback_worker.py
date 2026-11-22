@@ -15,10 +15,15 @@ Policy (all fail closed, no bypass attempts):
   quality / invalid: TERMINAL (RuntimeError naming only the kind). A
   restriction is never retried through a different route.
 - transient 'error' and ffmpeg exits: bounded reconnects with backoff and
-  a cumulative-gap limit, like RecordingWorker. A cycle that ran healthy
-  for at least healthy_reset_seconds re-arms both budgets (RecordingWorker
-  has always done this); cycle boundaries re-resolve as soon as the
-  resolver's own rate window allows instead of idling a fixed interval
+  a cumulative-gap limit. Budgets are NEVER re-armed in this worker: the
+  only progress signal available at this layer is the count of HLS input
+  segments fed, not validated new output media, so no honest health
+  reset is implementable yet (one may return when newly finalized output
+  duration is actually measured). Boundary (continue) waits accumulate
+  into the same gap budget and are checked against max_gap like reconnect
+  backoff, so degenerate quick cycles exhaust in bounded time too. Cycle
+  boundaries re-resolve as soon as the resolver's own rate window allows
+  instead of idling a fixed interval
   with no capture.
 """
 from __future__ import annotations
@@ -44,7 +49,6 @@ class PlaybackWorker:
                  cycle_deadline_seconds: float = 1800.0,
                  max_reconnects: int = 5, reconnect_base_seconds: float = 5.0,
                  max_gap_seconds: float = 300.0,
-                 healthy_reset_seconds: float = 300.0,
                  resolve_interval: float = tp.MIN_INTERVAL_SEC,
                  resolve_fn=None, capture_fn=None, opener=None, host_ok=None,
                  auth_poll_seconds: float = 2.0, sleep=asyncio.sleep,
@@ -59,7 +63,6 @@ class PlaybackWorker:
         self.max_reconnects = max_reconnects
         self.reconnect_base = reconnect_base_seconds
         self.max_gap = max_gap_seconds
-        self.healthy_reset = healthy_reset_seconds
         self.resolve_interval = resolve_interval
         self._mono = mono
         self._last_resolve_mono = mono()
@@ -268,8 +271,6 @@ class PlaybackWorker:
                 stop = lambda: ctx.stopping or self._stop_req
                 while not stop():
                     ctx.heartbeat()
-                    segs_before = self.captured_segments
-                    cycle_started = self._mono()
                     task = asyncio.create_task(asyncio.to_thread(self._cycle, stop))
                     while not task.done():
                         ctx.heartbeat()
@@ -280,15 +281,9 @@ class PlaybackWorker:
                         await asyncio.wait({task}, timeout=1.0)
                     outcome = task.result()   # RuntimeError/OSError propagate
                     task = None
-                    # a cycle that produced valid media and ran healthy for
-                    # a while is evidence of stability: re-arm the budgets
-                    # (the cap guards a stream dropping NOW, not total
-                    # drops over a long scheduled window)
-                    if (self.captured_segments > segs_before and
-                            self._mono() - cycle_started
-                            >= self.healthy_reset):
-                        self.reconnects = 0
-                        self.gap_seconds = 0.0
+                    # budgets are strictly cumulative for the life of the
+                    # session: no reset is honest without measured new
+                    # output media, and none is attempted here
                     if outcome in ("ended", "stopped", "revoked"):
                         self.end_reason = ("gate_closed" if outcome == "revoked"
                                            and self.stop_cause == "gate"
@@ -305,6 +300,13 @@ class PlaybackWorker:
                                    - (self._mono()
                                       - self._last_resolve_mono) + 0.5)
                         self.gap_seconds += wait
+                        # boundary waits count toward the same cumulative
+                        # gap cap as reconnect backoff: quick cycles with
+                        # no earned reset must still exhaust in bounded
+                        # time instead of looping on continues forever
+                        if self.gap_seconds > self.max_gap:
+                            raise RuntimeError(
+                                "playback unstable: cumulative reconnect gap exceeded")
                         await self._wait(ctx, wait)
                         continue
                     self.reconnects += 1

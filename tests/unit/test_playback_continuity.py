@@ -11,8 +11,9 @@ Two regressions pinned here, with real ffmpeg and a local in-memory opener
 2. Between cycles the worker used to idle a full resolve interval (30 s of
    lost footage every cycle) even though the resolver's own rate window
    was satisfied one whole cycle earlier; it now waits only the true
-   remaining window. A healthy cycle re-arms the reconnect/gap budgets,
-   like RecordingWorker.
+   remaining window. Boundary waits count toward the cumulative gap cap,
+   and budgets are never re-armed: no honest progress signal exists at
+   this layer (fed input segments are not validated output media).
 """
 import asyncio
 import subprocess
@@ -103,8 +104,9 @@ class _FakeBuffer:
 
     session_id = 1
 
-    def __init__(self):
+    def __init__(self, segment_seconds: int = 2):
         self._seq = 0
+        self.segment_seconds = segment_seconds
 
     def next_seq(self):
         return self._seq
@@ -150,7 +152,8 @@ class WorkerCycleTests(unittest.IsolatedAsyncioTestCase):
     def _worker(self, capture_fn, **kw):
         self.mono = [10_000.0]
         return PlaybackWorker(
-            _FakeBuffer(), "chan", str(self.dir / "nova.db"), self.dir,
+            _FakeBuffer(segment_seconds=kw.pop("segment_seconds", 2)),
+            "chan", str(self.dir / "nova.db"), self.dir,
             "ffmpeg", resolve_fn=lambda channel, **k: object(),
             capture_fn=capture_fn, auth_poll_seconds=0.0,
             sleep=self.rec, mono=lambda: self.mono[0], **kw)
@@ -177,29 +180,92 @@ class WorkerCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(sum(self.sleeps), 5.0)
         self.assertEqual(w.end_reason, "stopped")
 
-    async def test_healthy_cycle_rearms_reconnect_budget(self):
+    async def test_long_dense_cycles_never_rearm_the_budget(self):
+        # DELIBERATE conservative bound: the only progress signal at this
+        # layer is the count of HLS INPUT segments fed, not validated new
+        # output media, so no honest health reset exists. Even long,
+        # media-writing cycles leave spent budgets spent. (A measured
+        # output-duration reset may return as separate work.)
         ctx = _Ctx()
         calls = []
 
         def cap(resolved, ffmpeg, out, **kw):
             calls.append(1)
-            self.mono[0] += 1500.0    # a long, healthy capture cycle
+            self.mono[0] += 1500.0    # a long capture cycle, dense media
             if len(calls) == 1:
                 raise tp.PlaybackRefused("error", "transient blip")
             if len(calls) >= 3:
                 ctx.stopping = True
             return hls_pump.PumpResult("media_cap", 3, 6.0, 1000, 0, 1, "")
 
-        w = self._worker(cap, resolve_interval=30.0,
-                         healthy_reset_seconds=300.0)
+        w = self._worker(cap, resolve_interval=30.0)
         await self._run(w, ctx)
         self.assertEqual(len(calls), 3)
-        # the transient failure spent one reconnect; the healthy cycle
-        # after it re-armed the budget instead of letting boundary noise
-        # accumulate into a session-killing "playback unstable"
-        self.assertEqual(w.reconnects, 0)
-        self.assertLess(w.gap_seconds, 2.0)
-        self.assertEqual(w.end_reason, "stopped")
+        # the transient failure spent one reconnect and it stays spent
+        self.assertEqual(w.reconnects, 1)
+        self.assertGreater(w.gap_seconds, 0.0)
+
+    async def test_quick_continue_cycles_exhaust_the_gap_cap(self):
+        # REGRESSION (reviewer retraction): the continue branch used to add
+        # its boundary wait to gap_seconds without ever checking max_gap,
+        # so a stream whose every cycle ends at the media cap immediately,
+        # writing nothing, looped on continues forever. Each cycle below
+        # "runs" 1 s and writes 0 segments: no reset can be earned, the
+        # ~resolve-interval boundary waits accumulate, and the worker must
+        # terminate once the cumulative gap cap is exceeded.
+        ctx = _Ctx()
+        calls = []
+
+        def cap(resolved, ffmpeg, out, **kw):
+            calls.append(1)
+            self.mono[0] += 1.0       # degenerate quick cycle
+            if len(calls) >= 50:
+                ctx.stopping = True   # backstop; the fix must stop it first
+            return hls_pump.PumpResult("media_cap", 0, 0.0, 0, 0, 1, "")
+
+        w = self._worker(cap, resolve_interval=30.0, max_gap_seconds=300.0)
+        with self.assertRaises(RuntimeError):
+            await self._run(w, ctx)
+        self.assertEqual(w.end_reason, "failed")
+        self.assertIn("gap exceeded", w.error_text)
+        self.assertLess(len(calls), 50)
+
+    async def test_input_count_is_not_validated_output_duration(self):
+        # Independent reviewer counterexample, adapted: 100 fed HLS input
+        # segments and 301 s of wall time with only ONE real 5 s validated
+        # output file. No input-count-based reset may ever re-arm budgets
+        # from this. Guards against reintroduction of the removed re-arm.
+        from app.recording.buffer import RollingBuffer
+        from app.core.database import connect, migrate
+        ctx = _Ctx()
+        real_seg = make_segment(self.dir / "src5.ts", seconds=5.0)
+        buf = RollingBuffer(str(self.dir / "buf"), 1, segment_seconds=5)
+        conn = connect(str(self.dir / "nova.db"))
+        migrate(conn)
+        conn.close()
+        holder = {}
+
+        def cap(resolved, ffmpeg, out, **kw):
+            self.mono[0] += 301.0     # long wall, lots of fed input
+            # one real 5 s ffprobe-valid output segment, whatever the
+            # input HLS count claims
+            (buf.dir / "seg-000000.ts").write_bytes(real_seg)
+            ctx.stopping = True
+            return hls_pump.PumpResult("deadline", 100, 200.0, 1000, 0, 1, "")
+
+        self.mono = [10_000.0]
+        w = PlaybackWorker(
+            buf, "chan", str(self.dir / "nova.db"), self.dir, "ffmpeg",
+            resolve_fn=lambda channel, **k: object(), capture_fn=cap,
+            auth_poll_seconds=0.0, sleep=self.rec, mono=lambda: self.mono[0],
+            resolve_interval=30.0)
+        w.reconnects = 2
+        w.gap_seconds = 100.0
+        await self._run(w, ctx)
+        # 5 s of actual media over 301 s of wall must not earn a reset:
+        # the spent reconnect and the accumulated gap both remain
+        self.assertEqual(w.reconnects, 2)
+        self.assertGreater(w.gap_seconds, 100.0)
 
     async def test_nonzero_ffmpeg_rc_at_cap_consumes_a_reconnect(self):
         ctx = _Ctx()
@@ -224,8 +290,7 @@ class WorkerCycleTests(unittest.IsolatedAsyncioTestCase):
             raise tp.PlaybackRefused("error", "still broken")
 
         w = self._worker(cap, resolve_interval=30.0, max_reconnects=2,
-                         reconnect_base_seconds=1.0,
-                         healthy_reset_seconds=0.0)
+                         reconnect_base_seconds=1.0)
         with self.assertRaises(RuntimeError):
             await self._run(w, ctx)
         self.assertEqual(w.end_reason, "failed")
