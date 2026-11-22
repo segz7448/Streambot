@@ -151,7 +151,7 @@ class ClipSession:
         from ..editing.presets import PRESETS
         from ..intelligence.memory import Memory
         from ..intelligence.planner import plan_clip
-        from ..qc.verify import check_media
+        from ..qc.verify import check_media, probe
         mem = Memory(str(self.state_dir / "memory.json"))
         rows = conn.execute(
             "SELECT id, file_path, duration_seconds FROM clips"
@@ -170,6 +170,20 @@ class ClipSession:
                 qc = check_media(self.ffprobe, self.ffmpeg, str(edited),
                                  1.0, 100, 100, True)
                 if qc.ok:
+                    # Record the FINAL measured duration of the edited
+                    # file (ffprobe), the same discipline the
+                    # retrospective path uses: the edit step can change
+                    # length. If the measurement fails, keep the
+                    # extraction-window duration rather than guess.
+                    measured = None
+                    try:
+                        measured = float(
+                            probe(self.ffprobe, str(edited))
+                            .get("format", {}).get("duration", 0) or 0)
+                    except Exception:
+                        measured = None
+                    final_dur = (measured if measured and measured > 0
+                                 else float(dur or 0))
                     # Atomic HELD-to-admission outbox: the HELD update,
                     # the stored-metadata update and the durable
                     # admission job commit in ONE transaction, so a
@@ -183,8 +197,9 @@ class ClipSession:
                     try:
                         conn.execute(
                             "UPDATE clips SET file_path=?, preset=?,"
-                            " status='HELD', qc_report_json=? WHERE id=?",
-                            (str(edited), plan.preset,
+                            " duration_seconds=?, status='HELD',"
+                            " qc_report_json=? WHERE id=?",
+                            (str(edited), plan.preset, final_dur,
                              json.dumps({"qc_passed": True,
                                          "plan_reasons": plan.reasons}),
                              clip_id))
@@ -219,7 +234,7 @@ class ClipSession:
                         raise
                     mem.remember(
                         "clip", f"session:{session_id}:{clip_id}",
-                        f"{dur:.0f}s {plan.preset} clip from "
+                        f"{final_dur:.0f}s {plan.preset} clip from "
                         f"{self.source_label}", "mode A session",
                         confidence="observed")
                     self.clips_finished += 1
@@ -551,7 +566,10 @@ class ClipSession:
             if not skip_finalize:
                 self.phase = "finalizing"
                 try:
-                    await self._owned(detector.process_new_segments)
+                    # every writer attested drained above, so the capture's
+                    # final segment is safe to analyze here (it is skipped
+                    # during the live loop as possibly-still-written)
+                    await self._owned(detector.process_new_segments, True)
                     await self._owned(clipper.process_pending)
                     await self._owned(
                         self._finish_clips, session_id, work,

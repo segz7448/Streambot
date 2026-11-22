@@ -82,4 +82,9 @@ class CommandRouter:
         entry = self.handlers.get(cmd.name)
         if entry is None:
             return f"Unknown command /{cmd.name}. Send /help."
+        # positive evidence that an authorized inbound update reached the
+        # service and was dispatched: startup logs alone cannot prove the
+        # polling path is alive. The command NAME is logged, never args.
+        log.info("authorized command dispatched update_id=%s name=%s",
+                 update_id, cmd.name)
         return entry[0](cmd)

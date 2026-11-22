@@ -193,3 +193,61 @@ class AutoClipTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClipDurationRecordTests(unittest.TestCase):
+    """Regression: clips.duration_seconds must record the real extracted
+    window, not the buffer's segment length. The session finish path,
+    the planner, the delivery caption and the intake validation all read
+    duration_seconds; segment_seconds (5s) understated a ~30s clip."""
+
+    def setUp(self):
+        self.td = TemporaryDirectory()
+        self.db = str(Path(self.td.name) / "t.db")
+        conn = connect(self.db)
+        migrate(conn)
+        conn.close()
+        _seed_event(self.db, 100.0, "audio_spike", 0.9)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _duration(self):
+        conn = connect(self.db)
+        row = conn.execute("SELECT duration_seconds FROM clips").fetchone()
+        conn.close()
+        return row[0]
+
+    def test_real_extractor_duration_recorded(self):
+        clipper = AutoClipper(FakeBuffer(), self.db, HeuristicProvider(),
+                              "ffmpeg", self.td.name, min_score=0.6,
+                              extract_fn=lambda *a, **k: (Path("/tmp/c.mp4"),
+                                                          27.5))
+        self.assertEqual(clipper.process_pending(), 1)
+        self.assertEqual(self._duration(), 27.5)
+
+    def test_legacy_path_extractor_records_window_estimate(self):
+        # an extractor returning only a path (test fakes, older callers):
+        # the intended pre+post window is the estimate, never 5s segments
+        clipper = AutoClipper(FakeBuffer(), self.db, HeuristicProvider(),
+                              "ffmpeg", self.td.name, min_score=0.6,
+                              extract_fn=lambda *a, **k: Path("/tmp/c.mp4"))
+        self.assertEqual(clipper.process_pending(), 1)
+        self.assertEqual(self._duration(), 30.0)
+
+    def test_real_plan_duration_matches_layout(self):
+        # end-to-end through the real plan_clip: an event mid-buffer with
+        # the default 20s pre / 10s post window plans a ~30s duration
+        from app.clipping.extractor import plan_clip
+
+        class Buf(FakeBuffer):
+            def segments(self):
+                return [FakeSegment(i, 40.0 + (i + 1) * 5.0)
+                        for i in range(20)]
+
+            def event_window(self, event_time):
+                return [s.path for s in self.segments()]
+
+        plan = plan_clip(Buf(), 100.0, 20.0, 10.0)
+        self.assertIsNotNone(plan)
+        self.assertAlmostEqual(plan.duration, 30.0, delta=5.0)

@@ -300,3 +300,50 @@ class SceneChangeParserTests(unittest.TestCase):
             if s and last_t is not None and float(s.group(1)) >= 0.4:
                 out.append((last_t, float(s.group(1))))
         self.assertEqual(out, [(1.0, 0.521865)])
+
+
+class FinalizeNewestSegmentTests(unittest.TestCase):
+    """The recording loop skips the newest segment as possibly-still-
+    written; session finalize (after drain attestation) must analyze it,
+    or a moment in the capture's final seconds is silently lost."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "t.db")
+        conn = connect(self.db)
+        migrate(conn)
+        conn.execute(
+            "INSERT INTO twitch_sources (id, username, created_at,"
+            " updated_at) VALUES (1, 'synthetic', 0, 0)")
+        conn.execute(
+            "INSERT INTO stream_sessions (id, source_id, started_at, state)"
+            " VALUES (1, 1, 0, 'RECORDING')")
+        conn.commit()
+        conn.close()
+        self.buf = RollingBuffer(self.tmp.name, session_id=1,
+                                 segment_seconds=5, pre_event_seconds=15,
+                                 post_event_seconds=15, max_storage_mb=64)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_finalize_analyzes_newest_once(self):
+        p = os.path.join(str(self.buf.dir), "seg-000000.ts")
+        with open(p, "wb") as fh:
+            fh.write(b"\0" * 1024)
+        det = CandidateDetector(
+            "ffmpeg", self.buf, self.db,
+            audio_fn=lambda ff, pth: [],
+            scene_fn=lambda ff, pth: [(0.5, 0.8)])
+        # live-loop behavior unchanged: the only segment is skipped
+        self.assertEqual(det.process_new_segments(), 0)
+        # finalize: the drained writer's last segment is analyzed
+        self.assertEqual(det.process_new_segments(include_newest=True), 1)
+        # and never re-analyzed
+        self.assertEqual(det.process_new_segments(include_newest=True), 0)
+        conn = connect(self.db)
+        rows = [tuple(r) for r in conn.execute(
+            "SELECT kind, status FROM candidate_events").fetchall()]
+        conn.close()
+        self.assertEqual(rows, [("scene_change", "PENDING")])

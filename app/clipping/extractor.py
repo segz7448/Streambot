@@ -60,7 +60,12 @@ def extract_args(ffmpeg: str, concat_list: str, plan: ClipPlan,
 
 def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
                  out_path: str, pre_seconds: float = 20.0,
-                 post_seconds: float = 10.0) -> Path | None:
+                 post_seconds: float = 10.0) -> tuple[Path, float] | None:
+    """Extract the event window. Returns (path, real window duration in
+    seconds) so callers can record how long the clip actually is; the
+    planned duration comes from the segment layout, never assumed equal
+    to pre+post (a window clipped by stream start or the live edge is
+    shorter). Returns None when the window rotated out of the buffer."""
     plan = plan_clip(buffer, event_time, pre_seconds, post_seconds)
     if plan is None:
         return None
@@ -77,4 +82,4 @@ def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
     if proc.returncode != 0:
         raise RuntimeError(f"clip extraction failed rc={proc.returncode}: "
                            f"{proc.stderr[-300:]!r}")
-    return Path(out_path)
+    return Path(out_path), plan.duration

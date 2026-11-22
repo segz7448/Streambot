@@ -90,9 +90,13 @@ class CandidateDetector:
             log.warning("visual analysis failed for %s: %s", path, exc)
         return candidates, seg_median, episode_active
 
-    def process_new_segments(self) -> int:
+    def process_new_segments(self, include_newest: bool = False) -> int:
         """Analyze finalized segments newer than the last processed one.
-        The newest segment may still be written by ffmpeg; skip it."""
+        The newest segment may still be written by ffmpeg, so it is
+        skipped during the recording loop. Pass include_newest=True ONLY
+        from session finalize, after every writer has attested drained:
+        without it the capture's final segment is never analyzed and a
+        moment in the last seconds of a recording is silently lost."""
         ensure_state_table(self.db_path)
         conn = connect(self.db_path)
         row = conn.execute(
@@ -104,7 +108,7 @@ class CandidateDetector:
         episode_active = bool(row[2]) if row else False
         prev_mtime: float | None = row[3] if row else None
         segs = [s for s in self.buffer.segments() if s.sequence > last]
-        finalized = segs[:-1] if segs else []
+        finalized = segs if include_newest else (segs[:-1] if segs else [])
         written = 0
         for seg in finalized:
             # A recording interruption (reconnect gap) produces a real

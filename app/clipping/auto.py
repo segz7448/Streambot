@@ -127,10 +127,10 @@ class AutoClipper:
                 out = (f"{self.out_dir}/clip-{self.buffer.session_id}-"
                        f"{event['id']}.mp4")
                 try:
-                    path = self.extract_fn(self.ffmpeg, self.buffer,
-                                           event["at"], out,
-                                           pre_seconds=self.pre_seconds,
-                                           post_seconds=self.post_seconds)
+                    res = self.extract_fn(self.ffmpeg, self.buffer,
+                                          event["at"], out,
+                                          pre_seconds=self.pre_seconds,
+                                          post_seconds=self.post_seconds)
                 except Exception as exc:
                     log.warning("clip extraction failed for event %s: %s",
                                 event["id"], exc)
@@ -138,18 +138,27 @@ class AutoClipper:
                         "UPDATE candidate_events SET status='FAILED' WHERE id=?",
                         (event["id"],))
                     continue
-                if path is None:
+                if res is None:
                     # window rotated out of the buffer; cannot clip this event
                     conn.execute(
                         "UPDATE candidate_events SET status='EXPIRED' WHERE id=?",
                         (event["id"],))
                     continue
+                if isinstance(res, tuple):
+                    # the real extractor reports the planned window duration
+                    path, clip_seconds = res
+                else:
+                    # legacy/test extractors return only the path; the
+                    # intended pre+post window is the honest estimate then
+                    # (never the segment length, which understates it).
+                    path, clip_seconds = res, (
+                        self.pre_seconds + self.post_seconds)
                 conn.execute(
                     "INSERT OR IGNORE INTO clips (event_id, session_id,"
                     " file_path, duration_seconds, status, created_at)"
                     " VALUES (?,?,?,?,?,?)",
                     (event["id"], self.buffer.session_id, str(path),
-                     self.buffer.segment_seconds, "PENDING", time.time()))
+                     float(clip_seconds), "PENDING", time.time()))
                 conn.execute(
                     "UPDATE candidate_events SET status='CLIPPED' WHERE id=?",
                     (event["id"],))
