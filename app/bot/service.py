@@ -580,17 +580,107 @@ class BotService:
     async def _stop_handoff_consumer(self, _app) -> None:
         from . import sessions as _sess
         tracker = _sess.recovery_tracker()
-        # cancel + drain OFF the event loop: bounded kills and joins
-        # must never starve other commands or the rest of shutdown
-        await asyncio.to_thread(self._cancel_and_drain, tracker)
-        for name in ("_sched_task", "_pollwatch_task", "_handoff_task"):
-            task = getattr(self, name, None)
-            if task is not None:
+        # whole-sequence ownership under cancellation AND errors: every
+        # owned phase (recovery drain, then consumer teardown) runs to
+        # genuine completion behind a shield - a failing cancel request,
+        # drain step or confirmation is NEVER treated as worker
+        # completion, a parent cancellation is remembered and re-raised
+        # only after ALL cleanup, and a retained phase error never
+        # displaces that cancellation
+        cancelled = False
+
+        def _drain_owned() -> None:
+            try:
+                self._cancel_and_drain(tracker)
+                return
+            except Exception as exc:
+                first_error = exc
+                log.error("recovery drain failed during shutdown: %s; "
+                          "still retaining worker ownership", exc)
+            # the drain raised before confirming the worker exited:
+            # ownership continues - keep cancelling and keep waiting,
+            # and a failure to cancel or to CONFIRM is logged once and
+            # retried, never treated as completion
+            warned = False
+            while True:
+                try:
+                    tracker.request_cancel()
+                except Exception as exc:
+                    if not warned:
+                        warned = True
+                        log.error("recovery cancel request failed during "
+                                  "shutdown drain: %s; still retaining "
+                                  "worker ownership", exc)
+                try:
+                    if tracker.wait_done():
+                        break
+                except Exception as exc:
+                    if not warned:
+                        warned = True
+                        log.error("recovery drain confirmation failed "
+                                  "during shutdown: %s; still retaining "
+                                  "worker ownership", exc)
+            raise first_error
+
+        async def _teardown() -> None:
+            # ONLY this inner coroutine cancels and awaits the owned
+            # consumers, so a CancelledError at its own awaits is always
+            # the child's own expected cancellation - and nothing ever
+            # cancels the task wrapping it, which lets the shielded wait
+            # below read ANY CancelledError as a real parent request
+            error = None
+            for name in ("_sched_task", "_pollwatch_task",
+                         "_handoff_task"):
+                task = getattr(self, name, None)
+                if task is None:
+                    continue
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
-                    pass
+                    pass              # the child's expected cancellation
+                except Exception as exc:
+                    # retain cleanup ownership: record and continue with
+                    # the remaining owned consumers; surfaced afterwards
+                    if error is None:
+                        error = exc
+                    log.error("consumer %s cleanup failed during "
+                              "shutdown: %s", name, exc)
+            if error is not None:
+                raise error
+
+        async def _await_owned(phase):
+            # shielded wait that NEVER cancels the inner phase task, so
+            # a CancelledError here is by construction a REAL parent
+            # request (possibly coincident with phase completion):
+            # remember it and keep waiting until the phase genuinely
+            # finishes; a phase error is RETURNED, never allowed to
+            # escape past a remembered cancellation
+            nonlocal cancelled
+            while True:
+                try:
+                    await asyncio.shield(phase)
+                    return None
+                except asyncio.CancelledError:
+                    cancelled = True
+                    if phase.done():
+                        return phase.exception()
+                except Exception as exc:
+                    return exc
+
+        drain_error = await _await_owned(
+            asyncio.ensure_future(self._blocking(_drain_owned)))
+        teardown_error = await _await_owned(
+            asyncio.ensure_future(_teardown()))
+        # one consistent outcome: a remembered parent cancellation wins
+        # over every retained phase error; the drain error (first owned
+        # phase) surfaces before a teardown error
+        if cancelled:
+            raise asyncio.CancelledError
+        if drain_error is not None:
+            raise drain_error
+        if teardown_error is not None:
+            raise teardown_error
 
     def drain_inbox(self, reply=None) -> dict:
         from . import ops
