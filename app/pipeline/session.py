@@ -150,13 +150,26 @@ class ClipSession:
 
     def _finish_clips_db(self, conn, session_id: int, out_dir: Path,
                          runtime_dir: Path) -> None:
+        auth_on_conn = None
+        if self.playback is not None:
+            # the same claim/finalization authorization policy recovery
+            # uses, applied where that policy actually applies: record
+            # scope gates PUBLIC PLAYBACK capture (startplayback), so a
+            # mid-finalize revocation blocks the claim and the edit.
+            # Local-feed sessions never required record scope at start,
+            # so no claim-time scope applies to them.
+            def auth_on_conn(c, u=self.source_label):
+                r = c.execute("SELECT value FROM settings WHERE key=?",
+                              (f"srcauth:{u}:record",)).fetchone()
+                return bool(r and r[0] == "1")
         held = finish_pending_clips(
             conn, state_dir=self.state_dir, session_id=session_id,
             source_label=self.source_label, out_dir=out_dir,
             runtime_dir=runtime_dir, ffmpeg=self.ffmpeg,
             ffprobe=self.ffprobe, auto_deliver=True,
             pre_spawn=getattr(self, "_pre_spawn", None),
-            on_spawn=getattr(self, "_on_spawn_writer", None))
+            on_spawn=getattr(self, "_on_spawn_writer", None),
+            auth_on_conn=auth_on_conn)
         self.clips_finished += len(held)
 
     async def _run(self) -> None:
@@ -599,13 +612,20 @@ class _ClaimLost(Exception):
     pass
 
 
-def _claim_clip(conn, clip_id, token: str) -> bool:
+def _claim_clip(conn, clip_id, token: str, auth_on_conn=None) -> bool:
     """Exclusive owner-token claim, one short transaction. Only a free
     PENDING row can be claimed; rowcount 1 wins. Interrupted RECOVERING
     rows (a dead owner's claim) are NOT reclaimed here: they stay fenced
-    for review, never stolen via absence."""
+    for review, never stolen via absence. When the caller supplies
+    auth_on_conn, CURRENT record authorization is re-read inside this
+    same transaction BEFORE the claim: a revocation landing after any
+    earlier preflight prevents the claim - and therefore the edit -
+    entirely."""
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if auth_on_conn is not None and not auth_on_conn(conn):
+            conn.rollback()
+            raise _AuthorizationRevoked()
         cur = conn.execute(
             "UPDATE clips SET status='RECOVERING', recovery_owner=?,"
             " claimed_at=? WHERE id=? AND status='PENDING'"
@@ -662,8 +682,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
         # every finalizer claims under an explicit owner token; the live
         # path's token names its session, recovery's names its run
         claim_token = f"live-{session_id}-{uuid.uuid4().hex[:8]}"
-    if output_name is None:
-        output_name = lambda cid: f"clip-edited-{cid}.mp4"
+    from ..clipping import seal as _seal
     mem = Memory(str(state_dir / "memory.json"))
     # require_sealed fences legacy/unsealed rows: recovery only ever
     # touches input carrying durable producer completion evidence
@@ -680,8 +699,15 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
         # the original finalizer and recovery. rowcount 1 wins; anything
         # else (already HELD, owned by another run, fenced RECOVERING)
         # is skipped, never stolen.
-        if not _claim_clip(conn, clip_id, claim_token):
-            continue
+        try:
+            if not _claim_clip(conn, clip_id, claim_token, auth_on_conn):
+                continue
+        except _AuthorizationRevoked:
+            # revoked between preflight and claim: the claim was never
+            # taken, the row stays PENDING, and no edit is started
+            log.warning("authorization revoked before claim; leaving "
+                        "remaining clips PENDING")
+            break
         # a long edit can span an authorization change: re-check before
         # EVERY clip when the caller supplies a live check (boot recovery
         # does; the live finalize path keeps its existing behavior)
@@ -691,6 +717,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                         len(rows) - len(held_ids))
             _release_claim(conn, clip_id, claim_token)
             break
+        edited = None
         try:
             # the caller may substitute a verified private input (the
             # recovery snapshot); None from the resolver means the input
@@ -704,7 +731,16 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                     continue
             plan = plan_clip("auto", source_label, mem,
                              content_seconds=float(dur or 0))
-            edited = Path(out_dir) / output_name(clip_id)
+            if output_name is None:
+                # per-attempt exclusive output ownership: the path is
+                # reserved O_CREAT|O_EXCL before any writer is spawned.
+                # A name alone - random or deterministic - is not a
+                # reservation.
+                edited = _seal.reserve_output(
+                    out_dir, f"clip-edited-{clip_id}", ".mp4")
+            else:
+                edited = _seal.reserve_exact_or_unique(
+                    Path(out_dir) / output_name(clip_id))
             edit_clip(ffmpeg, str(input_path), str(edited),
                       PRESETS.get(plan.preset, PRESETS["vertical"]),
                       None, 0.5, str(runtime_dir),
@@ -722,6 +758,10 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                     measured = None
                 final_dur = (measured if measured and measured > 0
                              else float(dur or 0))
+                # durability before durability evidence: the final media
+                # and its directory are fsynced BEFORE the durable HELD
+                # commit, so HELD never names a file a crash could lose
+                _seal.fsync_tree(edited)
                 from ..bot.handoff import ADMIT_JOB_KIND
                 from ..core.jobs import JobQueue
                 conn.execute("BEGIN IMMEDIATE")
@@ -801,6 +841,10 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             continue
         except Exception as exc:
             log.warning("finish failed for clip %s: %s", clip_id, exc)
+            if edited is not None:
+                # our own reserved per-attempt output; a partial file is
+                # never referenced by the row, so remove it
+                edited.unlink(missing_ok=True)
             conn.execute(
                 "UPDATE clips SET status='FAILED', recovery_owner=NULL,"
                 " claimed_at=NULL WHERE id=? AND recovery_owner=?",
@@ -876,14 +920,22 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe, *,
             work = state_dir / "sessions" / username
             work.mkdir(parents=True, exist_ok=True)
             snap_dir = state_dir / "recovery" / f"session-{sid}"
+            snapshots = []
+
             def snapshot_resolver(clip_id, path, seal_sha, seal_bytes,
-                                  _sd=snap_dir):
-                snap = _seal.take_verified_snapshot(
+                                  _sd=snap_dir, _track=snapshots):
+                # bounded private copy: capped at the sealed byte count
+                # and a time budget, copied size AND digest verified
+                # against the producer's pre-existing committed
+                # evidence, snapshot directory fsynced
+                snap = _seal.take_verified_snapshot_bounded(
                     path, _sd, seal_sha, seal_bytes or -1)
                 if snap is None:
                     log.warning(
                         "recovery fenced clip %s: input does not match "
                         "the producer's sealed digest", clip_id)
+                else:
+                    _track.append(snap)
                 return snap
 
             def auth_now(c, u=username):
@@ -891,18 +943,24 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe, *,
                               (f"srcauth:{u}:record",)).fetchone()
                 return bool(r and r[0] == "1")
 
-            held = finish_pending_clips(
-                conn, state_dir=state_dir, session_id=sid,
-                source_label=username, out_dir=work,
-                runtime_dir=state_dir / "runtime",
-                ffmpeg=ffmpeg, ffprobe=ffprobe, auto_deliver=False,
-                enqueue_admission=False,
-                claim_token=run_token,
-                output_name=lambda cid, _t=run_token:
-                    f"clip-recovery-{cid}-{_t}.mp4",
-                input_resolver=snapshot_resolver,
-                auth_on_conn=auth_now,
-                require_sealed=True)
+            try:
+                held = finish_pending_clips(
+                    conn, state_dir=state_dir, session_id=sid,
+                    source_label=username, out_dir=work,
+                    runtime_dir=state_dir / "runtime",
+                    ffmpeg=ffmpeg, ffprobe=ffprobe, auto_deliver=False,
+                    enqueue_admission=False,
+                    claim_token=run_token,
+                    output_name=lambda cid, _t=run_token:
+                        f"clip-recovery-{cid}-{_t}.mp4",
+                    input_resolver=snapshot_resolver,
+                    auth_on_conn=auth_now,
+                    require_sealed=True)
+            finally:
+                # snapshots are private working copies: removed on every
+                # terminal path, success or failure
+                for snap in snapshots:
+                    snap.unlink(missing_ok=True)
             total += len(held)
         return total
     finally:

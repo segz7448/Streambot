@@ -194,10 +194,26 @@ def migrate(conn: sqlite3.Connection,
     for version, sql in sorted(migrations):
         if version in applied:
             continue
-        with conn:
-            conn.executescript(sql)
-            conn.execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (version, time.time()))
+        # Schema change and version marker commit in ONE transaction:
+        # executescript() runs statements in autocommit unless the
+        # script itself carries the transaction (`with conn` cannot
+        # help - executescript commits any pending transaction first),
+        # so BEGIN/COMMIT and the marker insert all live inside the
+        # script. A fault mid-script rolls the schema change and the
+        # marker back together; a retry then applies cleanly.
+        nl = chr(10)
+        script = ("BEGIN IMMEDIATE;" + nl + sql + nl +
+                  "INSERT INTO schema_migrations (version,"
+                  " applied_at) VALUES (" + str(int(version)) +
+                  ", " + repr(float(time.time())) + ");" + nl +
+                  "COMMIT;" + nl)
+        try:
+            conn.executescript(script)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         newly_applied.append(version)
     return newly_applied

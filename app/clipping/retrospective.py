@@ -191,13 +191,15 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     # inserted HELD (never PENDING), so they are not recovery-eligible
     # and need no seal evidence; the uniqueness fix is for the producers
     # themselves.
-    from .seal import unique_path
-    raw = str(unique_path(work, "clip-raw", ".mp4"))
+    from .seal import reserve_output
+    # per-attempt exclusive reservation (O_CREAT|O_EXCL) before any
+    # writer is spawned: a unique name alone is not ownership
+    raw = str(reserve_output(work, "clip-raw", ".mp4"))
     extract_fn(ffmpeg, src_path, raw, start, duration)
     result["extracted"] = Path(raw).exists()
 
     preset = PRESETS.get(plan.preset, PRESETS["vertical"])
-    edited = str(unique_path(work, "clip-edited", ".mp4"))
+    edited = str(reserve_output(work, "clip-edited", ".mp4"))
     edit_fn(ffmpeg, raw, edited, preset, None, 0.5, runtime_dir,
             watermark=plan.watermark or None)
     result["edited"] = Path(edited).exists()
@@ -208,6 +210,11 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
         result["status"] = "qc_failed"
         result["detail"] = "; ".join(getattr(qc, "failures", []) or [])
         return result
+
+    # durability before the durable HELD row: fsync the final media
+    # and its directory so HELD never names a file a crash could lose
+    from .seal import fsync_tree
+    fsync_tree(edited)
 
     conn = connect(db_path)
     migrate(conn)

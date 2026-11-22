@@ -43,7 +43,12 @@ class ModeCCommandPathTests(unittest.TestCase):
         # content-sized: the moment is ~2s; pre-roll + tail => well
         # under the 180s cap, never padded to it
         self.assertLessEqual(result["clip_duration_seconds"], 30.0)
-        edited = Path(self.dir / "work" / "clip-edited.mp4")
+        import sqlite3 as _sq
+        _c = _sq.connect(str(self.dir / "nova.db"))
+        _row = _c.execute("SELECT file_path FROM clips WHERE id=?",
+                          (result["clip_id"],)).fetchone()
+        _c.close()
+        edited = Path(_row[0])
         self.assertTrue(edited.exists())
         self.assertGreater(edited.stat().st_size, 10000)
         # vertical preset actually applied

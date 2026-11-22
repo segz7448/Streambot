@@ -261,7 +261,19 @@ class SealEvidenceTests(unittest.TestCase):
             t.join()
         self.assertEqual(len(paths), 2)
         self.assertNotEqual(paths[0], paths[1])
-        self.assertTrue(all(p.exists() for p in paths))
+        # exactly one row wins the event; the winner's file is kept and
+        # sealed, the loser's orphan (exclusively its own path) is
+        # removed, and produced counts only the winner
+        conn = connect(self.db)
+        rows = conn.execute("SELECT file_path FROM clips").fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1)
+        kept = Path(rows[0]["file_path"])
+        self.assertIn(kept, paths)
+        self.assertTrue(kept.exists())
+        removed = [p for p in paths if p != kept]
+        self.assertEqual(len(removed), 1)
+        self.assertFalse(removed[0].exists())
 
     def test_unsealable_output_fails_event_not_silent(self):
         # an extractor that creates no file must fail the event, never

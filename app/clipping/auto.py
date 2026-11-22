@@ -10,6 +10,7 @@ operator visibility rather than silently dropping it.
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 
 import time
 from typing import Callable
@@ -124,11 +125,11 @@ class AutoClipper:
                         "UPDATE candidate_events SET status='REJECTED' WHERE id=?",
                         (event["id"],))
                     continue
-                # unique, never-reused raw path: a deterministic path
-                # would let a concurrent or stale producer clobber the
-                # input another finalizer is about to seal
-                from .seal import seal_file, unique_path
-                out = str(unique_path(
+                # unique, never-reused raw path, RESERVED with
+                # O_CREAT|O_EXCL before the extractor child is spawned:
+                # this run exclusively owns the path it extracts into
+                from .seal import seal_file, reserve_output
+                out = str(reserve_output(
                     self.out_dir,
                     f"clip-{self.buffer.session_id}-{event['id']}", ".mp4"))
                 try:
@@ -139,12 +140,14 @@ class AutoClipper:
                 except Exception as exc:
                     log.warning("clip extraction failed for event %s: %s",
                                 event["id"], exc)
+                    Path(out).unlink(missing_ok=True)
                     conn.execute(
                         "UPDATE candidate_events SET status='FAILED' WHERE id=?",
                         (event["id"],))
                     continue
                 if res is None:
                     # window rotated out of the buffer; cannot clip this event
+                    Path(out).unlink(missing_ok=True)
                     conn.execute(
                         "UPDATE candidate_events SET status='EXPIRED' WHERE id=?",
                         (event["id"],))
@@ -167,11 +170,12 @@ class AutoClipper:
                 except Exception as exc:
                     log.warning("clip seal failed for event %s: %s",
                                 event["id"], exc)
+                    Path(path).unlink(missing_ok=True)
                     conn.execute(
                         "UPDATE candidate_events SET status='FAILED'"
                         " WHERE id=?", (event["id"],))
                     continue
-                conn.execute(
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO clips (event_id, session_id,"
                     " file_path, duration_seconds, status, created_at,"
                     " sealed_sha256, sealed_bytes, sealed_at)"
@@ -179,10 +183,18 @@ class AutoClipper:
                     (event["id"], self.buffer.session_id, str(path),
                      float(clip_seconds), "PENDING", time.time(),
                      seal_sha, seal_bytes, time.time()))
+                if cur.rowcount == 0:
+                    # a concurrent producer already published this
+                    # event: the file THIS run extracted is an orphan
+                    # (the path was exclusively ours), so remove it and
+                    # do not count it as produced. The event is still
+                    # covered by the winner's row, so it is CLIPPED.
+                    Path(path).unlink(missing_ok=True)
+                else:
+                    produced += 1
                 conn.execute(
                     "UPDATE candidate_events SET status='CLIPPED' WHERE id=?",
                     (event["id"],))
-                produced += 1
             conn.commit()
             conn.close()
             return produced
