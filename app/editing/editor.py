@@ -79,21 +79,60 @@ def edit_args(ffmpeg: str, src: str, out: str, preset: OutputPreset,
     return args
 
 
+def _kill_group(proc) -> None:
+    """Best-effort teardown of the spawned child's whole process group
+    (the child leads it: start_new_session=True)."""
+    import os
+    import signal
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        try:
+            proc.wait(timeout=3)
+            break
+        except Exception:
+            continue
+
+
 def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
               subtitle_path: str | None = None, focus_x: float = 0.5,
               runtime_dir: str = ".nova-runtime",
-              watermark: str | None = None) -> Path:
+              watermark: str | None = None,
+              pre_spawn=None, on_spawn=None) -> Path:
     env = dict(os.environ)
     if subtitle_path or watermark:
         # drawtext and libass both resolve fonts through fontconfig;
         # relocated prefixes ship a fontconfig that points at paths
         # which no longer exist (device-verified on the owner's AGT phone)
         env.update(ensure_fontconfig_env(ffmpeg, runtime_dir))
-    proc = subprocess.run(
+    # two-phase durable registration (when hooks are given): intent
+    # BEFORE spawn, identity bound right after; an unrecordable writer is
+    # never spawned and an unbindable one is killed with its whole group,
+    # because a surviving edit child can still write its output file
+    token = pre_spawn() if pre_spawn is not None else None
+    if pre_spawn is not None and token is None:
+        raise RuntimeError("edit spawn intent not recordable; not spawning")
+    proc = subprocess.Popen(
         edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x,
                   watermark=watermark),
-        capture_output=True, text=True, timeout=600, env=env)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        start_new_session=True)
+    if on_spawn is not None:
+        try:
+            bound = on_spawn(proc.pid, proc.pid, token)
+        except Exception:
+            bound = False
+        if not bound:
+            _kill_group(proc)
+            raise RuntimeError("edit writer identity not recorded; killed")
+    try:
+        out_s, err_s = proc.communicate(timeout=600)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        raise
     if proc.returncode != 0:
         raise RuntimeError(f"edit failed rc={proc.returncode}: "
-                           f"{proc.stderr[-300:]!r}")
+                           f"{err_s[-300:]!r}")
     return Path(out)

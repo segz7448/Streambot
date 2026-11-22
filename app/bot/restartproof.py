@@ -250,23 +250,24 @@ def proof_for_session(state_dir: Path, username: str, session_id,
         if not dead:
             return False, f"recorded writer {why}"
     pgids = {it["pgid"] for it in items if isinstance(it.get("pgid"), int)}
-    if pgids:
-        try:
-            pids = os.listdir(proc)
-        except OSError:
-            return False, "no process visibility: /proc not listable"
-        recorded = {it["pid"] for it in items}
-        for p in pids:
-            if not p.isdigit() or int(p) in recorded:
-                continue
-            ok, why, _ = stat_detail(int(p), proc)
-            if not ok:
-                if why == "absent":
-                    continue        # exited while scanning: definitively gone
-                return False, f"process visibility {why} for pid {p}"
-            pgrp = _read_stat(int(p), proc)
-            if pgrp and pgrp[0] in pgids:
-                return False, f"orphan survives: pid {p} in recorded group {pgrp[0]}"
+    # Complete process visibility is a proof leg even with no recorded
+    # groups: if we cannot list processes at all we know nothing, and a
+    # denied/hidden read is never evidence of absence.
+    try:
+        pids = os.listdir(proc)
+    except OSError:
+        return False, "no process visibility: /proc not listable"
+    recorded = {it["pid"] for it in items}
+    for p in pids:
+        if not p.isdigit() or int(p) in recorded:
+            continue
+        d = stat_detail(int(p), proc)     # ONE authoritative read per pid
+        if not d[0]:
+            if d[1] == "absent":
+                continue            # exited while scanning: definitively gone
+            return False, f"process visibility {d[1]} for pid {p}"
+        if d[1] in pgids:
+            return False, f"orphan survives: pid {p} in recorded group {d[1]}"
     try:
         active = bool(writer_active(username))
     except Exception:

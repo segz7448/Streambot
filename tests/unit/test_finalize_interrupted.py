@@ -43,10 +43,14 @@ class FinalizeTests(unittest.TestCase):
     def _add_clip(self, status="PENDING"):
         conn = connect(str(self.dir / "nova.db"))
         cur = conn.execute(
+            "INSERT INTO candidate_events (session_id, detected_at, kind)"
+            " VALUES (?,0,'moment')", (self.sid,))
+        ev = cur.lastrowid
+        cur = conn.execute(
             "INSERT INTO clips (event_id, session_id, file_path,"
             " duration_seconds, status, created_at)"
             " VALUES (?,?,?,?,?,0)",
-            (self.ev, self.sid, str(self.raw), 30.0, status))
+            (ev, self.sid, str(self.raw), 30.0, status))
         conn.commit()
         cid = cur.lastrowid
         conn.close()
@@ -67,8 +71,13 @@ class FinalizeTests(unittest.TestCase):
         return rows
 
     def _patches(self):
-        edited = self.work / "edited.mp4"
-        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime, watermark=None):
+        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime, watermark=None,
+                      pre_spawn=None, on_spawn=None):
+            # honor the two-phase registration contract like the real one
+            import os
+            tok = pre_spawn() if pre_spawn is not None else None
+            if on_spawn is not None:
+                on_spawn(os.getpid(), os.getpid(), tok)
             Path(dst).write_bytes(b"\x00" * 2048)
         qc = mock.Mock(ok=True)
         return [mock.patch("app.editing.editor.edit_clip", fake_edit),
@@ -91,8 +100,13 @@ class FinalizeTests(unittest.TestCase):
         self.assertAlmostEqual(dur, 28.5)   # ffprobe-measured, not guessed
         self.assertTrue(Path(path).exists())
         ad.assert_not_called()              # no boot-time flush
-        jobs = self._jobs()
-        self.assertEqual(len(jobs), 1)      # admission via normal outbox
+        # HOLD-ONLY: boot recovery never enqueues an admission; the clip
+        # waits HELD for the normal owner flows
+        self.assertEqual(self._jobs(), [])
+        # the edit child was registered into the session's writer registry
+        reg = self.work / f"writers-{self.sid}.json"
+        items = json.loads(reg.read_text())
+        self.assertTrue(any("pid" in it for it in items))
 
     def test_no_proof_leaves_clip_pending(self):
         cid = self._add_clip()
@@ -129,7 +143,34 @@ class FinalizeTests(unittest.TestCase):
         n2 = ps.finalize_interrupted_sessions(self.dir, "ffmpeg", "ffprobe",
                                               writer_proof=proof)
         self.assertEqual((n1, n2), (1, 0))
-        self.assertEqual(len(self._jobs()), 1)   # no duplicate admission
+        self.assertEqual(self._jobs(), [])       # hold-only, no admission
+
+    def test_authorization_rechecked_between_clips(self):
+        # a long edit can span a revocation: the second clip must NOT be
+        # finished after record authorization is withdrawn mid-run
+        c1 = self._add_clip()
+        c2 = self._add_clip()
+        edits = []
+        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime, watermark=None,
+                      pre_spawn=None, on_spawn=None):
+            edits.append(dst)
+            Path(dst).write_bytes(b"\x00" * 2048)
+            if len(edits) == 1:
+                # revoke while the first edit is "running"
+                source_auth.set_scope(self.dir, "someuser", "record", False)
+        qc = mock.Mock(ok=True)
+        for p in [mock.patch("app.editing.editor.edit_clip", fake_edit),
+                  mock.patch("app.qc.verify.check_media", lambda *a, **k: qc),
+                  mock.patch("app.qc.verify.probe",
+                             lambda *a, **k: {"format": {"duration": "28.5"}})]:
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        n = ps.finalize_interrupted_sessions(
+            self.dir, "ffmpeg", "ffprobe",
+            writer_proof=lambda d, u, s: (True, "proven"))
+        self.assertEqual(n, 1)
+        self.assertEqual(self._clip(c1)[0], "HELD")
+        self.assertEqual(self._clip(c2)[0], "PENDING")
 
     def test_non_pending_clips_untouched(self):
         held = self._add_clip(status="HELD")

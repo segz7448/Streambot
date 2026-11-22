@@ -153,7 +153,9 @@ class ClipSession:
             conn, state_dir=self.state_dir, session_id=session_id,
             source_label=self.source_label, out_dir=out_dir,
             runtime_dir=runtime_dir, ffmpeg=self.ffmpeg,
-            ffprobe=self.ffprobe, auto_deliver=True)
+            ffprobe=self.ffprobe, auto_deliver=True,
+            pre_spawn=getattr(self, "_pre_spawn", None),
+            on_spawn=getattr(self, "_on_spawn_writer", None))
         self.clips_finished += len(held)
 
     async def _run(self) -> None:
@@ -339,6 +341,7 @@ class ClipSession:
             # False means the caller terminates the just-spawned child:
             # an unidentifiable writer never keeps running
             return _rp.record_spawned(_path, token, pid, pgid)
+        self._pre_spawn, self._on_spawn_writer = _pre_spawn, _register
         runner = FFmpegRunner(self.ffmpeg, self.ffprobe, max_concurrent=1,
                               pre_spawn=_pre_spawn, on_spawn=_register)
         if self.playback is not None:
@@ -355,10 +358,17 @@ class ClipSession:
                                      sweep_seconds=max(1, self.segment_seconds))
         self._worker = worker
         detector = CandidateDetector(self.ffmpeg, buf, db_path)
+        # extraction children are registered writers too: a crash
+        # mid-extraction must not leave an unrecorded writer behind
+        from ..clipping.extractor import extract_clip as _extract
+        import functools
         clipper = AutoClipper(buf, db_path, HeuristicProvider(),
                               self.ffmpeg, str(work),
                               pre_seconds=self.clip_pre_seconds,
-                              post_seconds=self.clip_post_seconds)
+                              post_seconds=self.clip_post_seconds,
+                              extract_fn=functools.partial(
+                                  _extract, pre_spawn=_pre_spawn,
+                                  on_spawn=_register))
         sup = Supervisor(
             [Service("record", worker.run,
                      heartbeat_seconds=max(1, self.segment_seconds - 1),
@@ -522,7 +532,9 @@ def recover_interrupted_sessions(state_dir: Path) -> int:
 
 def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                          out_dir: Path, runtime_dir: Path, ffmpeg, ffprobe,
-                         auto_deliver: bool = False) -> list:
+                         auto_deliver: bool = False, pre_spawn=None,
+                         on_spawn=None, enqueue_admission: bool = True,
+                         per_clip_authorization=None) -> list:
     """Edit + QC every PENDING clip row of one session: plan, edit,
     ffprobe-measured final duration, atomic HELD + metadata + admission
     outbox per clip. Per-clip isolated and idempotent: only PENDING rows
@@ -545,6 +557,14 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
     held_ids = []
     finished = 0
     for clip_id, path, dur in rows:
+        # a long edit can span an authorization change: re-check before
+        # EVERY clip when the caller supplies a live check (boot recovery
+        # does; the live finalize path keeps its existing behavior)
+        if per_clip_authorization is not None and \
+                not per_clip_authorization():
+            log.warning("authorization changed; leaving %d clip(s) PENDING",
+                        len(rows) - len(held_ids))
+            break
         try:
             plan = plan_clip("auto", source_label, mem,
                              content_seconds=float(dur or 0))
@@ -552,7 +572,8 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             edit_clip(ffmpeg, path, str(edited),
                       PRESETS.get(plan.preset, PRESETS["vertical"]),
                       None, 0.5, str(runtime_dir),
-                      watermark=plan.watermark or None)
+                      watermark=plan.watermark or None,
+                      pre_spawn=pre_spawn, on_spawn=on_spawn)
             qc = check_media(ffprobe, ffmpeg, str(edited),
                              1.0, 100, 100, True)
             if qc.ok:
@@ -594,7 +615,9 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                         " WHERE id = (SELECT event_id FROM clips"
                         " WHERE id = ?)", (json.dumps(meta), clip_id))
                     from ..core.provenance import repost_allowed
-                    if repost_allowed(conn, clip_id)[0]:
+                    # boot recovery passes enqueue_admission=False: clips
+                    # reach HELD only, never an automatic release effect
+                    if enqueue_admission and repost_allowed(conn, clip_id)[0]:
                         JobQueue(conn).enqueue(
                             ADMIT_JOB_KIND, {"clip_row_id": int(clip_id)})
                     conn.commit()
@@ -684,11 +707,18 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe, *,
                 continue
             work = state_dir / "sessions" / username
             work.mkdir(parents=True, exist_ok=True)
+            registry = work / f"writers-{sid}.json"
             held = finish_pending_clips(
                 conn, state_dir=state_dir, session_id=sid,
                 source_label=username, out_dir=work,
                 runtime_dir=state_dir / "runtime",
-                ffmpeg=ffmpeg, ffprobe=ffprobe, auto_deliver=False)
+                ffmpeg=ffmpeg, ffprobe=ffprobe, auto_deliver=False,
+                pre_spawn=lambda _r=registry: _rp.record_spawn_intent(_r),
+                on_spawn=lambda pid, pgid, tok, _r=registry:
+                    _rp.record_spawned(_r, tok, pid, pgid),
+                enqueue_admission=False,
+                per_clip_authorization=lambda u=username:
+                    source_auth.allowed(state_dir, u, "record"))
             total += len(held)
         return total
     finally:

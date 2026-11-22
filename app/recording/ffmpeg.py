@@ -37,11 +37,16 @@ class FFmpegProcess:
     def running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
-    async def start(self) -> None:
+    async def start(self, own_group: bool = False) -> None:
+        # own_group: the child leads its own process group so a later boot
+        # can prove IT (and any descendant) dead by pgid, and stop() can
+        # take down the whole group instead of leaking grandchildren
+        self._own_group = own_group
         self._proc = await asyncio.create_subprocess_exec(
             *self.args,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE)
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=own_group)
         self.pid = self._proc.pid
         self.started_at = time.time()
         # Drain stderr continuously: an unconsumed pipe buffer (64 KiB)
@@ -74,11 +79,28 @@ class FFmpegProcess:
             return -1
         if self._proc.returncode is not None:
             return self._proc.returncode
-        self._proc.terminate()
+        import os
+        import signal
+        pgid = self._proc.pid if getattr(self, "_own_group", False) else None
+        def _sig(sig):
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, sig)
+                    return
+                except ProcessLookupError:
+                    return
+                except PermissionError:
+                    pass          # fall back to the direct child
+            try:
+                (self._proc.terminate if sig == signal.SIGTERM
+                 else self._proc.kill)()
+            except ProcessLookupError:
+                pass
+        _sig(signal.SIGTERM)
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=grace)
         except asyncio.TimeoutError:
-            self._proc.kill()
+            _sig(signal.SIGKILL)
             await self._proc.wait()
         return self._proc.returncode or 0
 
@@ -151,12 +173,13 @@ class FFmpegRunner:
         try:
             async with self._sem:
                 try:
-                    await proc.start()
+                    # registered writers lead their own group: the pgid is
+                    # recorded so a boot-time proof sweep catches surviving
+                    # descendants, and stop() takes the whole group down
+                    await proc.start(own_group=self.on_spawn is not None)
                     if self.on_spawn is not None and proc.pid is not None:
-                        # shares this process's group: no pgid recorded;
-                        # the per-pid start-time record is the proof input
                         try:
-                            bound = self.on_spawn(proc.pid, None, token)
+                            bound = self.on_spawn(proc.pid, proc.pid, token)
                         except Exception:
                             bound = False
                         if not bound:
