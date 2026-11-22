@@ -555,6 +555,13 @@ def main() -> None:
     from ..core.logging import setup_service_logging
     setup_service_logging(os.path.join(state_dir, "logs"))
     log.info("service process starting pid=%d", os.getpid())
+    if os.environ.get("NOVA_TITLE_SOURCE", "").strip().lower() != "off":
+        # unofficial anonymous live-title read (owner-requested player route);
+        # NOVA_TITLE_SOURCE=off keeps the gate closed. Read-only, no capture.
+        from ..core import content_gate
+        from ..ingestion import twitch_title
+        content_gate.set_provider(twitch_title.provider)
+        log.info("live-title source: anonymous player route (unofficial)")
     BotService(token, PairingStore(os.path.join(state_dir, "admin.json"))).run()
 
 

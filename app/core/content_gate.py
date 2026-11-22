@@ -12,8 +12,9 @@ No provider, a provider error, malformed evidence, a different channel, not
 live, stale, or mismatch is a refusal. A manual start decides timing only.
 Local recordings and injected fixtures are not live capture and skip this.
 
-No title source ships. One must be official or otherwise authorized and is
-supplied through ``set_provider``; until then every live path refuses.
+A title source is supplied through ``set_provider``; with none every live
+path refuses. The service installs app.ingestion.twitch_title (anonymous,
+unofficial, read-only; NOVA_TITLE_SOURCE=off disables it).
 
 Locking: ``check`` calls the provider with NO lock held and records the typed
 outcome. ``check_cached`` only validates that recorded outcome (in memory,
