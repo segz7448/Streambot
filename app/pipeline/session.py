@@ -727,6 +727,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             log.warning("authorization changed; leaving %d clip(s) PENDING",
                         len(rows) - len(held_ids))
             _release_claim(conn, clip_id, claim_token)
+            _outcome(clip_id, "interrupted")
             break
         edited = None
         published = False
@@ -740,6 +741,9 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                     clip_id, path, seal_sha, seal_bytes)
                 if input_path is None:
                     _release_claim(conn, clip_id, claim_token)
+                    # verified-untrusted input is a real run outcome:
+                    # claimed, checked, fenced back to PENDING
+                    _outcome(clip_id, "fenced")
                     continue
             plan = plan_clip("auto", source_label, mem,
                              content_seconds=float(dur or 0))
@@ -857,6 +861,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             _release_claim(conn, clip_id, claim_token)
             log.warning("authorization revoked mid-finish; clip %s "
                         "returned to PENDING", clip_id)
+            _outcome(clip_id, "fenced")
             break
         except _ClaimLost:
             # someone else took the row mid-edit: leave it untouched
@@ -864,8 +869,17 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             conn.rollback()
             edited.unlink(missing_ok=True)
             log.warning("claim lost for clip %s; left fenced", clip_id)
+            _outcome(clip_id, "fenced")
             continue
         except Exception as exc:
+            if published:
+                # ancillary post-commit failure only: the clip IS
+                # durably HELD - never report a second, contradictory
+                # terminal result and never touch committed media
+                log.warning("post-commit ancillary step failed for "
+                            "clip %s (clip stays HELD, output "
+                            "preserved): %s", clip_id, exc)
+                continue
             if per_clip_authorization is not None and \
                     not per_clip_authorization():
                 # interrupted by an external stop (shutdown cancel)

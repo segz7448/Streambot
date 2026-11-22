@@ -625,8 +625,9 @@ def _recovery_outcome_text(state_dir: Path, held: int,
     recovered += sum(1 for i in rest if after.get(i) == "HELD")
     failed += sum(1 for i in rest
                   if after.get(i) in ("FAILED", "QC_FAILED"))
-    fenced = sum(1 for i in rest
-                 if after.get(i) in ("PENDING", "RECOVERING"))
+    fenced = sum(1 for oc in worked.values() if oc == "fenced")
+    fenced += sum(1 for i in rest
+                  if after.get(i) in ("PENDING", "RECOVERING"))
     if recovered == 0 and held:
         # HELD via a path without outcome detail (e.g. idempotent
         # re-claim): report the helper's own count, never a guess
