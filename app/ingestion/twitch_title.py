@@ -325,17 +325,21 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                 if exc.kind in TERMINAL:
                     done = _set_latch(exc.kind, clock()) is True
                     raise TitleUnavailable(exc.kind) from None
+                # only the typed no-answer transport failure may keep fresh
+                # evidence; a cancellation is never kept
+                keep_ok = (exc.kind == "error"
+                           and getattr(exc, "detail", "") != "cancelled")
                 with _lock:
                     _backoff[login] = mono() + ERROR_BACKOFF_S
-                    _backoff_retain[login] = True
+                    _backoff_retain[login] = keep_ok
                 done = True
-                raise TitleUnavailable("transport", True) from None
+                raise TitleUnavailable("transport", keep_ok) from None
             except Exception:
                 with _lock:
                     _backoff[login] = mono() + ERROR_BACKOFF_S
-                _backoff_retain[login] = True
+                _backoff_retain[login] = False
                 done = True
-                raise TitleUnavailable("error", True) from None
+                raise TitleUnavailable("error") from None
             with _lock:
                 if latched():             # a refusal (any channel) won the race
                     done = True

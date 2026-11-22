@@ -467,6 +467,18 @@ class RetainTransportOnly(TitleProvider):
         self.assertFalse(check().ok)
         self.assertEqual(len(op.calls), 2)
 
+    def test_generic_exception_and_cancellation_are_not_retained(self):
+        for bad in (RuntimeError("boom"), tp.PlaybackRefused("error", "cancelled"),
+                    tp.PlaybackRefused("quality", "x")):
+            tt.reset()
+            op = Op((200, doc()), bad)
+            check = self.gate(op)
+            self.assertTrue(check().ok)
+            self.m.t += 20
+            self.assertFalse(check().ok, repr(bad))
+            self.m.t += 5                         # backoff keeps it closed
+            self.assertFalse(check().ok, repr(bad))
+
     def test_provider_replacement_drops_kept_evidence(self):
         op = Op((200, doc()), tp.PlaybackRefused("error", "x"))
         check = self.gate(op)
