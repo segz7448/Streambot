@@ -123,6 +123,10 @@ class BotService:
         self.router.register("stopclip",
                              lambda c: self._stopclip(),
                              "stop active clipping sessions")
+        self.router.register("recoverclips",
+                             lambda c: self._recoverclips(),
+                             "finish clips left by interrupted sessions "
+                             "to HELD for review (nothing delivered)")
         self.router.register("sessions",
                              lambda c: self._sessions(),
                              "list clipping sessions")
@@ -222,6 +226,12 @@ class BotService:
     def _sourceauth(self, args: str) -> str:
         from . import source_auth
         return source_auth.sourceauth_reply(self._state_dir(), args)
+
+    def _recoverclips(self) -> str:
+        from . import media as bot_media
+        from . import sessions as sess
+        ff, fp = bot_media.ffmpeg_paths()
+        return sess.recoverclips_reply(self._state_dir(), ff, fp)
 
     def _stopclip(self) -> str:
         from . import sessions as sess

@@ -552,3 +552,41 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
                f"turn it on later (/sourceauth {username} repost on, only "
                "with the streamer's permission).")
             + " /stopclip ends the session.")
+
+
+def recoverclips_reply(state_dir: Path, ffmpeg: str, ffprobe: str) -> str:
+    """/recoverclips: explicitly finish SEALED PENDING clips left by
+    interrupted sessions, to HELD for owner review. Owner-invoked only
+    (the router is admin-gated); no automatic boot wiring calls this.
+    Nothing is delivered or queued for upload. Legacy/unsealed clips
+    and previously-interrupted recovery claims stay fenced; no capture
+    is resumed and no writer is declared dead."""
+    from ..core.database import connect
+    from ..pipeline.session import finalize_interrupted_sessions
+    state_dir = Path(state_dir)
+    held = finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe)
+    fenced = 0
+    db = state_dir / "nova.db"
+    if db.exists():
+        conn = connect(str(db))
+        try:
+            fenced = conn.execute(
+                "SELECT count(*) FROM clips c JOIN stream_sessions s"
+                " ON s.id = c.session_id WHERE s.state='INTERRUPTED'"
+                " AND c.status IN ('PENDING','RECOVERING')").fetchone()[0]
+        finally:
+            conn.close()
+    lines = []
+    if held:
+        lines.append(
+            f"Recovery: {held} clip(s) from interrupted sessions "
+            "finished to HELD for your review (/deliveries). "
+            "Nothing was delivered or queued for upload.")
+    if fenced:
+        lines.append(
+            f"{fenced} clip(s) remain fenced (legacy/unsealed input, "
+            "authorization off, or a previously interrupted recovery) - "
+            "left untouched, not retried.")
+    if not lines:
+        return "Recovery: nothing to do - no interrupted sessions with recoverable clips."
+    return "\n".join(lines)
