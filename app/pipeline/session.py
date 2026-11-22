@@ -212,8 +212,12 @@ class ClipSession:
 
     def _owner_drained(self, task=None) -> bool:
         """Positive attestation by every owner: the recorder task finished,
-        the worker attests no process/thread of its own remains, and no
-        session-owned executor work is outstanding."""
+        the worker attests no process/thread of its own remains, no
+        session-owned executor work is outstanding, AND every writer in
+        the session's registry is verifiably dead with an empty group.
+        Executor completion alone never releases ownership: when cleanup
+        failed or anything is unverifiable, ownership stays unresolved
+        (fail closed) rather than attesting drained."""
         w = getattr(self, "_worker", None)
         if w is None or not hasattr(w, "drained"):
             return False
@@ -223,9 +227,48 @@ class ClipSession:
             with self._inflight_lock:
                 if self._inflight:
                     return False
-            return bool(w.drained())
+            if not bool(w.drained()):
+                return False
         except Exception:
             return False
+        return self._registered_writers_dead()
+
+    def _registered_writers_dead(self) -> bool:
+        """Fail-closed check of this session's writer registry: every
+        recorded intent must be bound, every bound pid verifiably dead
+        (start-time comparison, PID-reuse safe), and every recorded group
+        verifiably empty. An unreadable registry, an unresolved intent,
+        a live pid, a surviving group member, or any visibility
+        uncertainty is NOT death."""
+        import os
+        from ..bot import restartproof as _rp
+        sid = getattr(self, "_session_id", None)
+        if sid is None:
+            return True              # no session registry could exist yet
+        registry = (Path(self.state_dir) / "sessions" / self.source_label
+                    / f"writers-{sid}.json")
+        if not registry.exists():
+            return True              # no writers were ever registered
+        items = _rp._load_registry(registry)
+        if items is None or not isinstance(items, list):
+            return False             # unreadable registry: unknown writers
+        for it in items:
+            if not isinstance(it, dict) or "pid" not in it:
+                return False         # unresolved intent: writer may exist
+            dead, _why = _rp._pid_dead(it["pid"], it.get("start", -1),
+                                       "/proc")
+            if not dead:
+                return False
+            pgid = it.get("pgid")
+            if isinstance(pgid, int):
+                try:
+                    os.killpg(pgid, 0)
+                    return False     # group still has members
+                except ProcessLookupError:
+                    pass             # group verifiably empty
+                except Exception:
+                    return False     # uncertainty is not death
+        return True
 
     def _mark_drained(self) -> None:
         """Persist the terminal outcome always; persist drained=true ONLY if

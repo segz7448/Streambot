@@ -77,18 +77,30 @@ class FFmpegProcess:
     async def stop(self, grace: float = 5.0) -> int:
         if not self._proc:
             return -1
-        if self._proc.returncode is not None:
-            return self._proc.returncode
         import os
         import signal
         pgid = self._proc.pid if getattr(self, "_own_group", False) else None
+
+        def _group_alive() -> bool:
+            # True unless the group is verifiably EMPTY; uncertainty is
+            # treated as alive, never as success
+            if pgid is None:
+                return False
+            try:
+                os.killpg(pgid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except Exception:
+                return True
+
         def _sig(sig):
             if pgid is not None:
                 try:
                     os.killpg(pgid, sig)
                     return
                 except ProcessLookupError:
-                    return
+                    pass          # group empty; still try the direct child
                 except PermissionError:
                     pass          # fall back to the direct child
             try:
@@ -96,12 +108,26 @@ class FFmpegProcess:
                  else self._proc.kill)()
             except ProcessLookupError:
                 pass
+
+        # A leader that already exited is NOT an empty group: signal the
+        # group even then. This is cleanup of the child's own process
+        # group only, not arbitrary-descendant containment.
         _sig(signal.SIGTERM)
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=grace)
         except asyncio.TimeoutError:
+            pass
+        # A successful leader wait is not a dead group either: while the
+        # leader is still up or any group member survives, escalate.
+        if self._proc.returncode is None or _group_alive():
             _sig(signal.SIGKILL)
-            await self._proc.wait()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            t_end = time.monotonic() + 3.0
+            while _group_alive() and time.monotonic() < t_end:
+                await asyncio.sleep(0.05)
         return self._proc.returncode or 0
 
     async def wait(self) -> tuple[int, bytes]:

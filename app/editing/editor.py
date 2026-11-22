@@ -79,21 +79,67 @@ def edit_args(ffmpeg: str, src: str, out: str, preset: OutputPreset,
     return args
 
 
+def _close_pipes(proc) -> None:
+    """Close any pipes still open on the child so no fd reaches a
+    destructor unclosed (ResourceWarning)."""
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
+
+def _group_alive(pgid: int) -> bool:
+    """True unless the group is verifiably EMPTY. Any uncertainty
+    (permission, transient errors) is treated as alive: group cleanup
+    must never declare success on a guess."""
+    import os
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True
+
+
 def _kill_group(proc) -> None:
-    """Best-effort teardown of the spawned child's whole process group
-    (the child leads it: start_new_session=True)."""
+    """Best-effort teardown of the spawned child's own process group (the
+    child leads it: start_new_session=True). A dead leader is NOT a dead
+    group: after the leader exits we verify the group is empty and
+    escalate to SIGKILL while any member survives. This is group cleanup
+    only; it does not establish arbitrary-descendant containment, and
+    callers verify outcomes instead of trusting this best-effort pass."""
     import os
     import signal
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    import time
+    pgid = proc.pid
+    try:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                break                    # group verifiably empty
+            except PermissionError:
+                break                    # cannot signal: nothing more to do
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    proc.wait(timeout=0.1)
+                except Exception:
+                    pass
+                if not _group_alive(pgid):
+                    break
+            if not _group_alive(pgid):
+                break
+    finally:
+        _close_pipes(proc)
         try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            break
-        try:
-            proc.wait(timeout=3)
-            break
+            proc.wait(timeout=1)
         except Exception:
-            continue
+            pass
 
 
 def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
@@ -128,10 +174,13 @@ def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
             _kill_group(proc)
             raise RuntimeError("edit writer identity not recorded; killed")
     try:
-        out_s, err_s = proc.communicate(timeout=600)
-    except subprocess.TimeoutExpired:
-        _kill_group(proc)
-        raise
+        try:
+            out_s, err_s = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            raise
+    finally:
+        _close_pipes(proc)
     if proc.returncode != 0:
         raise RuntimeError(f"edit failed rc={proc.returncode}: "
                            f"{err_s[-300:]!r}")

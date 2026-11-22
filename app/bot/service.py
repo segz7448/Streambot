@@ -431,7 +431,6 @@ class BotService:
         from ..clipping.retrospective import validate_recording
         from ..core import schedule as _sched
         from . import sessions as _sess
-        from . import restartproof as _rp
         from . import source_auth as _auth
         from . import media as _m
         sd = self._state_dir()
@@ -450,11 +449,11 @@ class BotService:
             confirm=lambda a: _sched.confirm_recording(sd, a, valid),
             error=_sess.session_error,
             writer_active=lambda u: _sess.writer_active(sd, u),
-            # positive proof only: the session's own drained attestation,
-            # or every recorded owner/writer verifiably dead (restartproof)
-            terminated=lambda u, a: (
-                _sess.session_terminated(sd, u, a)
-                or _rp.writer_death_proof(sd, u, a)[0]),
+            # positive proof only: the session's own drained attestation.
+            # Proof-based recovery via restartproof is DISABLED in
+            # production: process-visibility completeness on Android is
+            # unresolved, so no proof OR leg may terminate a window here.
+            terminated=lambda u, a: _sess.session_terminated(sd, u, a),
             terminal=lambda u, a: _sess.session_terminal(u, a, sd),
             content_qualified=lambda u: self._content_qualified(u),
             record_allowed=lambda u: _auth.allowed(sd, u, "record"))
@@ -529,30 +528,22 @@ class BotService:
         if recovered:
             log.warning("marked %d crashed session(s) INTERRUPTED",
                         recovered)
-        # finish clips already extracted by sessions that died mid-run:
-        # existing PENDING rows only (no detection/clipper reprocessing),
-        # per-clip idempotent, gated on positive writer-death proof and
-        # the source's CURRENT record authorization; admissions flow
-        # through the normal outbox, nothing is flushed at boot
-        try:
-            from ..pipeline.session import finalize_interrupted_sessions
-            finished = finalize_interrupted_sessions(
-                self._state_dir(),
-                os.environ.get("NOVA_FFMPEG", "ffmpeg"),
-                os.environ.get("NOVA_FFPROBE", "ffprobe"))
-            if finished:
-                log.info("finalized %d clip(s) from interrupted sessions",
-                         finished)
-        except Exception:
-            log.exception("interrupted-session clip finalization failed")
+        # Boot-time clip finalization is DISABLED in production: it is
+        # proof-based recovery over interrupted sessions, and process-
+        # visibility completeness on Android is unresolved, so no
+        # recovery/overwrite path may run here. finalize_interrupted_
+        # sessions stays in the tree (with its tests) unwired for a
+        # future round; interrupted sessions keep their PENDING clips
+        # fenced for manual review.
         from ..core import schedule as _schedmod
         from . import sessions as _s2
-        from . import restartproof as _rp
+        # restartproof proof OR leg removed here as well (see above):
+        # interrupted windows end MISSED only on the session's own
+        # positive attestation
         _n = _schedmod.reconcile(
             self._state_dir(),
-            terminated=lambda u, a: (
-                _s2.session_terminated(self._state_dir(), u, a)
-                or _rp.writer_death_proof(self._state_dir(), u, a)[0]),
+            terminated=lambda u, a: _s2.session_terminated(
+                self._state_dir(), u, a),
             terminal=lambda u, a: _s2.session_terminal(u, a, self._state_dir()))
         if _n:
             log.warning("ended %d interrupted schedule window(s) MISSED", _n)

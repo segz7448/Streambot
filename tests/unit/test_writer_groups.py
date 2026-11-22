@@ -11,6 +11,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -229,6 +230,203 @@ def _children_of(pid):
         except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
             continue
     return kids
+
+
+def _group_members(pgid):
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as fh:
+                parts = fh.read().rsplit(")", 1)[1].split()
+            if int(parts[2]) == pgid and parts[0] not in ("Z", "X"):
+                out.append(int(entry))
+        except Exception:
+            continue
+    return out
+
+
+_TERM_IGNORING_CHILD = ("import signal,time;"
+                        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                        "time.sleep(300)")
+
+
+class KillGroupRegressionTests(unittest.TestCase):
+    """Reviewer-owned regression (r2): a TERM-resistant descendant must
+    not survive _kill_group. A dead leader is not a dead process group."""
+
+    def test_term_resistant_descendant_must_not_survive(self):
+        from app.editing.editor import _kill_group
+        parent = ("import subprocess,sys,time;"
+                  "p=subprocess.Popen([sys.executable,'-c',sys.argv[1]]);"
+                  "print(p.pid,flush=True);time.sleep(300)")
+        p = subprocess.Popen([sys.executable, "-c", parent,
+                              _TERM_IGNORING_CHILD],
+                             start_new_session=True, stdout=subprocess.PIPE,
+                             text=True)
+        try:
+            kid = int(p.stdout.readline())
+            _kill_group(p)
+            self.assertFalse(_group_members(p.pid),
+                             "a dead leader is not a dead process group")
+            self.assertFalse(_alive(kid))
+        finally:
+            import signal
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                pass
+            p.stdout.close()
+
+
+class StopGroupCleanupTests(unittest.TestCase):
+    """FFmpegProcess.stop must clean the child's own group on BOTH paths:
+    a leader that already exited, and a successful leader wait that left
+    TERM-resistant members behind."""
+
+    def test_stop_with_already_dead_leader_kills_group(self):
+        from app.recording.ffmpeg import FFmpegProcess
+
+        async def go():
+            p = FFmpegProcess(
+                args=["sh", "-c",
+                      f"{sys.executable} -c '{_TERM_IGNORING_CHILD}' & exit 0"],
+                session_id="t")
+            await p.start(own_group=True)
+            await asyncio.wait_for(p.wait(), timeout=10)  # leader exits
+            members = _group_members(p.pid)
+            await p.stop(grace=0.3)
+            return p.pid, members
+
+        pid, members = asyncio.run(go())
+        self.assertTrue(members, "expected a surviving descendant")
+        for m in members:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(m, 0)
+        self.assertFalse(_group_members(pid))
+
+    def test_stop_after_successful_leader_wait_kills_survivors(self):
+        from app.recording.ffmpeg import FFmpegProcess
+
+        async def go():
+            p = FFmpegProcess(
+                args=["sh", "-c",
+                      f"{sys.executable} -c '{_TERM_IGNORING_CHILD}' & "
+                      "exec sleep 300"],
+                session_id="t")
+            await p.start(own_group=True)
+            await asyncio.sleep(0.5)
+            members = _group_members(p.pid)
+            await p.stop(grace=0.3)
+            return p.pid, members
+
+        pid, members = asyncio.run(go())
+        self.assertTrue(members, "expected leader plus descendant")
+        for m in members:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(m, 0)
+        self.assertFalse(_group_members(pid))
+
+
+class PipeClosureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.out = str(self.tmp / "out.mp4")
+        self.src = str(self.tmp / "src.mp4")
+        Path(self.src).write_bytes(b"\x00" * 128)
+        fake_ff = self.tmp / "fake-ffmpeg"
+        fake_ff.write_text("#!/bin/sh\nexit 0\n")
+        fake_ff.chmod(0o755)
+        self.ff = str(fake_ff)
+
+    def _capture_popen(self, captured):
+        real_popen = editor.subprocess.Popen
+
+        def spy(*a, **k):
+            proc = real_popen(*a, **k)
+            captured["proc"] = proc
+            return proc
+        return mock.patch.object(editor.subprocess, "Popen",
+                                 side_effect=spy)
+
+    def test_pipes_closed_on_success(self):
+        captured = {}
+        with self._capture_popen(captured):
+            edit_clip(self.ff, self.src, self.out, HORIZONTAL, 0, 10,
+                      str(self.tmp), pre_spawn=lambda: "t",
+                      on_spawn=lambda *a: True)
+        self.assertTrue(captured["proc"].stdout.closed)
+        self.assertTrue(captured["proc"].stderr.closed)
+
+    def test_pipes_closed_on_bind_failure_kill(self):
+        captured = {}
+        with self._capture_popen(captured):
+            with self.assertRaises(RuntimeError):
+                edit_clip(self.ff, self.src, self.out, HORIZONTAL, 0, 10,
+                          str(self.tmp), pre_spawn=lambda: "t",
+                          on_spawn=lambda *a: False)
+        self.assertTrue(captured["proc"].stdout.closed)
+        self.assertTrue(captured["proc"].stderr.closed)
+
+
+class OwnerDrainedFailClosedTests(unittest.TestCase):
+    """Executor completion is not ownership release: _owner_drained must
+    stay False while any registered writer is unverifiable or alive."""
+
+    def setUp(self):
+        from app.pipeline.session import ClipSession
+        self.tmp = Path(tempfile.mkdtemp())
+        inst = ClipSession.__new__(ClipSession)
+        inst._session_id = 42
+        inst.state_dir = self.tmp
+        inst.source_label = "someuser"
+        inst._worker = mock.Mock()
+        inst._worker.drained = lambda: True
+        inst._inflight = 0
+        self.inst = inst
+        self.reg_dir = self.tmp / "sessions" / "someuser"
+        self.reg_dir.mkdir(parents=True)
+        self.registry = self.reg_dir / "writers-42.json"
+
+    def test_no_registry_is_drained(self):
+        self.assertTrue(self.inst._owner_drained())
+
+    def test_live_registered_writer_blocks_drained(self):
+        from app.bot import restartproof as rp
+        proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        try:
+            token = rp.record_spawn_intent(self.registry)
+            self.assertIsNotNone(token)
+            self.assertTrue(rp.record_spawned(self.registry, token,
+                                              proc.pid, proc.pid))
+            self.assertFalse(self.inst._owner_drained())
+            proc.terminate()
+            proc.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while _group_members(proc.pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(self.inst._owner_drained())
+        finally:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            proc.wait()
+
+    def test_unreadable_registry_blocks_drained(self):
+        self.registry.write_bytes(b"not json at all")
+        self.assertFalse(self.inst._owner_drained())
+
+    def test_unresolved_intent_blocks_drained(self):
+        from app.bot import restartproof as rp
+        token = rp.record_spawn_intent(self.registry)
+        self.assertIsNotNone(token)
+        self.assertFalse(self.inst._owner_drained())
 
 
 if __name__ == "__main__":

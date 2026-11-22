@@ -81,6 +81,7 @@ def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
     if pre_spawn is not None and token is None:
         Path(list_path).unlink(missing_ok=True)
         raise RuntimeError("extract spawn intent not recordable; not spawning")
+    proc = None
     try:
         proc = subprocess.Popen(
             extract_args(ffmpeg, list_path, plan, out_path),
@@ -101,6 +102,9 @@ def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
             _kill_group(proc)
             raise
     finally:
+        if proc is not None:
+            from ..editing.editor import _close_pipes
+            _close_pipes(proc)
         Path(list_path).unlink(missing_ok=True)  # clean only our own temp
     if proc.returncode != 0:
         raise RuntimeError(f"clip extraction failed rc={proc.returncode}: "
