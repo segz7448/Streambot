@@ -150,7 +150,9 @@ def take_verified_snapshot_bounded(src, snapshot_dir, expected_sha256: str,
     import time as _time
     src = Path(src)
     Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
-    snap = unique_path(snapshot_dir, "snapshot", src.suffix or ".bin")
+    # exclusive reservation, not just a random name: a colliding
+    # candidate (another attempt's input) is skipped, never truncated
+    snap = reserve_output(snapshot_dir, "snapshot", src.suffix or ".bin")
     deadline = _time.monotonic() + max_seconds
 
     def late(phase: str) -> None:

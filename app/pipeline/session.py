@@ -718,6 +718,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             _release_claim(conn, clip_id, claim_token)
             break
         edited = None
+        published = False
         try:
             # the caller may substitute a verified private input (the
             # recovery snapshot); None from the resolver means the input
@@ -809,6 +810,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                 except Exception:
                     conn.rollback()
                     raise
+                published = True
                 # PUBLICATION COMMIT POINT: the row is durably HELD and
                 # the admission outbox (when enabled) is committed in
                 # the same transaction. Everything below is ancillary:
@@ -852,9 +854,11 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             continue
         except Exception as exc:
             log.warning("finish failed for clip %s: %s", clip_id, exc)
-            if edited is not None:
-                # our own reserved per-attempt output; a partial file is
-                # never referenced by the row, so remove it
+            if edited is not None and not published:
+                # our own reserved per-attempt output that was NEVER
+                # published; remove it. After the durable commit the
+                # guard holds: committed media is never unlinked here,
+                # no matter which ancillary call raised.
                 edited.unlink(missing_ok=True)
             conn.execute(
                 "UPDATE clips SET status='FAILED', recovery_owner=NULL,"

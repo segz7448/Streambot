@@ -2,6 +2,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.clipping import seal
 
@@ -49,6 +50,27 @@ class SealTests(unittest.TestCase):
     def test_unique_path_never_repeats(self):
         seen = {seal.unique_path(self.dir, "p", ".mp4") for _ in range(50)}
         self.assertEqual(len(seen), 50)
+
+    def test_snapshot_path_collision_preserves_prior_bytes(self):
+        # a snapshot path that already exists (another attempt's input)
+        # must never be overwritten: reservation is exclusive, so the
+        # colliding candidate is skipped and its bytes survive
+        sha, size = seal.seal_file(self.raw)
+        snapdir = self.dir / "rec"
+        snapdir.mkdir()
+        victim = snapdir / "snapshot-aaaaaaaaaaaa.ts"
+        victim.write_bytes(b"PRIOR-ATTEMPT-BYTES")
+
+        class FakeUUID:
+            def __init__(self, hexval):
+                self.hex = hexval
+        seq = iter([FakeUUID("a" * 32), FakeUUID("b" * 32)])
+        with mock.patch("app.clipping.seal.uuid.uuid4",
+                        side_effect=lambda: next(seq)):
+            snap = seal.take_verified_snapshot_bounded(
+                self.raw, snapdir, sha, size)
+        self.assertIsNotNone(snap)
+        self.assertNotEqual(snap, victim)
 
 
 if __name__ == "__main__":

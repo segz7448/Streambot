@@ -308,3 +308,27 @@ class PostCommitAncillaryTests(FinalizeTests):
         self.assertEqual(held, [cid])
         self.assertEqual(status, "HELD")
         self.assertTrue(Path(path).exists())
+
+    def test_published_guard_holds_even_if_ancillary_handler_raises(self):
+        # defense in depth: even if a post-commit ancillary HANDLER
+        # itself raises (here the guarded memory-note log call), the
+        # outer cleanup must never unlink a published output
+        cid = self._add_clip()
+        for p in self._patches():
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        raised = []
+        def boom_once(msg, *a):
+            if not raised:
+                raised.append(msg)
+                raise RuntimeError("logger boom")
+        with mock.patch("app.intelligence.memory.Memory.remember",
+                        side_effect=OSError("boom")), mock.patch(
+                            "app.pipeline.session.log.warning",
+                            side_effect=boom_once):
+            n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg",
+                                                 "ffprobe")
+        self.assertEqual(n, 1)
+        status, dur, path, owner = self._clip(cid)
+        self.assertEqual(status, "HELD")
+        self.assertTrue(Path(path).exists())
