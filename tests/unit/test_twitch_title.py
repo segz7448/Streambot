@@ -548,6 +548,37 @@ class RetainTransportOnly(TitleProvider):
         self.assertFalse(out["r"].ok, out["r"].reason)
         self.assertFalse(cg.check_cached("slowchan", now=self.m).ok)
 
+    def test_latch_cannot_install_during_retained_publication(self):
+        import threading
+        state = {"slow": 0}
+
+        def op(req, timeout, limit, deadline, should_stop):
+            state["slow"] += 1
+            if state["slow"] == 1:
+                return (200, doc(login="slowchan"))
+            raise tp.PlaybackRefused("error", "deadline reached")
+        cg.set_provider(lambda u: tt.fetch(u, opener=op, clock=self.m,
+                                           mono=self.m))
+        self.assertTrue(cg.check("slowchan", now=self.m).ok)
+        self.m.t += 20
+        seen = {}
+
+        class Spy(dict):
+            def __setitem__(d, k, v):
+                if "th" not in seen:       # first publication write
+                    seen["th"] = th = threading.Thread(
+                        target=lambda: tt._set_latch("blocked", 0.0))
+                    th.start()
+                    th.join(0.3)
+                    seen["blocked_during_publish"] = th.is_alive()
+                dict.__setitem__(d, k, v)
+        cg._last = Spy(cg._last)
+        r = cg.check("slowchan", now=self.m)
+        seen["th"].join(5)
+        self.assertTrue(seen["blocked_during_publish"])
+        self.assertTrue(r.ok)             # published before the latch landed
+        self.assertEqual(tt.latched(), "blocked")
+
     def test_provider_replacement_drops_kept_evidence(self):
         op = Op((200, doc()), tp.PlaybackRefused("error", "x"))
         check = self.gate(op)

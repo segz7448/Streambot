@@ -118,6 +118,16 @@ def _judge(username: str, ev, now: float) -> Result:
     return Result(True, "ok")
 
 
+def _publish(u: str, seq: int, res: Result, ev) -> None:
+    """Record an outcome. Caller holds _lock."""
+    _last[u] = (res, ev)
+    _pub[u] = seq
+    if res.ok and ev is not None:
+        _good[u] = ev
+    else:
+        _good.pop(u, None)      # any newer non-passing outcome wins
+
+
 def check(username: str, now=time.time) -> Result:
     """Ask the provider (blocking; never call under a registry lock).
 
@@ -159,7 +169,9 @@ def check(username: str, now=time.time) -> Result:
             return newer[0] if newer else Result(False, "unavailable")
         if guard is not None:
             # Lock order: _lock (here) then twitch_title._lock (in guard).
-            # Terminal eligibility and publication share one section.
+            # Terminal eligibility, retained judgment AND publication all
+            # happen inside the guard, so a latch cannot install between
+            # them. Guard errors fail closed.
             try:
                 with guard() as eligible:
                     kept = _good.get(u) if eligible else None
@@ -167,14 +179,12 @@ def check(username: str, now=time.time) -> Result:
                         held = _judge(u, kept, tnow)
                         if held.ok:
                             res, ev = held, kept
+                    _publish(u, seq, res, ev)
             except Exception:  # noqa: BLE001
                 res, ev = Result(False, "unavailable"), None
-        _last[u] = (res, ev)
-        _pub[u] = seq
-        if res.ok and ev is not None:
-            _good[u] = ev
+                _publish(u, seq, res, ev)
         else:
-            _good.pop(u, None)      # any newer non-passing outcome wins
+            _publish(u, seq, res, ev)
     return res
 
 
