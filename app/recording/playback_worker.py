@@ -54,7 +54,31 @@ _REFUSAL_KINDS = frozenset(
 
 def _safe_kind(exc) -> str:
     kind = getattr(exc, "kind", None)
-    return kind if kind in _REFUSAL_KINDS else "error"
+    # isinstance gate first: membership on an unhashable value raises
+    # TypeError, and this path must never throw
+    return kind if isinstance(kind, str) and kind in _REFUSAL_KINDS else "error"
+
+
+def _refusal_extras(exc) -> str:
+    """Fixed-schema structured extras on a refusal: fetch sub-stage
+    (tp.REFUSAL_STAGES), transport class (tp.TRANSPORTS), bounded HTTP
+    status. Exact-type gates before any membership test (an unhashable
+    value would raise TypeError); the whole thing is additionally wrapped
+    so a diagnostic failure can NEVER replace the original refusal."""
+    try:
+        out = ""
+        stage = getattr(exc, "stage", None)
+        if isinstance(stage, str) and stage in tp.REFUSAL_STAGES:
+            out += " stage=" + stage
+        transport = getattr(exc, "transport", None)
+        if isinstance(transport, str) and transport in tp.TRANSPORTS:
+            out += " via=" + transport
+        code = getattr(exc, "http_status", None)
+        if type(code) is int and 100 <= code <= 599:
+            out += " http=%d" % code
+        return out
+    except Exception:
+        return ""
 
 
 def _bounded_int(res, name, lo=-1_000_000, hi=1_000_000_000):
@@ -208,7 +232,8 @@ class PlaybackWorker:
                     opener=self.opener, host_ok=self.host_ok,
                     min_interval=self.resolve_interval, should_stop=stop_or_revoked)
         except tp.PlaybackRefused as e:
-            self.last_cycle_diag = "resolve refused kind=" + _safe_kind(e)
+            self.last_cycle_diag = ("resolve refused kind=" + _safe_kind(e)
+                                    + _refusal_extras(e))
             return self._refused(e.kind)
         if not self._recheck():
             return "revoked"
@@ -224,7 +249,8 @@ class PlaybackWorker:
                 output_args=self.buffer.segmenter_output_args(self.buffer.next_seq()),
                 pre_spawn=self.pre_spawn, on_spawn=self.on_spawn)
         except tp.PlaybackRefused as e:
-            self.last_cycle_diag = "capture refused kind=" + _safe_kind(e)
+            self.last_cycle_diag = ("capture refused kind=" + _safe_kind(e)
+                                    + _refusal_extras(e))
             return self._refused(e.kind)
         self._note_cycle_diag(res)
         seq_after = self.buffer.next_seq()
@@ -304,7 +330,7 @@ class PlaybackWorker:
         change capture behavior or turn a success into a crash."""
         try:
             reason = getattr(res, "reason", None)
-            if reason not in _CAPTURE_REASONS:
+            if not isinstance(reason, str) or reason not in _CAPTURE_REASONS:
                 reason = "unknown"
             self.last_cycle_diag = (
                 "capture reason=%s ffmpeg_rc=%s segments=%s media=%s bytes=%s"
@@ -318,6 +344,8 @@ class PlaybackWorker:
     terminal_kind = None      # typed reason for a terminal refusal (read by the scheduler)
 
     def _refused(self, kind: str) -> str:
+        if not isinstance(kind, str):
+            kind = "error"     # malformed refusal: safest transient class
         if kind in TERMINAL:
             self.terminal_kind = kind
         if kind == "offline":

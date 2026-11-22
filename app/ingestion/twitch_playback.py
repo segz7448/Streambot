@@ -49,14 +49,30 @@ _QUERY = ("query PlaybackAccessToken($login: String!, $isLive: Boolean!, "
           "playerType: $playerType}) @include(if: $isLive) { value signature } }")
 
 
+# Closed enums for the structured, nonsecret diagnostic fields a
+# PlaybackRefused may carry. Values outside these sets are never emitted.
+REFUSAL_STAGES = frozenset({"token", "playlist", "segment", "spawn", "pipe"})
+TRANSPORTS = frozenset({"http", "timeout", "dns", "refused", "tls",
+                        "connect", "reset", "too_large", "parse", "spawn",
+                        "deadline", "cancelled", "other"})
+_CHILD_CLASSES = {1: "timeout", 2: "dns", 3: "refused", 4: "tls",
+                  5: "reset", 6: "connect"}
+
+
 class PlaybackRefused(Exception):
     """kind: unauthorized | invalid | offline | restricted | challenge |
-    blocked | quality | error. Message never contains a URL or token."""
+    blocked | quality | error. Message never contains a URL or token.
+    Optional structured diagnostics: stage (REFUSAL_STAGES), transport
+    (TRANSPORTS), http_status (bounded int) - fixed enums/values only."""
 
-    def __init__(self, kind: str, detail: str = ""):
+    def __init__(self, kind: str, detail: str = "", *, stage=None,
+                 transport=None, http_status=None):
         super().__init__(f"{kind}: {detail}" if detail else kind)
         self.kind = kind
         self.detail = detail
+        self.stage = stage
+        self.transport = transport
+        self.http_status = http_status
 
 
 @dataclass(frozen=True)
@@ -114,9 +130,9 @@ def default_opener(req: urllib.request.Request, timeout: float,
     def left():
         return (deadline - time.monotonic()) if deadline is not None else timeout
     if left() <= 0:
-        raise PlaybackRefused("error", "deadline reached")
+        raise PlaybackRefused("error", "deadline reached", transport="deadline")
     if should_stop is not None and should_stop():
-        raise PlaybackRefused("error", "cancelled")
+        raise PlaybackRefused("error", "cancelled", transport="cancelled")
     child = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_fetch_child.py")
     try:
         proc = subprocess.Popen(
@@ -124,7 +140,7 @@ def default_opener(req: urllib.request.Request, timeout: float,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             start_new_session=True)
     except OSError:
-        raise PlaybackRefused("error", "cannot start fetch worker") from None
+        raise PlaybackRefused("error", "cannot start fetch worker", transport="spawn") from None
     t_hard = time.monotonic() + max(0.5, timeout)   # whole-request cap
     buf = bytearray()
     why = None
@@ -172,13 +188,23 @@ def default_opener(req: urllib.request.Request, timeout: float,
         except Exception:
             pass
     if why:
-        raise PlaybackRefused("error", why)
-    if proc.returncode != 0 or len(buf) < 4:
-        raise PlaybackRefused("error", "network error")
+        raise PlaybackRefused("error", why, transport={
+            "cancelled": "cancelled",
+            "deadline reached": "deadline",
+            "response too large": "too_large"}.get(why, "other"))
+    if proc.returncode != 0:
+        transport = "other"
+        if len(buf) >= 5:
+            status0, cls = struct.unpack(">IB", bytes(buf[:5]))
+            if status0 == 0:
+                transport = _CHILD_CLASSES.get(cls, "other")
+        raise PlaybackRefused("error", "network error", transport=transport)
+    if len(buf) < 4:
+        raise PlaybackRefused("error", "network error", transport="other")
     status = struct.unpack(">I", bytes(buf[:4]))[0]
     body = bytes(buf[4:])
     if status == 200 and len(body) > limit:
-        raise PlaybackRefused("error", "response too large")
+        raise PlaybackRefused("error", "response too large", transport="too_large")
     return status, body
 
 
@@ -212,12 +238,16 @@ def _host_ok(url: str, host_ok=None) -> bool:
 
 def _status_refusal(code: int, stage: str) -> PlaybackRefused:
     if code == 404:
-        return PlaybackRefused("offline", f"{stage} 404 (channel offline or unknown)")
+        return PlaybackRefused("offline", f"{stage} 404 (channel offline or unknown)",
+                               transport="http", http_status=code)
     if code in (401, 403):
-        return PlaybackRefused("restricted", f"{stage} HTTP {code}")
+        return PlaybackRefused("restricted", f"{stage} HTTP {code}",
+                               transport="http", http_status=code)
     if code == 429:
-        return PlaybackRefused("blocked", f"{stage} rate limited (no retry)")
-    return PlaybackRefused("error", f"{stage} HTTP {code}")
+        return PlaybackRefused("blocked", f"{stage} rate limited (no retry)",
+                               transport="http", http_status=code)
+    return PlaybackRefused("error", f"{stage} HTTP {code}",
+                           transport="http", http_status=code)
 
 
 def _get_token(channel, opener, timeout, deadline=None, should_stop=None):

@@ -52,16 +52,27 @@ class PumpResult:
     stderr_tail: str     # redacted, bounded
 
 
-def _fetch(url, opener, host_ok, timeout, limit, deadline, should_stop):
-    if not tp._host_ok(url, host_ok):
-        raise tp.PlaybackRefused("blocked", "URI outside the allowed playback hosts")
-    code, body = tp.call_opener(opener, urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0"}), timeout, limit, deadline, should_stop)
-    if code != 200:
-        raise tp._status_refusal(code, "media")
-    if len(body) > limit:
-        raise tp.PlaybackRefused("error", "response too large")
-    return body
+def _fetch(url, opener, host_ok, timeout, limit, deadline, should_stop,
+           stage=None):
+    # stage tags any refusal with WHERE in the capture pipe it happened
+    # (closed enum in tp.REFUSAL_STAGES); never carries text of its own.
+    try:
+        if not tp._host_ok(url, host_ok):
+            raise tp.PlaybackRefused(
+                "blocked", "URI outside the allowed playback hosts")
+        code, body = tp.call_opener(opener, urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0"}), timeout, limit,
+            deadline, should_stop)
+        if code != 200:
+            raise tp._status_refusal(code, "media")
+        if len(body) > limit:
+            raise tp.PlaybackRefused("error", "response too large",
+                                     transport="too_large")
+        return body
+    except tp.PlaybackRefused as e:
+        if stage is not None and getattr(e, "stage", None) is None:
+            e.stage = stage
+        raise
 
 
 def _attrs(line: str) -> dict:
@@ -247,7 +258,7 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
                 break
             try:
                 text = _fetch(base, op, host_ok, timeout, PLAYLIST_MAX_BYTES,
-                              dl, should_stop).decode("utf-8", "replace")
+                              dl, should_stop, stage="playlist").decode("utf-8", "replace")
             except tp.PlaybackRefused as e:
                 if e.kind == "offline" and segs_n:
                     reason = "ended"; break
@@ -262,7 +273,7 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
                 if should_stop() or clock() >= t_end or media >= max_media_seconds:
                     break
                 try:
-                    blob = _fetch(uri, op, host_ok, timeout, SEGMENT_MAX_BYTES, dl, should_stop)
+                    blob = _fetch(uri, op, host_ok, timeout, SEGMENT_MAX_BYTES, dl, should_stop, stage="segment")
                 except tp.PlaybackRefused as e:
                     if e.kind == "offline":      # expired segment: skip
                         next_seq = seq + 1
@@ -293,7 +304,11 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
     except tp.PlaybackRefused as e:
         err = e
     except Exception as exc:
-        err = tp.PlaybackRefused("error", tp.redact(type(exc).__name__))
+        err = tp.PlaybackRefused(
+            "error", tp.redact(type(exc).__name__),
+            transport=("timeout" if isinstance(exc, TimeoutError)
+                       else "parse" if isinstance(exc, ValueError)
+                       else "other"))
     finally:
         _terminate(proc, grace)
         th.join(timeout=5)

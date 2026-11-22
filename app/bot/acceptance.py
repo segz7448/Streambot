@@ -11,12 +11,16 @@ Run only under a separately approved live window. Not a scheduler/retry loop.
 from __future__ import annotations
 import argparse
 import json
+import math
 import threading
 import time
 from pathlib import Path
 from . import sessions, source_auth
 from ..ingestion import twitch_playback as tp
 from ..pipeline.session import ClipSession
+
+
+APPROVED_TARGETS = frozenset({"lacy", "agent00"})
 
 
 def run_once(state_dir, ffmpeg, ffprobe, *, target, seconds=85,
@@ -27,8 +31,11 @@ def run_once(state_dir, ffmpeg, ffprobe, *, target, seconds=85,
     retained, never allowed to bypass ownership cleanup.
     """
     sd = Path(state_dir)
-    if target != "lacy" or not (0 < seconds <= 85):
-        raise ValueError("acceptance requires lacy and 0 < seconds <= 85")
+    if type(target) is not str or target not in APPROVED_TARGETS:
+        raise ValueError("target is not approved for bounded acceptance")
+    if (type(seconds) not in (int, float) or not math.isfinite(seconds)
+            or not 0 < seconds <= 85):
+        raise ValueError("acceptance requires finite 0 < seconds <= 85")
     if not (sd / "nova.db").is_file():
         raise ValueError("explicit existing state required")
     if not source_auth.allowed(sd, target, "record") or source_auth.allowed(sd, target, "repost"):
@@ -120,7 +127,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true", required=True)
     parser.add_argument("--state-dir", required=True)
-    parser.add_argument("--target", required=True, choices=["lacy"])
+    parser.add_argument("--target", required=True, choices=sorted(APPROVED_TARGETS))
     parser.add_argument("--seconds", type=float, default=85)
     args=parser.parse_args()
     from .media import ffmpeg_paths

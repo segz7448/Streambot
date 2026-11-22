@@ -15,6 +15,35 @@ import urllib.error
 import urllib.request
 
 
+def _classify(exc) -> int:
+    """Map a fetch failure to a FIXED class byte for the parent: 1 timeout,
+    2 dns, 3 refused, 4 tls, 5 reset, 6 connect, 9 other. No message text,
+    no exception str - a bounded code only."""
+    import http.client
+    import socket
+    import ssl
+    cur, seen = exc, 0
+    while cur is not None and seen < 4:
+        if isinstance(cur, (TimeoutError, socket.timeout)):
+            return 1
+        if isinstance(cur, socket.gaierror):
+            return 2
+        if isinstance(cur, ConnectionRefusedError):
+            return 3
+        if isinstance(cur, ssl.SSLError):
+            return 4
+        if isinstance(cur, (ConnectionResetError,
+                            http.client.RemoteDisconnected)):
+            return 5
+        cur = (getattr(cur, "reason", None)
+               if isinstance(cur, urllib.error.URLError)
+               else getattr(cur, "__cause__", None))
+        seen += 1
+    if isinstance(exc, (ConnectionError, OSError)):
+        return 6
+    return 9
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k):
         return None
@@ -44,7 +73,12 @@ def main() -> int:
                 break
             out.write(b); out.flush(); n += len(b)
         return 0
-    except BaseException:
+    except BaseException as exc:
+        try:
+            sys.stdout.buffer.write(struct.pack(">IB", 0, _classify(exc)))
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
         return 2
 
 

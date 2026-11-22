@@ -155,6 +155,126 @@ class CycleDiagSchemaTests(unittest.TestCase):
         self.assertIn("ffmpeg_rc=1", msg)
 
 
+class RefusalStructuredFieldTests(unittest.TestCase):
+    """kind=error collapses fetch classes; the fixed-schema stage/transport/
+    http_status fields restore the distinction without any raw text."""
+
+    def test_status_refusal_carries_http_status_and_transport(self):
+        for code, kind in ((404, "offline"), (403, "restricted"),
+                           (429, "blocked"), (500, "error")):
+            e = tp._status_refusal(code, "media")
+            self.assertEqual(e.kind, kind)
+            self.assertEqual(e.transport, "http")
+            self.assertEqual(e.http_status, code)
+
+    def test_fetch_tags_stage_without_overriding(self):
+        from app.ingestion import hls_pump
+        opener = lambda *a: (403, b"")
+        try:
+            hls_pump._fetch("https://usher.ttvnw.net/x", opener, None, 1,
+                            100, None, None, stage="segment")
+            self.fail("expected refusal")
+        except tp.PlaybackRefused as e:
+            self.assertEqual((e.kind, e.stage, e.transport, e.http_status),
+                             ("restricted", "segment", "http", 403))
+        # a refusal that already carries a stage keeps it
+        def staged(*a):
+            raise tp.PlaybackRefused("error", "x", stage="playlist")
+        try:
+            hls_pump._fetch("https://usher.ttvnw.net/x", staged, None, 1,
+                            100, None, None, stage="segment")
+            self.fail("expected refusal")
+        except tp.PlaybackRefused as e:
+            self.assertEqual(e.stage, "playlist")
+
+    def test_worker_diag_includes_validated_extras_only(self):
+        w = _worker()
+        w.capture_fn = mock.Mock(side_effect=tp.PlaybackRefused(
+            "error", SECRET_BLOB, stage="segment", transport="http",
+            http_status=500))
+        with mock.patch.object(w, "_recheck", return_value=True):
+            self.assertEqual(w._cycle_inner(lambda: False), "retry")
+        self.assertEqual(w.last_cycle_diag,
+                         "capture refused kind=error stage=segment "
+                         "via=http http=500")
+        for marker in SECRET_MARKERS:
+            self.assertNotIn(marker, w.last_cycle_diag)
+
+    def test_worker_drops_bogus_extras(self):
+        w = _worker()
+        bad = tp.PlaybackRefused("error", "x", stage="https://cdn.invalid/",
+                                 transport="sql injection", http_status=99999)
+        w.capture_fn = mock.Mock(side_effect=bad)
+        with mock.patch.object(w, "_recheck", return_value=True):
+            self.assertEqual(w._cycle_inner(lambda: False), "retry")
+        self.assertEqual(w.last_cycle_diag, "capture refused kind=error")
+
+    def test_unhashable_values_never_throw_or_leak(self):
+        # reviewer control: stage=[] / transport={} / kind=[] must not
+        # raise TypeError from frozenset membership and must not replace
+        # the original refusal outcome
+        w = _worker()
+        bad = tp.PlaybackRefused("error", "x")
+        bad.kind, bad.stage, bad.transport, bad.http_status = [], [], {}, []
+        w.capture_fn = mock.Mock(side_effect=bad)
+        with mock.patch.object(w, "_recheck", return_value=True):
+            self.assertEqual(w._cycle_inner(lambda: False), "retry")
+        self.assertEqual(w.last_cycle_diag, "capture refused kind=error")
+
+    def test_throwing_attribute_access_falls_back_safely(self):
+        class Hostile(Exception):
+            kind = "error"
+            def __getattr__(self, name):
+                raise RuntimeError("boom")
+        from app.recording import playback_worker as pw
+        self.assertEqual(pw._refusal_extras(Hostile()), "")
+        self.assertEqual(pw._safe_kind(Hostile()), "error")
+
+    def test_unhashable_capture_reason_degrades_to_unknown(self):
+        w = _worker()
+        w._note_cycle_diag(types.SimpleNamespace(
+            reason=["ended"], ffmpeg_rc=0, segments=0, media_seconds=0,
+            bytes_written=0))
+        self.assertIn("reason=unknown", w.last_cycle_diag)
+
+    def test_child_classify_fixed_codes(self):
+        import socket
+        import ssl
+        import urllib.error
+        from app.ingestion import _fetch_child as fc
+        self.assertEqual(fc._classify(TimeoutError()), 1)
+        self.assertEqual(fc._classify(socket.gaierror()), 2)
+        self.assertEqual(fc._classify(
+            urllib.error.URLError(ConnectionRefusedError())), 3)
+        self.assertEqual(fc._classify(
+            urllib.error.URLError(ssl.SSLError())), 4)
+        self.assertEqual(fc._classify(ConnectionResetError()), 5)
+        self.assertEqual(fc._classify(OSError()), 6)
+        self.assertEqual(fc._classify(ValueError()), 9)
+
+    def test_default_opener_reports_refused_transport(self):
+        # closed localhost port: the real child fails connect -> class byte
+        import socket
+        import urllib.request
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()                       # nothing listens here
+        with self.assertRaises(tp.PlaybackRefused) as cm:
+            tp.default_opener(
+                urllib.request.Request(f"http://127.0.0.1:{port}/"),
+                5, 1000, None)
+        self.assertEqual(cm.exception.transport, "refused")
+
+    def test_default_opener_deadline_transport(self):
+        import urllib.request
+        with self.assertRaises(tp.PlaybackRefused) as cm:
+            tp.default_opener(
+                urllib.request.Request("http://127.0.0.1:1/"), 5, 1000,
+                time.monotonic() - 1)   # already-expired deadline
+        self.assertEqual(cm.exception.transport, "deadline")
+
+
 class AcceptanceDiagTests(unittest.TestCase):
     """The runner JSON carries fixed-schema failure fields only."""
 
