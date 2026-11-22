@@ -393,11 +393,20 @@ class OwnerDrainedFailClosedTests(unittest.TestCase):
         self.reg_dir.mkdir(parents=True)
         self.registry = self.reg_dir / "writers-42.json"
 
-    def test_no_registry_is_drained(self):
+    def test_missing_registry_blocks_drained(self):
+        # the manifest is initialized before any session work, so a
+        # missing file is a LOST manifest, indistinguishable from lost
+        # writer evidence: it must block, not pass as "no writers"
+        self.assertFalse(self.inst._owner_drained())
+
+    def test_empty_manifest_is_drained(self):
+        from app.bot import restartproof as rp
+        self.assertTrue(rp.init_registry(self.registry))
         self.assertTrue(self.inst._owner_drained())
 
     def test_live_registered_writer_blocks_drained(self):
         from app.bot import restartproof as rp
+        self.assertTrue(rp.init_registry(self.registry))
         proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
         try:
             token = rp.record_spawn_intent(self.registry)
@@ -427,6 +436,51 @@ class OwnerDrainedFailClosedTests(unittest.TestCase):
         token = rp.record_spawn_intent(self.registry)
         self.assertIsNotNone(token)
         self.assertFalse(self.inst._owner_drained())
+
+    def _entry(self, **over):
+        import json as _json
+        entry = {"intent": "t", "ts": 1.0, "pid": 424242,
+                 "start": 1000, "pgid": 424242}
+        entry.update(over)
+        self.registry.write_text(_json.dumps(
+            {"v": 1, "writers": [entry]}))
+
+    def test_live_pid_with_missing_start_blocks_drained(self):
+        # the r3 gap: a live pid whose start is missing must NOT be
+        # mistaken for a reused (dead) pid
+        live = os.getpid()
+        self._entry(pid=live, start=None, pgid=live)
+        self.assertFalse(self.inst._owner_drained())
+        self._entry(pid=live, pgid=live)
+        import json as _json
+        self.registry.write_text(_json.dumps(
+            {"v": 1, "writers":
+             [{"intent": "t", "ts": 1.0, "pid": live, "pgid": live}]}))
+        self.assertFalse(self.inst._owner_drained())
+
+    def test_missing_pgid_blocks_drained(self):
+        import json as _json
+        self.registry.write_text(_json.dumps(
+            {"v": 1, "writers":
+             [{"intent": "t", "ts": 1.0, "pid": 424242,
+               "start": 1000}]}))
+        self.assertFalse(self.inst._owner_drained())
+
+    def test_legacy_unversioned_manifest_blocks_drained(self):
+        # pre-version layout: never wiped, never read as valid
+        import json as _json
+        self.registry.write_text(_json.dumps(
+            [{"intent": "t", "ts": 1.0, "pid": 424242, "start": 1000,
+              "pgid": 424242}]))
+        self.assertFalse(self.inst._owner_drained())
+
+    def test_invalid_identities_block_drained(self):
+        for bad in (dict(pid=-1), dict(pid=0), dict(pid=True),
+                    dict(start=-5), dict(start=0), dict(pgid=-2),
+                    dict(pgid="x")):
+            self._entry(**bad)
+            self.assertFalse(self.inst._owner_drained(),
+                             f"entry {bad} must fail closed")
 
 
 if __name__ == "__main__":

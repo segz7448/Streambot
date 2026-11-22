@@ -105,8 +105,9 @@ class FinalizeTests(unittest.TestCase):
         self.assertEqual(self._jobs(), [])
         # the edit child was registered into the session's writer registry
         reg = self.work / f"writers-{self.sid}.json"
-        items = json.loads(reg.read_text())
-        self.assertTrue(any("pid" in it for it in items))
+        doc = json.loads(reg.read_text())
+        self.assertEqual(doc.get("v"), 1)
+        self.assertTrue(any("pid" in it for it in doc["writers"]))
 
     def test_no_proof_leaves_clip_pending(self):
         cid = self._add_clip()

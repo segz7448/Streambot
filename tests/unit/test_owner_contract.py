@@ -162,6 +162,13 @@ class DurableTerminal(Base):
         c.commit(); c.close()
         import types
         s._session_id = sid
+        # the session initializes its durable writer manifest before any
+        # work; this hand-built session must do the same before its
+        # drained attestation can be valid
+        from app.bot import restartproof as _rp
+        work = self.sd / "sessions" / "streamerx"
+        work.mkdir(parents=True, exist_ok=True)
+        assert _rp.init_registry(work / f"writers-{sid}.json")
         s._worker = types.SimpleNamespace(terminal_kind="challenge", end_reason="failed",
                                           drained=lambda: True)
         s._owners_drained = True

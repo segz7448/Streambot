@@ -247,27 +247,33 @@ class ClipSession:
             return True              # no session registry could exist yet
         registry = (Path(self.state_dir) / "sessions" / self.source_label
                     / f"writers-{sid}.json")
+        # the manifest is initialized before any session work, so a
+        # missing file means a LOST manifest, not "no writers": block
         if not registry.exists():
-            return True              # no writers were ever registered
+            return False
         items = _rp._load_registry(registry)
         if items is None or not isinstance(items, list):
             return False             # unreadable registry: unknown writers
         for it in items:
             if not isinstance(it, dict) or "pid" not in it:
                 return False         # unresolved intent: writer may exist
-            dead, _why = _rp._pid_dead(it["pid"], it.get("start", -1),
-                                       "/proc")
+            # explicit complete schema: pid, start and pgid must all be
+            # valid positive identities; a missing or malformed field
+            # fails closed (a missing start must never look like reuse)
+            if not (_rp._valid_pos_int(it.get("pid"))
+                    and _rp._valid_pos_int(it.get("start"))
+                    and _rp._valid_pos_int(it.get("pgid"))):
+                return False
+            dead, _why = _rp._pid_dead(it["pid"], it["start"], "/proc")
             if not dead:
                 return False
-            pgid = it.get("pgid")
-            if isinstance(pgid, int):
-                try:
-                    os.killpg(pgid, 0)
-                    return False     # group still has members
-                except ProcessLookupError:
-                    pass             # group verifiably empty
-                except Exception:
-                    return False     # uncertainty is not death
+            try:
+                os.killpg(it["pgid"], 0)
+                return False         # group still has members
+            except ProcessLookupError:
+                pass                 # group verifiably empty
+            except Exception:
+                return False         # uncertainty is not death
         return True
 
     def _mark_drained(self) -> None:
@@ -367,6 +373,17 @@ class ClipSession:
         self._session_id = session_id
         conn.commit()
         conn.close()
+
+        # durable writer manifest BEFORE any session work: after this,
+        # a missing manifest means it was LOST, and lost blocks every
+        # drained attestation (fail closed) instead of passing as
+        # "no writers". Failure here fails the session before any
+        # writer exists.
+        from ..bot import restartproof as _rp
+        if not _rp.init_registry(work / f"writers-{session_id}.json"):
+            raise RuntimeError(
+                f"writer manifest for session {session_id} not "
+                "initializable; refusing to run unrecorded")
 
         buf = RollingBuffer(str(work), session_id=session_id,
                             segment_seconds=self.segment_seconds,

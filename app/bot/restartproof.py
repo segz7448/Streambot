@@ -117,6 +117,52 @@ def _persist(registry_path: Path, items: list) -> bool:
         return False
 
 
+_MANIFEST_VERSION = 1
+
+
+def _valid_pos_int(v) -> bool:
+    """A valid positive process identity integer (bools are not ints
+    here; zero/negative pids, starts and pgids are not identities)."""
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _read_manifest(registry_path: Path) -> tuple[str, list | None]:
+    """Strict manifest read. Returns ("missing"|"ok"|"invalid", writers).
+    Only a dict carrying the current version and a writers list is ok:
+    corrupt JSON, legacy (pre-version) layouts and any other shape are
+    "invalid" and must fail every consumer closed - never wiped, never
+    treated as empty."""
+    registry_path = Path(registry_path)
+    if not registry_path.exists():
+        return "missing", None
+    try:
+        doc = json.loads(registry_path.read_text())
+    except Exception:
+        return "invalid", None
+    if (isinstance(doc, dict) and doc.get("v") == _MANIFEST_VERSION
+            and isinstance(doc.get("writers"), list)):
+        return "ok", doc["writers"]
+    return "invalid", None
+
+
+def init_registry(registry_path: Path) -> bool:
+    """Create the session's durable writer manifest (empty, versioned)
+    BEFORE any session work. After this call, a MISSING manifest can
+    only mean it was lost, and a lost manifest must block every
+    attestation that depends on it - so callers treat False as fatal
+    for the session. Never wipes an existing manifest: an unreadable
+    or legacy one is evidence, not an initialization target."""
+    registry_path = Path(registry_path)
+    with _LOCK:
+        status, _ = _read_manifest(registry_path)
+        if status == "ok":
+            return True
+        if status == "invalid":
+            return False            # corrupt/legacy: fail closed
+        return _persist(registry_path,
+                        {"v": _MANIFEST_VERSION, "writers": []})
+
+
 def record_spawn_intent(registry_path: Path) -> str | None:
     """Durably persist an UNRESOLVED spawn intent BEFORE the child exists.
     Returns the intent token; None on any persistence failure, in which
@@ -128,14 +174,14 @@ def record_spawn_intent(registry_path: Path) -> str | None:
     token = f"{time.time_ns()}-{os.getpid()}"
     registry_path = Path(registry_path)
     with _LOCK:
-        try:
+        status, items = _read_manifest(registry_path)
+        if status == "missing":
             items = []
-            if registry_path.exists():
-                items = json.loads(registry_path.read_text())
-        except Exception:
-            return None             # unreadable registry: cannot record
+        elif status != "ok":
+            return None             # corrupt/legacy registry: cannot record
         items.append({"intent": token, "ts": time.time()})
-        return token if _persist(registry_path, items) else None
+        return token if _persist(
+            registry_path, {"v": _MANIFEST_VERSION, "writers": items})             else None
 
 
 def record_spawned(registry_path: Path, token: str, pid: int,
@@ -143,30 +189,37 @@ def record_spawned(registry_path: Path, token: str, pid: int,
     """Complete a spawn intent with the child's identity. False on ANY
     failure - the caller MUST terminate the spawned child and fail the
     spawn: an unidentifiable writer must never keep running."""
+    if not _valid_pos_int(pid):
+        return False                # no valid identity: cannot record
+    # pgid stays optional at bind time (a writer without a recorded
+    # group is legal); every death ATTESTATION requires a complete
+    # valid identity and fails closed without one
     start = read_start_time(pid, proc)
     if start is None:
         return False
     registry_path = Path(registry_path)
     with _LOCK:
-        try:
-            items = json.loads(registry_path.read_text())
-        except Exception:
-            return False
+        status, items = _read_manifest(registry_path)
+        if status != "ok":
+            return False            # missing/corrupt/legacy: cannot bind
         for it in items:
             if it.get("intent") == token and "pid" not in it:
                 it["pid"] = pid
                 it["start"] = start
                 if pgid:
                     it["pgid"] = pgid
-                return _persist(registry_path, items)
+                return _persist(
+                    registry_path,
+                    {"v": _MANIFEST_VERSION, "writers": items})
         return False                # intent lost: cannot bind the child
 
 
 def _load_registry(registry_path: Path):
-    try:
-        return json.loads(Path(registry_path).read_text())
-    except Exception:
-        return None
+    """Writers list for proof consumers; None unless the manifest is a
+    valid current-version document (missing, corrupt and legacy all
+    fail closed)."""
+    status, items = _read_manifest(registry_path)
+    return items if status == "ok" else None
 
 
 def _load_notes(state_dir: Path, session_id) -> dict | None:
@@ -244,7 +297,8 @@ def proof_for_session(state_dir: Path, username: str, session_id,
             # mid-spawn or lost completion - indistinguishable from a
             # live unrecorded writer, so it blocks proof forever
             return False, "unresolved spawn intent: a writer may be unrecorded"
-        if not isinstance(it.get("pid"), int) or not isinstance(it.get("start"), int):
+        if not (_valid_pos_int(it.get("pid"))
+                and _valid_pos_int(it.get("start"))):
             return False, "writer registry entry malformed"
         dead, why = _pid_dead(it["pid"], it["start"], proc)
         if not dead:
