@@ -53,7 +53,10 @@ class PlaybackWorker:
                  resolve_fn=None, capture_fn=None, opener=None, host_ok=None,
                  auth_poll_seconds: float = 2.0, sleep=asyncio.sleep,
                  on_recording=None, probe=None, ffprobe=None,
-                 mono=time.monotonic, pre_spawn=None, on_spawn=None):
+                 mono=time.monotonic, pre_spawn=None, on_spawn=None,
+                 acceptance_deadline=None, single_cycle=False):
+        self.acceptance_deadline = acceptance_deadline
+        self.single_cycle = single_cycle
         self.buffer, self.channel = buffer, channel
         self.db_path, self.state_dir, self.ffmpeg = db_path, state_dir, ffmpeg
         self.initial = initial_resolved
@@ -93,6 +96,8 @@ class PlaybackWorker:
     # -- authorization -------------------------------------------------
     def record_ok(self) -> bool:
         now = time.monotonic()
+        if self.acceptance_deadline is not None and now >= self.acceptance_deadline:
+            return False
         if now - self._auth_at >= self.auth_poll:
             # record scope AND a current GTA6 title match: both are
             # rechecked while running, so a title change ends the capture
@@ -146,7 +151,9 @@ class PlaybackWorker:
     def _cycle_inner(self, stop) -> str:
         """-> 'ended' | 'continue' | 'stopped' | 'revoked' | 'retry'.
         Raises RuntimeError on terminal refusals."""
-        stop_or_revoked = lambda: stop() or not self.record_ok()
+        expired = lambda: (self.acceptance_deadline is not None and
+                           time.monotonic() >= self.acceptance_deadline)
+        stop_or_revoked = lambda: expired() or stop() or not self.record_ok()
         if not self._recheck():
             return "revoked"
         if stop():
@@ -169,7 +176,9 @@ class PlaybackWorker:
         try:
             res = self.capture_fn(
                 resolved, self.ffmpeg, "", max_media_seconds=self.cycle_media,
-                deadline_sec=self.cycle_deadline, opener=self.opener,
+                deadline_sec=(min(self.cycle_deadline, max(0.001,
+                    self.acceptance_deadline - time.monotonic()))
+                    if self.acceptance_deadline is not None else self.cycle_deadline), opener=self.opener,
                 host_ok=self.host_ok, should_stop=stop_or_revoked,
                 output_args=self.buffer.segmenter_output_args(self.buffer.next_seq()),
                 pre_spawn=self.pre_spawn, on_spawn=self.on_spawn)
@@ -286,6 +295,11 @@ class PlaybackWorker:
                     # budgets are strictly cumulative for the life of the
                     # session: no reset is honest without measured new
                     # output media, and none is attempted here
+                    if self.single_cycle:
+                        if outcome == "retry":
+                            raise RuntimeError("single capture attempt failed; no retry")
+                        self.end_reason = "single_cycle_complete"
+                        return  # never reconnect/re-resolve in acceptance mode
                     if outcome in ("ended", "stopped", "revoked"):
                         self.end_reason = ("gate_closed" if outcome == "revoked"
                                            and self.stop_cause == "gate"

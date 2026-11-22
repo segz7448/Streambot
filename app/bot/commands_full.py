@@ -231,17 +231,19 @@ def quality_reply(state_dir: Path, args: str) -> str:
                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (arg,))
             p = PRESETS[arg]
+            # The planner reads Memory, not settings. Persist that preference
+            # before reporting success; otherwise this command only changes
+            # its own status display while edits keep using the old preset.
+            from ..intelligence.memory import Memory
+            Memory(str(state_dir / "memory.json")).remember(
+                "preference", "quality", arg, "owner via /quality",
+                confidence="stated")
             return (f"Quality preset set to {arg} "
                     f"({p.width}x{p.height}, crf {p.video_crf}, "
                     f"audio {p.audio_bitrate}).")
         row = conn.execute(
             "SELECT value FROM settings WHERE key='quality'").fetchone()
     current = row[0] if row else "vertical (default)"
-    if arg:
-        from ..intelligence.memory import Memory
-        Memory(str(state_dir / "memory.json")).remember(
-            "preference", "quality", arg, "owner via /quality",
-            confidence="stated")
     return (f"Current quality: {current}. Available: "
             + ", ".join(sorted(PRESETS)) + ". Usage: /quality <preset>")
 

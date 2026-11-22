@@ -30,7 +30,11 @@ class AutoClipper:
                  out_dir: str, min_score: float = 0.6,
                  pre_seconds: float = 20.0, post_seconds: float = 10.0,
                  merge_seconds: float = 5.0,
-                 extract_fn: Callable = extract_clip):
+                 extract_fn: Callable = extract_clip,
+                 max_session_clips: int | None = None):
+        if max_session_clips is not None and max_session_clips != 1:
+            raise ValueError("only opt-in single-clip bound is supported")
+        self.max_session_clips = max_session_clips
         self.buffer = buffer
         self.db_path = db_path
         self.provider = provider
@@ -125,6 +129,12 @@ class AutoClipper:
                         "UPDATE candidate_events SET status='REJECTED' WHERE id=?",
                         (event["id"],))
                     continue
+                if self.max_session_clips is not None:
+                    count = conn.execute(
+                        "SELECT count(*) FROM clips WHERE session_id=?",
+                        (self.buffer.session_id,)).fetchone()[0]
+                    if count >= self.max_session_clips:
+                        break   # no extra extraction, edit, or private send
                 # unique, never-reused raw path, RESERVED with
                 # O_CREAT|O_EXCL before the extractor child is spawned:
                 # this run exclusively owns the path it extracts into

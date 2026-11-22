@@ -34,10 +34,17 @@ class ClipSession:
                  segment_seconds: int = 5, tick_seconds: float = 3.0,
                  clip_pre_seconds: float = 20.0,
                  clip_post_seconds: float = 10.0,
-                 playback: dict | None = None):
+                 playback: dict | None = None,
+                 acceptance_deadline: float | None = None,
+                 max_session_clips: int | None = None):
         # playback: None for mode A feeds. For public playback: a dict with
         # optional initial_resolved and test/owned-fixture hooks
         # (resolve_fn, capture_fn, opener, host_ok, worker_kwargs).
+        if acceptance_deadline is not None and (playback is None or
+                max_session_clips != 1):
+            raise ValueError("bounded acceptance requires playback and max1")
+        self.acceptance_deadline = acceptance_deadline
+        self.max_session_clips = max_session_clips
         self.playback = playback
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
@@ -169,7 +176,8 @@ class ClipSession:
             ffprobe=self.ffprobe, auto_deliver=True,
             pre_spawn=getattr(self, "_pre_spawn", None),
             on_spawn=getattr(self, "_on_spawn_writer", None),
-            auth_on_conn=auth_on_conn)
+            auth_on_conn=auth_on_conn,
+            enqueue_admission=self.acceptance_deadline is None)
         self.clips_finished += len(held)
 
     async def _run(self) -> None:
@@ -426,7 +434,8 @@ class ClipSession:
                 initial_resolved=pb.pop("initial_resolved", None),
                 on_recording=self._mark_recording,
                 ffprobe=self.ffprobe, pre_spawn=_pre_spawn, on_spawn=_register,
-                **pb)
+                acceptance_deadline=self.acceptance_deadline,
+                single_cycle=self.acceptance_deadline is not None, **pb)
         else:
             worker = RecordingWorker(runner, buf, self.feed, db_path,
                                      sweep_seconds=max(1, self.segment_seconds))
@@ -440,6 +449,7 @@ class ClipSession:
                               self.ffmpeg, str(work),
                               pre_seconds=self.clip_pre_seconds,
                               post_seconds=self.clip_post_seconds,
+                              max_session_clips=self.max_session_clips,
                               extract_fn=functools.partial(
                                   _extract, pre_spawn=_pre_spawn,
                                   on_spawn=_register))
