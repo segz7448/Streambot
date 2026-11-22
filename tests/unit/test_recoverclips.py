@@ -151,6 +151,40 @@ class RecoveryTrackerTests(FinalizeTests):
         self.assertEqual(self._clip(cid2)[0], "PENDING")
         self.assertEqual(len(sent), 1)
 
+    def test_mid_edit_cancel_returns_clip_to_pending(self):
+        # a shutdown cancel landing DURING an edit is not a clip
+        # failure: the row goes back to PENDING, never FAILED
+        cid = self._add_clip()
+        for p in self._patches()[1:]:
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        tracker = sessions.RecoveryTracker()
+        def edit(ffmpeg, src, dst, preset, a, b, runtime,
+                 watermark=None, pre_spawn=None, on_spawn=None):
+            tracker.request_cancel()
+            raise OSError("killed mid-edit")
+        sent = []
+        with mock.patch("app.editing.editor.edit_clip", edit):
+            tracker.begin(self.dir, "ffmpeg", "ffprobe", sent.append)
+            tracker._thread.join(10)
+        self.assertFalse(tracker._thread.is_alive())
+        self.assertEqual(self._clip(cid)[0], "PENDING")
+
+    def test_boot_reconcile_records_interrupted_run_truthfully(self):
+        # a run cut off with the service gets a truthful outcome and a
+        # queued owner notice; nothing is replayed
+        run_id = sessions.recovery_run_start(self.dir)
+        self.assertIsNotNone(run_id)
+        n = sessions.reconcile_recovery_runs(self.dir)
+        self.assertEqual(n, 1)
+        from app.core import schedule as _sched
+        notices = _sched.pending_notices(self.dir)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("did not report its result", notices[0][1])
+        self.assertIn("Re-send /recoverclips", notices[0][1])
+        # idempotent: nothing left unfinished
+        self.assertEqual(sessions.reconcile_recovery_runs(self.dir), 0)
+
     def test_empty_state_still_reports(self):
         tracker = sessions.RecoveryTracker()
         sent = []

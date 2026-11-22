@@ -766,17 +766,24 @@ def _step_attempt(state_dir, ops: Ops, a, now) -> None:
 
 # ---- durable notice outbox (at-most-one in flight, repeats are labelled) --
 
+def notice_on_conn(c, text: str, schedule_id: int | None = None,
+                   now: float | None = None) -> int:
+    """Insert into the durable outbox on an EXISTING transaction cursor,
+    so a caller can commit its own state change and the owner notice in
+    ONE transaction. Delivery stays with the service's notice consumer
+    (claim/send/mark-sent/release-and-label-repeat); nothing is sent
+    here, so this is safe from any thread and offline."""
+    now = now if now is not None else time.time()
+    cur = c.execute("INSERT INTO schedule_notices (schedule_id,text,"
+                    "created_at) VALUES (?,?,?)",
+                    (schedule_id, text, now))
+    return cur.lastrowid
+
+
 def queue_notice(state_dir, text: str, schedule_id: int | None = None) -> int:
-    """Durable outbox insert for a non-schedule notice (e.g. a background
-    recovery result): delivered by the service's notice consumer with the
-    same claim/send/mark-sent/release-and-label-repeat reconciliation as
-    schedule notices. Never sends anything itself, so it is safe from any
-    thread and offline."""
+    """Standalone durable outbox insert (own transaction)."""
     with txn(state_dir) as c:
-        cur = c.execute("INSERT INTO schedule_notices (schedule_id,text,"
-                        "created_at) VALUES (?,?,?)",
-                        (schedule_id, text, time.time()))
-        return cur.lastrowid
+        return notice_on_conn(c, text, schedule_id)
 
 
 def claim_notice(state_dir, now: float | None = None):

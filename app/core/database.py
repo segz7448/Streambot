@@ -160,6 +160,18 @@ MIGRATIONS: list[tuple[int, str]] = [
     ALTER TABLE clips ADD COLUMN recovery_owner TEXT;
     ALTER TABLE clips ADD COLUMN claimed_at REAL;
     """),
+    (5, """
+    -- Tracked /recoverclips runs: durable accepted-run identity and
+    -- outcome, so a restart never loses a run the owner was told
+    -- about. The boot reconcile marks cut-off runs truthfully; it
+    -- never replays work.
+    CREATE TABLE recovery_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at REAL NOT NULL,
+        finished_at REAL,
+        outcome TEXT
+    );
+    """),
 ]
 
 JOB_STATES = (

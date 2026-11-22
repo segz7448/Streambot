@@ -853,6 +853,23 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             log.warning("claim lost for clip %s; left fenced", clip_id)
             continue
         except Exception as exc:
+            if per_clip_authorization is not None and \
+                    not per_clip_authorization():
+                # interrupted by an external stop (shutdown cancel)
+                # mid-edit: NOT a clip failure - the row goes back to
+                # PENDING for a later run, never marked FAILED. Only
+                # our own unpublished output is removed.
+                if edited is not None and not published:
+                    edited.unlink(missing_ok=True)
+                try:
+                    _release_claim(conn, clip_id, claim_token)
+                except Exception:
+                    log.warning("claim release after interruption "
+                                "failed for clip %s; left fenced",
+                                clip_id)
+                log.warning("finish interrupted for clip %s; returned "
+                            "to PENDING", clip_id)
+                break
             log.warning("finish failed for clip %s: %s", clip_id, exc)
             if edited is not None and not published:
                 # our own reserved per-attempt output that was NEVER
@@ -887,7 +904,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
 
 def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                                   should_continue=None,
-                                  writer_proof=None) -> int:
+                                  on_spawn=None) -> int:
     """Sealed-input recovery for sessions left INTERRUPTED: finish the
     clips whose raw input carries durable producer seal evidence so the
     work is not stranded invisible. Narrow and fail-closed on purpose:
@@ -977,6 +994,7 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                     input_resolver=snapshot_resolver,
                     auth_on_conn=auth_now,
                     per_clip_authorization=should_continue,
+                    on_spawn=on_spawn,
                     require_sealed=True)
             finally:
                 # snapshots are private working copies: removed on every

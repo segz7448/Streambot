@@ -238,16 +238,18 @@ class BotService:
                                                fp, notify=self._notify)
 
     def _notify(self, text: str) -> None:
-        # enqueue the background result into the durable notice outbox;
-        # the service's notice consumer delivers it to the paired admin
-        # with claim/send/mark-sent semantics (retried after failure and
-        # reconciled after a restart, never lost). Queueing only: safe
-        # from the worker thread and offline, never raises.
-        from ..core import schedule as _sched
+        # the durable notice is already queued atomically with the run
+        # outcome (sessions.recovery_run_finish); this only wakes the
+        # notice consumer for prompt delivery. Best-effort, safe from
+        # the worker thread, never raises.
+        loop = getattr(self, "_loop", None)
+        wake = getattr(self, "_notice_wake", None)
+        if loop is None or wake is None or loop.is_closed():
+            return
         try:
-            _sched.queue_notice(self._state_dir(), text)
+            loop.call_soon_threadsafe(wake.set)
         except Exception:
-            log.exception("recovery result notice could not be queued")
+            log.warning("notice consumer wake failed")
 
     def _stopclip(self) -> str:
         from . import sessions as sess
@@ -443,6 +445,12 @@ class BotService:
         # Real device media tools: the relocated termux prefix (or the
         # NOVA_FFPROBE override), never a bare PATH guess.
         _, ffprobe_path = _media.ffmpeg_paths()
+        self._loop = asyncio.get_running_loop()
+        self._notice_wake = asyncio.Event()
+        from . import sessions as _sess
+        # truthfully close out any recovery run cut off by the last
+        # stop and queue its notice; this NEVER replays recovery work
+        _sess.reconcile_recovery_runs(self._state_dir())
         self._handoff_task = asyncio.create_task(
             handoff.run_consumer(self._state_dir(),
                                  ffprobe=ffprobe_path))
@@ -543,11 +551,27 @@ class BotService:
                 raise
             except Exception:
                 log.exception("schedule tick failed")
-            await asyncio.sleep(30)
+            wake = getattr(self, "_notice_wake", None)
+            if wake is not None:
+                wake.clear()
+            if wake is None:
+                await asyncio.sleep(30)
+            else:
+                try:
+                    await asyncio.wait_for(wake.wait(), 30)
+                except asyncio.TimeoutError:
+                    pass
 
     async def _stop_handoff_consumer(self, _app) -> None:
         from . import sessions as _sess
-        _sess.recovery_tracker().request_cancel()
+        tracker = _sess.recovery_tracker()
+        tracker.request_cancel()
+        if not tracker.wait_done():
+            # never claim a clean stop we did not get: the worker is a
+            # daemon, its current child was asked to stop, and the boot
+            # reconcile will record the run as interrupted
+            log.error("recovery worker outlived the shutdown drain; "
+                      "boot reconcile will record the run truthfully")
         for name in ("_sched_task", "_pollwatch_task", "_handoff_task"):
             task = getattr(self, name, None)
             if task is not None:
