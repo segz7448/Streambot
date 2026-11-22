@@ -75,9 +75,13 @@ class TitleUnavailable(Exception):
     """Raised for every inconclusive answer. ``kind`` is a short typed
     label; the message never carries a URL, token or response text."""
 
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, retain: bool = False):
         super().__init__(kind)
         self.kind = kind
+        # True only for a local transport-level failure (no usable answer
+        # arrived). The gate may then keep judging the last good evidence
+        # by its ORIGINAL fetch time, so it still expires at the age limit.
+        self.retain = retain
 
 
 TERMINAL = ("blocked", "challenge", "restricted")
@@ -94,6 +98,7 @@ _own: set = set()                # fence names this process created
 _lock = threading.Lock()
 _cache: dict = {}        # login -> (Evidence, monotonic fetched)
 _backoff: dict = {}      # login -> monotonic deadline
+_backoff_retain: dict = {}   # login -> backoff came from a transport failure
 _locks: dict = {}        # login -> per-channel lock (serialises a burst)
 
 
@@ -219,6 +224,7 @@ def reset() -> None:
     with _lock:
         _cache.clear()
         _backoff.clear()
+        _backoff_retain.clear()
         _locks.clear()
         _own.clear()          # a fresh process owns no fences
 
@@ -276,7 +282,7 @@ def fetch(channel: str, *, opener=None, clock=time.time,
             until = _backoff.get(login, 0.0)
             hit = _cache.get(login)
         if t < until:
-            raise TitleUnavailable("backoff")
+            raise TitleUnavailable("backoff", _backoff_retain.get(login, False))
         if hit is not None and t - hit[1] < MIN_INTERVAL_S:
             with _lock:
                 if latched():
@@ -312,6 +318,7 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                         else ERROR_BACKOFF_S
                     with _lock:
                         _backoff[login] = mono() + wait
+                        _backoff_retain[login] = False
                     done = True
                 raise
             except tp.PlaybackRefused as exc:
@@ -320,13 +327,15 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                     raise TitleUnavailable(exc.kind) from None
                 with _lock:
                     _backoff[login] = mono() + ERROR_BACKOFF_S
+                    _backoff_retain[login] = True
                 done = True
-                raise TitleUnavailable("transport") from None
+                raise TitleUnavailable("transport", True) from None
             except Exception:
                 with _lock:
                     _backoff[login] = mono() + ERROR_BACKOFF_S
+                _backoff_retain[login] = True
                 done = True
-                raise TitleUnavailable("error") from None
+                raise TitleUnavailable("error", True) from None
             with _lock:
                 if latched():             # a refusal (any channel) won the race
                     done = True

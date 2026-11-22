@@ -36,6 +36,8 @@ FUTURE_SKEW_S = 5.0
 _lock = threading.Lock()      # guards only the two small dicts below
 _provider = None              # fn(username) -> Evidence
 _last: dict = {}              # username -> (Result, Evidence | None)
+_good: dict = {}              # username -> last evidence that PASSED (kept only
+                              # across transport-only failures, never past age)
 _gen = 0                      # bumped on every set_provider
 _seq = 0                      # check start order
 _pub: dict = {}               # username -> seq of the published outcome
@@ -78,6 +80,7 @@ def set_provider(fn) -> None:
         _gen += 1
         _last.clear()
         _pub.clear()
+        _good.clear()
 
 
 def _user(name) -> str:
@@ -133,8 +136,23 @@ def check(username: str, now=time.time) -> Result:
     else:
         try:
             ev = fn(u)
-        except Exception:  # noqa: BLE001 - any failure is a closed gate
+        except Exception as exc:  # noqa: BLE001 - any failure is a closed gate
             res, ev = Result(False, "unavailable"), None
+            if getattr(exc, "retain", False) is True:
+                # transport-only failure: no new answer arrived. Keep judging
+                # the last PASSING evidence by its original fetch time, so it
+                # still goes stale at MAX_TITLE_AGE_S. A newer negative answer
+                # (offline/mismatch/wrong channel) cleared it, so it never
+                # overrides one; terminal refusals never set this flag.
+                with _lock:
+                    kept = _good.get(u)
+                if kept is not None:
+                    try:
+                        held = _judge(u, kept, now())
+                    except Exception:  # noqa: BLE001
+                        held = Result(False, "invalid")
+                    if held.ok:
+                        res, ev = held, kept
         else:
             try:
                 res = _judge(u, ev, now())
@@ -148,6 +166,10 @@ def check(username: str, now=time.time) -> Result:
             return newer[0] if newer else Result(False, "unavailable")
         _last[u] = (res, ev)
         _pub[u] = seq
+        if res.ok and ev is not None:
+            _good[u] = ev
+        else:
+            _good.pop(u, None)      # any newer non-passing outcome wins
     return res
 
 

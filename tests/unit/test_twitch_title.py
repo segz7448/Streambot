@@ -403,6 +403,78 @@ class TitleProvider(unittest.TestCase):
             u, opener=Op((200, doc(login="impostor"))), clock=time.time, mono=self.m))
         self.assertEqual(cg.check("lacy").reason, "wrong_channel")
 
+class RetainTransportOnly(TitleProvider):
+    """A transport-only failure may reuse the last PASSING evidence by its
+    ORIGINAL fetch time. Nothing newer or stronger is ever overridden."""
+
+    def gate(self, op):
+        cg.set_provider(lambda u: tt.fetch(u, opener=op, clock=self.m,
+                                           mono=self.m))
+        return lambda: cg.check("lacy", now=self.m)
+
+    def test_transport_failure_keeps_fresh_pass_but_never_past_age(self):
+        op = Op((200, doc()), tp.PlaybackRefused("error", "deadline reached"),
+                tp.PlaybackRefused("error", "deadline reached"),
+                tp.PlaybackRefused("error", "deadline reached"))
+        check = self.gate(op)
+        self.assertTrue(check().ok)
+        self.m.t += 20
+        self.assertTrue(check().ok)               # transport blip, age 20
+        self.m.t += 5
+        self.assertTrue(check().ok)               # inside backoff, still age 25
+        self.assertEqual(len(op.calls), 2)
+        self.m.t += 40                            # age 65, backoff over
+        self.assertTrue(check().ok)
+        self.m.t += tt.ERROR_BACKOFF_S + 30       # age > MAX_TITLE_AGE_S
+        r = check()
+        self.assertFalse(r.ok, r.reason)
+
+    def test_transport_failure_without_prior_pass_is_closed(self):
+        op = Op(tp.PlaybackRefused("error", "x"))
+        self.assertEqual(self.gate(op)().reason, "unavailable")
+
+    def test_newer_negative_answer_is_never_overridden(self):
+        offline = (200, doc(stream=None))
+        op = Op((200, doc()), offline,
+                tp.PlaybackRefused("error", "x"))
+        check = self.gate(op)
+        self.assertTrue(check().ok)
+        self.m.t += 20
+        self.assertEqual(check().reason, "not_live")
+        self.m.t += 40
+        self.assertFalse(check().ok)              # transport after offline: closed
+
+    def test_non_transport_inconclusive_answers_are_not_retained(self):
+        for bad in ((500, b""), (200, b"junk"),
+                    (200, json.dumps({"errors": [{"message": "x"}]}).encode())):
+            tt.reset()
+            op = Op((200, doc()), bad)
+            check = self.gate(op)
+            self.assertTrue(check().ok)
+            self.m.t += 20
+            self.assertEqual(check().reason, "unavailable", str(bad))
+            self.m.t += 5                         # inside backoff: still closed
+            self.assertFalse(check().ok, str(bad))
+
+    def test_terminal_refusal_is_never_retained(self):
+        op = Op((200, doc()), (429, b""))
+        check = self.gate(op)
+        self.assertTrue(check().ok)
+        self.m.t += 20
+        self.assertFalse(check().ok)
+        self.assertEqual(tt.latched(), "blocked")
+        self.m.t += 1
+        self.assertFalse(check().ok)
+        self.assertEqual(len(op.calls), 2)
+
+    def test_provider_replacement_drops_kept_evidence(self):
+        op = Op((200, doc()), tp.PlaybackRefused("error", "x"))
+        check = self.gate(op)
+        self.assertTrue(check().ok)
+        check = self.gate(op)                     # set_provider again
+        self.m.t += 20
+        self.assertFalse(check().ok)
+
 
 if __name__ == "__main__":
     unittest.main()
