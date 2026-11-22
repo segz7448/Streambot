@@ -238,6 +238,103 @@ class TitleProvider(unittest.TestCase):
             self.fetch(op)
         self.assertEqual(c.exception.kind, "latched")
 
+    def fences(self):
+        d = tt.pending_dir()
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+    def test_fence_removed_after_every_committed_outcome(self):
+        for ans in ((200, doc()), (500, b""), (200, b"junk")):
+            tt.reset()
+            op = Op(ans)
+            try:
+                self.fetch(op)
+            except tt.TitleUnavailable:
+                pass
+            self.assertEqual(self.fences(), [], ans)
+
+    def test_terminal_commit_failure_then_fresh_process_makes_no_request(self):
+        real = tt._write
+
+        def flaky(path, d):
+            if path.endswith(tt.LATCH_FILE):
+                raise OSError("disk")             # only the latch write fails
+            return real(path, d)
+        tt._write = flaky
+        try:
+            op = Op((429, b""), (200, doc()))
+            with self.assertRaises(tt.TitleUnavailable):
+                self.fetch(op)                    # readiness (fence) ok, then 429
+        finally:
+            tt._write = real
+        self.assertFalse(os.path.exists(tt.latch_path()))
+        self.assertEqual(len(self.fences()), 1)   # fence kept: commit failed
+        self.restart()                            # fresh process
+        with self.assertRaises(tt.TitleUnavailable) as c:
+            self.fetch(op)
+        self.assertEqual(c.exception.kind, "latched")
+        self.assertEqual(len(op.calls), 1)        # no additional request
+
+    def test_crash_between_response_and_commit_stays_closed(self):
+        real_close, real_set = tt._fence_close, tt._set_latch
+
+        def die(*a, **k):
+            raise SystemExit("process killed")
+        tt._fence_close = lambda name: None       # a dead process cleans nothing
+        tt._set_latch = die
+        try:
+            op = Op((429, b""), (200, doc()))
+            with self.assertRaises(SystemExit):
+                self.fetch(op)
+        finally:
+            tt._fence_close, tt._set_latch = real_close, real_set
+        self.assertFalse(os.path.exists(tt.latch_path()))
+        self.restart()
+        with self.assertRaises(tt.TitleUnavailable) as c:
+            self.fetch(op)
+        self.assertEqual(c.exception.kind, "latched")
+        self.assertEqual(len(op.calls), 1)
+
+    def test_crash_during_success_commit_also_stays_closed(self):
+        real_close = tt._fence_close
+        tt._fence_close = lambda name: None
+        try:
+            op = Op((200, doc()), (200, doc()))
+            self.assertTrue(self.fetch(op).live)
+        finally:
+            tt._fence_close = real_close
+        self.restart()
+        with self.assertRaises(tt.TitleUnavailable) as c:
+            self.fetch(op)
+        self.assertEqual(c.exception.kind, "latched")
+        self.assertEqual(len(op.calls), 1)
+        self.assertTrue(tt.reset_latch(authorized=True))
+        self.assertEqual(self.fences(), [])
+        self.assertTrue(self.fetch(op).live)
+
+    def test_concurrent_requests_keep_separate_fences(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        out = {}
+
+        def slow(req, timeout, limit, deadline, should_stop):
+            started.set()
+            release.wait(5)
+            return 200, doc(login="slowchan")
+
+        th = threading.Thread(target=lambda: out.update(
+            ev=tt.fetch("slowchan", opener=slow, clock=lambda: 5000.0, mono=self.m)))
+        th.start()
+        self.assertTrue(started.wait(5))
+        self.assertEqual(len(self.fences()), 1)   # slow request's fence
+        mine = self.fences()[0]
+        self.assertTrue(self.fetch(Op((200, doc(login="fastchan"))), "fastchan").live)
+        self.assertEqual(self.fences(), [mine])   # the other fence untouched
+        self.assertIsNone(tt.latched())            # own fences are not "leftover"
+        release.set()
+        th.join(5)
+        self.assertTrue(out["ev"].live)
+        self.assertEqual(self.fences(), [])
+
     def test_only_explicit_authorized_reset_clears(self):
         op = Op((429, b""), (200, doc()))
         with self.assertRaises(tt.TitleUnavailable):

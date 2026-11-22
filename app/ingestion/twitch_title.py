@@ -27,9 +27,17 @@ Evidence rules (all fail closed, enforced again by content_gate):
     authorized ``reset_latch(authorized=True)`` (or deleting the latch file)
     clears it; nothing in the service calls that. Nothing is worked around.
     The latch has priority over every result: a fetch that finished after a
-    latch was set (for any channel) is discarded, and no request is made at
-    all unless the latch file location is writable right now, so a refusal
-    that could not be persisted can never be forgotten by a restart;
+    latch was set (for any channel) is discarded.
+    DURABLE FENCE: before every request a pending-request file is written
+    (and fsynced) under <state>/title_source_pending/. If that cannot be
+    written, NO request is made. The fence is removed only after the outcome
+    is committed (success cached, transient error recorded, or the terminal
+    latch file written). If the commit fails, or the process dies between the
+    response and the commit, the fence stays on disk and a restarted process
+    treats any leftover fence as a refusal (latched, closed) until an
+    explicit authorized reset. Each request has its own fence file, so
+    concurrent requests never clear each other's. The cost: a process killed
+    in the middle of one request closes the source until reset;
   * a redirect, a non-JSON body, a 5xx or a transport error is transient:
     bounded retry after ERROR_BACKOFF_S; a query the endpoint rejects for
     another reason after REJECT_BACKOFF_S;
@@ -46,6 +54,7 @@ import json
 import os
 import re
 import threading
+import uuid
 import time
 import urllib.request
 
@@ -77,8 +86,10 @@ _BLOCK_WORDS = ("unauthorized", "unauthenticated", "forbidden", "toomanyrequests
                 "too many requests", "rate limit", "ratelimit", "rate_limit",
                 "access denied", "not authorized")
 LATCH_FILE = "title_source_latch.json"
+PENDING_DIR = "title_source_pending"
 _latch_path_override = None      # tests
 _latched = None                  # in-memory copy of the kind, once set
+_own: set = set()                # fence names this process created
 
 _lock = threading.Lock()
 _cache: dict = {}        # login -> (Evidence, monotonic fetched)
@@ -106,10 +117,50 @@ def latched():
         kind = doc.get("kind") if isinstance(doc, dict) else None
         _latched = kind if kind in TERMINAL else "blocked"
     except FileNotFoundError:
+        if _leftover_fence():   # a fence this process did not create
+            _latched = "blocked"
+            return _latched
         return None
     except Exception:           # unreadable/corrupt latch file: stay closed
         _latched = "blocked"
     return _latched
+
+
+def pending_dir() -> str:
+    return os.path.join(os.path.dirname(latch_path()), PENDING_DIR)
+
+
+def _leftover_fence() -> bool:
+    """True if any pending-request fence exists that this process did not
+    create in this run (a crash, or a failed outcome commit)."""
+    try:
+        names = os.listdir(pending_dir())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True             # cannot tell: stay closed
+    return any(n not in _own and not n.endswith(".tmp") for n in names)
+
+
+def _fence_open() -> str:
+    name = uuid.uuid4().hex
+    _own.add(name)
+    try:
+        _write(os.path.join(pending_dir(), name), {"kind": "pending"})
+    except OSError:
+        _own.discard(name)
+        raise TitleUnavailable("no_state") from None   # no request is made
+    return name
+
+
+def _fence_close(name: str) -> None:
+    try:
+        os.remove(os.path.join(pending_dir(), name))
+        _own.discard(name)
+    except FileNotFoundError:
+        _own.discard(name)
+    except OSError:
+        pass                    # stays on disk: a restart will stay closed
 
 
 def _write(path: str, doc: dict) -> None:
@@ -118,31 +169,22 @@ def _write(path: str, doc: dict) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(doc, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
-def _set_latch(kind: str, now: float) -> None:
+def _set_latch(kind: str, now: float) -> bool:
     """Latch under the module lock so a concurrent publisher sees it. The
-    memory copy always holds; the file write is best effort here because
-    ``_durable_ready`` already proved the location writable before the
-    request was made."""
+    memory copy always holds. Returns True only if the latch file was
+    committed; on False the caller keeps its pending fence on disk so a
+    restart stays closed."""
     global _latched
     with _lock:
         _latched = kind if kind in TERMINAL else "blocked"
         kind = _latched
     try:
         _write(latch_path(), {"kind": kind, "at": int(now)})
-    except OSError:
-        pass
-
-
-def _durable_ready() -> bool:
-    """True only if the latch file location can be written right now (a
-    probe file is written and replaced). Called before every request: if a
-    refusal could not be recorded, no request is made."""
-    try:
-        path = os.path.join(os.path.dirname(latch_path()), "title_source_ready")
-        _write(path, {"ok": 1})
         return True
     except OSError:
         return False
@@ -161,6 +203,14 @@ def reset_latch(*, authorized: bool = False) -> bool:
         pass
     except OSError:
         return False
+    try:
+        for n in os.listdir(pending_dir()):
+            os.remove(os.path.join(pending_dir(), n))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    _own.clear()
     return True
 
 
@@ -170,6 +220,7 @@ def reset() -> None:
         _cache.clear()
         _backoff.clear()
         _locks.clear()
+        _own.clear()          # a fresh process owns no fences
 
 
 def _chan_lock(login: str):
@@ -231,8 +282,8 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                 if latched():
                     raise TitleUnavailable("latched")
             return hit[0]
-        if not _durable_ready():
-            raise TitleUnavailable("no_state")      # cannot persist a refusal
+        fence = _fence_open()                   # raises no_state: no request
+        keep = False                            # True: commit failed, keep fence
         body = json.dumps({
             "operationName": "StreamTitle", "query": _QUERY,
             "variables": {"login": login}}).encode()
@@ -241,43 +292,49 @@ def fetch(channel: str, *, opener=None, clock=time.time,
             "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
         op = opener or tp.default_opener
         try:
-            code, raw = tp.call_opener(op, req, timeout, 100_000,
-                                       mono() + max(timeout * 2, 1.0), None)
-            if code in (401, 403, 429):
-                raise TitleUnavailable("blocked")
-            if code != 200:
-                raise TitleUnavailable("http")
             try:
-                doc = json.loads(raw.decode("utf-8"))
-            except Exception:
-                raise TitleUnavailable("not_json") from None
-            ev = _parse(doc, login, clock())
-        except TitleUnavailable as exc:
-            if exc.kind in TERMINAL:
-                _set_latch(exc.kind, clock())
-            else:
-                wait = REJECT_BACKOFF_S if exc.kind == "rejected" \
-                    else ERROR_BACKOFF_S
+                code, raw = tp.call_opener(op, req, timeout, 100_000,
+                                           mono() + max(timeout * 2, 1.0), None)
+                if code in (401, 403, 429):
+                    raise TitleUnavailable("blocked")
+                if code != 200:
+                    raise TitleUnavailable("http")
+                try:
+                    doc = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    raise TitleUnavailable("not_json") from None
+                ev = _parse(doc, login, clock())
+            except TitleUnavailable as exc:
+                if exc.kind in TERMINAL:
+                    keep = not _set_latch(exc.kind, clock())
+                else:
+                    wait = REJECT_BACKOFF_S if exc.kind == "rejected" \
+                        else ERROR_BACKOFF_S
+                    with _lock:
+                        _backoff[login] = mono() + wait
+                raise
+            except tp.PlaybackRefused as exc:
+                if exc.kind in TERMINAL:
+                    keep = not _set_latch(exc.kind, clock())
+                    raise TitleUnavailable(exc.kind) from None
                 with _lock:
-                    _backoff[login] = mono() + wait
+                    _backoff[login] = mono() + ERROR_BACKOFF_S
+                raise TitleUnavailable("transport") from None
+            except Exception:
+                with _lock:
+                    _backoff[login] = mono() + ERROR_BACKOFF_S
+                raise TitleUnavailable("error") from None
+            with _lock:
+                if latched():             # a refusal (any channel) won the race
+                    raise TitleUnavailable("latched")
+                _cache[login] = (ev, mono())
+                _backoff.pop(login, None)
+            return ev
+        except BaseException:
             raise
-        except tp.PlaybackRefused as exc:
-            if exc.kind in TERMINAL:
-                _set_latch(exc.kind, clock())
-                raise TitleUnavailable(exc.kind) from None
-            with _lock:
-                _backoff[login] = mono() + ERROR_BACKOFF_S
-            raise TitleUnavailable("transport") from None
-        except Exception:
-            with _lock:
-                _backoff[login] = mono() + ERROR_BACKOFF_S
-            raise TitleUnavailable("error") from None
-        with _lock:
-            if latched():                 # a refusal (any channel) won the race
-                raise TitleUnavailable("latched")
-            _cache[login] = (ev, mono())
-            _backoff.pop(login, None)
-        return ev
+        finally:
+            if not keep:
+                _fence_close(fence)
 
 
 def provider(username: str) -> Evidence:
