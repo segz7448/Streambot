@@ -73,5 +73,21 @@ class SealTests(unittest.TestCase):
         self.assertNotEqual(snap, victim)
 
 
+    def test_bounded_snapshot_missing_source_leaves_no_reservation(self):
+        sha, size = seal.seal_file(self.raw)
+        self.raw.unlink()
+        snapdir = self.dir / "rec"
+        self.assertIsNone(seal.take_verified_snapshot_bounded(
+            self.raw, snapdir, sha, size))
+        self.assertEqual(list(snapdir.iterdir()), [])
+
+    def test_bounded_snapshot_size_mismatch_leaves_no_reservation(self):
+        sha, size = seal.seal_file(self.raw)
+        snapdir = self.dir / "rec"
+        self.assertIsNone(seal.take_verified_snapshot_bounded(
+            self.raw, snapdir, sha, size + 1))
+        self.assertEqual(list(snapdir.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

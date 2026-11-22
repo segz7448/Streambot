@@ -160,6 +160,10 @@ def take_verified_snapshot_bounded(src, snapshot_dir, expected_sha256: str,
             raise TimeoutError(f"snapshot {phase} finished after the "
                                "time cap; result rejected")
 
+    # the reservation is owned from creation: every non-success path
+    # (missing source, size mismatch, digest mismatch, late result,
+    # any error) removes it; only a fully verified snapshot survives
+    verified = False
     try:
         try:
             st = src.stat()
@@ -193,7 +197,10 @@ def take_verified_snapshot_bounded(src, snapshot_dir, expected_sha256: str,
         finally:
             os.close(dfd)
         late("directory fsync")
+        verified = True
         return snap
     except Exception:
-        snap.unlink(missing_ok=True)
         return None
+    finally:
+        if not verified:
+            snap.unlink(missing_ok=True)
