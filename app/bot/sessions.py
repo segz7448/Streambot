@@ -598,30 +598,38 @@ def recoverclips_reply(state_dir: Path, ffmpeg: str, ffprobe: str, *,
 
 
 def _recovery_outcome_text(state_dir: Path, held: int,
-                           eligible: dict) -> str:
-    """Structured per-run outcome for the EXACT clips that were
-    unfinished when this run started - derived from their actual row
-    states afterwards, never from global counts."""
+                           eligible: dict, outcomes=None) -> str:
+    """Structured per-run outcome: exact per-clip terminal results the
+    run itself reported (including clips that became eligible after the
+    pre-read), merged with post-run row states for pre-read clips it
+    did not touch; never global counts."""
     from ..core.database import connect
     state_dir = Path(state_dir)
+    worked = dict(outcomes or [])
+    rest = {i: s for i, s in eligible.items() if i not in worked}
     after: dict = {}
-    if eligible:
+    if rest:
         conn = connect(str(state_dir / "nova.db"))
         try:
             after = {r[0]: r[1] for r in conn.execute(
                 "SELECT id, status FROM clips WHERE id IN ("
-                + ",".join(str(int(i)) for i in eligible)
+                + ",".join(str(int(i)) for i in rest)
                 + ")").fetchall()}
         finally:
             conn.close()
-    recovered = sum(1 for i in eligible if after.get(i) == "HELD")
-    failed = sum(1 for i in eligible
-                 if after.get(i) in ("FAILED", "QC_FAILED"))
-    fenced = sum(1 for i in eligible
+    recovered = sum(1 for oc in worked.values() if oc == "HELD")
+    failed = sum(1 for oc in worked.values()
+                 if oc in ("FAILED", "QC_FAILED"))
+    interrupted = sum(1 for oc in worked.values()
+                      if oc == "interrupted")
+    recovered += sum(1 for i in rest if after.get(i) == "HELD")
+    failed += sum(1 for i in rest
+                  if after.get(i) in ("FAILED", "QC_FAILED"))
+    fenced = sum(1 for i in rest
                  if after.get(i) in ("PENDING", "RECOVERING"))
-    if recovered != held:
-        # HELD via a non-standard path (e.g. idempotent re-claim):
-        # report the helper's own count, never a derived guess
+    if recovered == 0 and held:
+        # HELD via a path without outcome detail (e.g. idempotent
+        # re-claim): report the helper's own count, never a guess
         recovered = held
     lines = []
     if recovered:
@@ -634,6 +642,11 @@ def _recovery_outcome_text(state_dir: Path, held: int,
             f"{failed} clip(s) could not be finished (edit or quality "
             "check failed) - now marked failed; future runs do not "
             "retry them.")
+    if interrupted:
+        lines.append(
+            f"{interrupted} clip(s) were stopped mid-recovery by "
+            "shutdown and left pending; re-send /recoverclips to "
+            "continue.")
     if fenced:
         lines.append(
             f"{fenced} clip(s) remain fenced (legacy/unsealed input, "
@@ -694,13 +707,24 @@ def recovery_run_finish(state_dir, run_id, outcome: str,
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                nid = None
                 if run_id is not None:
                     conn.execute(
                         "UPDATE recovery_runs SET finished_at=?,"
                         " outcome=? WHERE id=?",
                         (time.time(), outcome, run_id))
-                if queue:
-                    notice_on_conn(conn, outcome)
+                    row = conn.execute(
+                        "SELECT notice_id FROM recovery_runs"
+                        " WHERE id=?", (run_id,)).fetchone()
+                    nid = row[0] if row else None
+                # idempotent under retries: one completion notice per
+                # run, no matter how often finish is retried
+                if queue and nid is None:
+                    nid = notice_on_conn(conn, outcome)
+                    if run_id is not None:
+                        conn.execute(
+                            "UPDATE recovery_runs SET notice_id=?"
+                            " WHERE id=?", (nid, run_id))
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
@@ -740,7 +764,10 @@ def reconcile_recovery_runs(state_dir) -> int:
                         "UPDATE recovery_runs SET finished_at=?,"
                         " outcome=? WHERE id=?",
                         (time.time(), text, r[0]))
-                    notice_on_conn(conn, text)
+                    nid = notice_on_conn(conn, text)
+                    conn.execute(
+                        "UPDATE recovery_runs SET notice_id=?"
+                        " WHERE id=?", (nid, r[0]))
                 except BaseException:
                     conn.execute("ROLLBACK")
                     raise
@@ -772,6 +799,8 @@ class RecoveryTracker:
         self._cancel = threading.Event()
         self._child_lock = threading.Lock()
         self._child_pgid = None
+        self._child_birth = None
+        self._ffmpeg = None
 
     def begin(self, state_dir, ffmpeg, ffprobe, notify) -> str:
         with self._lock:
@@ -787,6 +816,18 @@ class RecoveryTracker:
         # durable accepted-run record BEFORE the owner is told the run
         # started (the ack reply clears the inbox entry after this)
         run_id = recovery_run_start(state_dir)
+        if run_id is None:
+            # fail CLOSED: without durable acceptance no work starts and
+            # no "started" ack is given; _thread stays joinable
+            with self._lock:
+                self._running_since = None
+            self._thread = threading.Thread(target=lambda: None,
+                                            daemon=True,
+                                            name="recoverclips")
+            self._thread.start()
+            return ("Recovery could not be recorded durably, so "
+                    "nothing was started (fail-closed). Please try "
+                    "again; if this persists, see /logs.")
         self._thread = threading.Thread(
             target=self._run, args=(Path(state_dir), ffmpeg, ffprobe,
                                     notify, run_id),
@@ -831,10 +872,22 @@ class RecoveryTracker:
         return not t.is_alive()
 
     def _on_spawn(self, pid, pgid, token):
-        # record the current edit child's process group so a shutdown
-        # cancel can tear it down; identity is re-verified at kill time
+        # cancel fence FIRST: a child bound after cancellation is
+        # refused; edit_clip then tears down THAT exact child itself
+        # (an unbindable writer never keeps running)
+        if self._cancel.is_set():
+            return False
+        # record birth identity (kernel start time) so a later kill can
+        # distinguish this child from a reused process-group number
+        birth = None
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                birth = fh.read().rsplit(b")", 1)[1].split()[19]
+        except Exception:
+            birth = None
         with self._child_lock:
             self._child_pgid = pgid
+            self._child_birth = birth
         return True
 
     def _kill_recorded_child(self) -> None:
@@ -847,16 +900,31 @@ class RecoveryTracker:
         from ..editing.editor import _group_alive
         with self._child_lock:
             pgid = self._child_pgid
+            birth = self._child_birth
         if pgid is None:
             return
+        # birth identity: the group leader must be the SAME process
+        # recorded at spawn (kernel start time), not a reused number
         try:
-            with open(f"/proc/{pgid}/cmdline", "rb") as fh:
-                cmd = fh.read()
+            with open(f"/proc/{pgid}/stat", "rb") as fh:
+                now = fh.read().rsplit(b")", 1)[1].split()[19]
+        except Exception:
+            return                        # gone or unverifiable
+        if birth is None or now != birth:
+            _log.warning("recorded recovery child pgid %s failed birth "
+                         "identity; not signalling", pgid)
+            return
+        # and its real executable must be the ffmpeg binary we spawned -
+        # never an unrelated process with ffmpeg in its arguments
+        import os as _os
+        try:
+            exe = _os.readlink(f"/proc/{pgid}/exe")
         except OSError:
-            return                        # already gone
-        if b"ffmpeg" not in cmd:
-            _log.warning("recorded recovery child pgid %s is not an "
-                         "ffmpeg leader; not signalling", pgid)
+            return
+        if _os.path.basename(exe) != _os.path.basename(
+                self._ffmpeg or "ffmpeg"):
+            _log.warning("recorded recovery child pgid %s is %s, not "
+                         "the spawned ffmpeg; not signalling", pgid, exe)
             return
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
@@ -910,21 +978,34 @@ class RecoveryTracker:
                 eligible = _interrupted_unfinished(conn)
             finally:
                 conn.close()
+        self._ffmpeg = ffmpeg
+        outcomes: list = []
+
+        def _on_outcome(cid, oc, _acc=outcomes):
+            _acc.append((cid, oc))
+            # the clip's edit child is done: never keep a stale pgid
+            with self._child_lock:
+                self._child_pgid = None
+                self._child_birth = None
+
         self._started.set()
-        # positional: cooperative cancel between units + current-child
-        # registration for verified teardown at shutdown; the callee
-        # defaults keep older signatures working
+        # positional: cooperative cancel between units, current-child
+        # registration for verified teardown, exact per-clip outcomes;
+        # the callee defaults keep older signatures working
         held = finalize_interrupted_sessions(
             state_dir, ffmpeg, ffprobe,
             lambda: not self._cancel.is_set(),
-            self._on_spawn)
+            self._on_spawn,
+            _on_outcome)
         # "nothing to do" only when the run ACTUALLY did nothing: clips
         # that became eligible after the pre-read above are processed
-        # and must be reported, never hidden behind the stale snapshot
-        if held == 0 and not eligible:
+        # and their exact outcomes (including failures) are reported,
+        # never hidden behind the stale snapshot
+        if held == 0 and not outcomes and not eligible:
             return ("Recovery: nothing to do - no interrupted sessions "
                     "with unfinished clips.")
-        return _recovery_outcome_text(state_dir, held, eligible)
+        return _recovery_outcome_text(state_dir, held, eligible,
+                                      outcomes)
 
     def status(self) -> str:
         with self._lock:

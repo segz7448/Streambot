@@ -169,7 +169,8 @@ MIGRATIONS: list[tuple[int, str]] = [
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         started_at REAL NOT NULL,
         finished_at REAL,
-        outcome TEXT
+        outcome TEXT,
+        notice_id INTEGER
     );
     """),
 ]

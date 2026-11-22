@@ -663,7 +663,8 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                          output_name=None,
                          input_resolver=None,
                          auth_on_conn=None,
-                         require_sealed: bool = False) -> list:
+                         require_sealed: bool = False,
+                         outcome_cb=None) -> list:
     """Edit + QC every PENDING clip row of one session: plan, edit,
     ffprobe-measured final duration, atomic HELD + metadata + admission
     outbox per clip. Per-clip isolated and idempotent: only PENDING rows
@@ -684,6 +685,16 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
         claim_token = f"live-{session_id}-{uuid.uuid4().hex[:8]}"
     from ..clipping import seal as _seal
     mem = Memory(str(state_dir / "memory.json"))
+
+    def _outcome(clip_id, outcome):
+        # exact per-clip terminal outcomes for the caller's run report;
+        # reporting must never break finishing
+        if outcome_cb is None:
+            return
+        try:
+            outcome_cb(clip_id, outcome)
+        except Exception:
+            log.warning("outcome callback failed for clip %s", clip_id)
     # require_sealed fences legacy/unsealed rows: recovery only ever
     # touches input carrying durable producer completion evidence
     rows = conn.execute(
@@ -819,6 +830,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                 # unpublished pre-commit failures (handled above).
                 finished += 1
                 held_ids.append(clip_id)
+                _outcome(clip_id, "HELD")
                 try:
                     mem.remember(
                         "clip", f"session:{session_id}:{clip_id}",
@@ -838,6 +850,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                     (json.dumps({"qc_passed": False}),
                      clip_id, claim_token))
                 conn.commit()
+                _outcome(clip_id, "QC_FAILED")
         except _AuthorizationRevoked:
             conn.rollback()
             edited.unlink(missing_ok=True)   # our own unique output only
@@ -869,6 +882,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                                 clip_id)
                 log.warning("finish interrupted for clip %s; returned "
                             "to PENDING", clip_id)
+                _outcome(clip_id, "interrupted")
                 break
             log.warning("finish failed for clip %s: %s", clip_id, exc)
             if edited is not None and not published:
@@ -882,6 +896,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                 " claimed_at=NULL WHERE id=? AND recovery_owner=?",
                 (clip_id, claim_token))
             conn.commit()
+            _outcome(clip_id, "FAILED")
     conn.commit()
     if held_ids and auto_deliver:
         # automatic delivery ergonomics: when the owner preference
@@ -904,7 +919,8 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
 
 def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                                   should_continue=None,
-                                  on_spawn=None) -> int:
+                                  on_spawn=None,
+                                  outcome_cb=None) -> int:
     """Sealed-input recovery for sessions left INTERRUPTED: finish the
     clips whose raw input carries durable producer seal evidence so the
     work is not stranded invisible. Narrow and fail-closed on purpose:
@@ -995,6 +1011,7 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                     auth_on_conn=auth_now,
                     per_clip_authorization=should_continue,
                     on_spawn=on_spawn,
+                    outcome_cb=outcome_cb,
                     require_sealed=True)
             finally:
                 # snapshots are private working copies: removed on every

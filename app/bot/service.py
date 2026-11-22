@@ -562,16 +562,27 @@ class BotService:
                 except asyncio.TimeoutError:
                     pass
 
+    @staticmethod
+    def _cancel_and_drain(tracker) -> None:
+        # ownership is retained until the worker ACTUALLY exits: a
+        # drain timeout only means we keep cancelling and keep waiting,
+        # never that we return with live recovery work behind us
+        tracker.request_cancel()
+        warned = False
+        while not tracker.wait_done():
+            if not warned:
+                log.error("recovery worker outlived the first shutdown "
+                          "drain; still waiting - shutdown is not done "
+                          "while recovery work is alive")
+                warned = True
+            tracker.request_cancel()
+
     async def _stop_handoff_consumer(self, _app) -> None:
         from . import sessions as _sess
         tracker = _sess.recovery_tracker()
-        tracker.request_cancel()
-        if not tracker.wait_done():
-            # never claim a clean stop we did not get: the worker is a
-            # daemon, its current child was asked to stop, and the boot
-            # reconcile will record the run as interrupted
-            log.error("recovery worker outlived the shutdown drain; "
-                      "boot reconcile will record the run truthfully")
+        # cancel + drain OFF the event loop: bounded kills and joins
+        # must never starve other commands or the rest of shutdown
+        await asyncio.to_thread(self._cancel_and_drain, tracker)
         for name in ("_sched_task", "_pollwatch_task", "_handoff_task"):
             task = getattr(self, name, None)
             if task is not None:
