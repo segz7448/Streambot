@@ -48,13 +48,18 @@ def _tok_src() -> str:
 class BotService:
     def __init__(self, token: str, store: PairingStore,
                  watermark: UpdateWatermark | None = None):
+        from .pollwatch import PollWatch, PollWatchedBot
         self.store = store
         self.watermark = watermark or UpdateWatermark(
             str(store.path.parent / "updates.json"))
         self.inbox = PreAckInbox(str(store.path.parent / "inbox.json"))
         self.router = CommandRouter(admin_ids=[])
         self.started_at = time.time()
-        self.app = Application.builder().token(token) \
+        # polling-liveness record: positive proof past "Application started"
+        # that getUpdates succeeds, without logging any content
+        self.poll_watch = PollWatch()
+        self.app = Application.builder() \
+            .bot(PollWatchedBot(self.poll_watch, token=token)) \
             .post_init(self._start_handoff_consumer) \
             .post_shutdown(self._stop_handoff_consumer).build()
         self.app.add_handler(CommandHandler("pair", self._pair))
@@ -232,9 +237,22 @@ class BotService:
         uptime = int(time.time() - self.started_at)
         handled, failed = self.watermark.snapshot()
         admin = "paired" if self.store.admin_id() is not None else "unpaired"
+        poll = self.poll_watch.snapshot()
+        if poll["last_ok_at"] is None:
+            polling = ("polling: NO successful getUpdates yet "
+                       f"({poll['error_count']} error(s)"
+                       + (f", last {poll['last_error_kind']}"
+                          if poll["last_error_kind"] else "") + ")")
+        else:
+            polling = (f"polling: last getUpdates ok "
+                       f"{int(poll['last_ok_age'])}s ago "
+                       f"({poll['ok_count']} ok, {poll['error_count']} error(s), "
+                       f"{poll['updates_received']} update(s) in, "
+                       f"{poll['outbound_sent']} message(s) out)")
         return (f"NOVA Clip Engine status\n"
                 f"bot: running ({uptime}s uptime, {admin})\n"
                 f"updates handled: {handled}, failed pending: {len(failed)}\n"
+                f"{polling}\n"
                 f"token source: {_tok_src()}\n"
                 f"pipeline: capture idle - no Twitch source authorized yet")
 
@@ -403,6 +421,26 @@ class BotService:
             handoff.run_consumer(self._state_dir(),
                                  ffprobe=ffprobe_path))
         self._sched_task = asyncio.create_task(self._schedule_loop())
+        self._pollwatch_task = asyncio.create_task(self._pollwatch_loop())
+
+    async def _pollwatch_loop(self, interval: float = 300.0) -> None:
+        """Periodic content-free heartbeat: positive proof in the logs that
+        getUpdates still succeeds (or that it has stopped). Counts and ages
+        only; never tokens, URLs, payloads, chat ids or message text."""
+        while True:
+            await asyncio.sleep(interval)
+            poll = self.poll_watch.snapshot()
+            handled, _failed = self.watermark.snapshot()
+            if poll["last_ok_at"] is None:
+                log.warning("telegram polling NOT yet proven: no successful "
+                            "getUpdates since start (errors=%d last=%s)",
+                            poll["error_count"], poll["last_error_kind"])
+            else:
+                log.info("telegram polling alive: last getUpdates ok %.0fs "
+                         "ago (ok=%d err=%d updates=%d outbound=%d handled=%d)",
+                         poll["last_ok_age"], poll["ok_count"],
+                         poll["error_count"], poll["updates_received"],
+                         poll["outbound_sent"], handled)
 
     @staticmethod
     async def _blocking(fn, *args):
@@ -478,20 +516,14 @@ class BotService:
             await asyncio.sleep(30)
 
     async def _stop_handoff_consumer(self, _app) -> None:
-        st = getattr(self, "_sched_task", None)
-        if st is not None:
-            st.cancel()
-            try:
-                await st
-            except asyncio.CancelledError:
-                pass
-        task = getattr(self, "_handoff_task", None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for name in ("_sched_task", "_pollwatch_task", "_handoff_task"):
+            task = getattr(self, name, None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     def drain_inbox(self, reply=None) -> dict:
         from . import ops
