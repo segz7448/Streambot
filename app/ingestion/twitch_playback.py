@@ -121,9 +121,11 @@ def default_opener(req: urllib.request.Request, timeout: float,
 
     The whole request (DNS, connect, TLS, headers, body, HTTPError body) runs
     in _fetch_child.py in its own process group. The parent polls with an
-    absolute monotonic ``deadline`` and ``should_stop`` and kills the group
-    when either fires, so neither getaddrinfo nor a trickling body can
-    outlive them (bounded by the poll interval, ~0.1s, plus kill/reap).
+    absolute monotonic ``deadline``, an inactivity cap of ``timeout`` seconds
+    without a received byte, and ``should_stop``, and kills the group when
+    any fires, so neither getaddrinfo nor a stalled body can outlive them
+    (bounded by the poll interval, ~0.1s, plus kill/reap). A transfer that
+    keeps receiving bytes may run until ``deadline``.
     Overflow past ``limit`` raises instead of truncating. Redirects refused
     in the child. The URL goes to the child on stdin, never in argv."""
     import base64, json, os, select, signal, struct, subprocess, sys
@@ -141,7 +143,15 @@ def default_opener(req: urllib.request.Request, timeout: float,
             start_new_session=True)
     except OSError:
         raise PlaybackRefused("error", "cannot start fetch worker", transport="spawn") from None
-    t_hard = time.monotonic() + max(0.5, timeout)   # whole-request cap
+    # `timeout` is an INACTIVITY cap, not a whole-request cap: the request
+    # dies after `timeout` seconds without a single byte (anti-stall
+    # unchanged - a hung server still dies at the cap), while a transfer
+    # that keeps making progress may run until the absolute `deadline`.
+    # Measured need: live segment GETs were killed at exactly the 15s
+    # whole-request cap (session 7, via=deadline, zero media); a slow but
+    # healthy download must be able to finish within the capture window.
+    idle_cap = max(0.5, timeout)
+    last_progress = time.monotonic()
     buf = bytearray()
     why = None
     try:
@@ -151,7 +161,7 @@ def default_opener(req: urllib.request.Request, timeout: float,
                 "data": (base64.b64encode(req.data).decode()
                          if req.data else None),
                 "headers": dict(req.header_items()),
-                "limit": limit, "timeout": max(0.2, min(timeout, left()))}).encode())
+                "limit": limit, "timeout": max(0.2, min(timeout + 10.0, left()))}).encode())
             proc.stdin.close()
         except OSError:
             pass
@@ -159,7 +169,7 @@ def default_opener(req: urllib.request.Request, timeout: float,
         while True:
             if should_stop is not None and should_stop():
                 why = "cancelled"; break
-            if left() <= 0 or time.monotonic() >= t_hard:
+            if left() <= 0 or time.monotonic() - last_progress >= idle_cap:
                 why = "deadline reached"; break
             r, _, _ = select.select([fd], [], [], 0.1)
             if r:
@@ -167,6 +177,7 @@ def default_opener(req: urllib.request.Request, timeout: float,
                 if not b:
                     break
                 buf.extend(b)
+                last_progress = time.monotonic()
                 if len(buf) > 4 + limit + 4096 and len(buf) > 4 + limit:
                     why = "response too large"; break
         if why is None:
