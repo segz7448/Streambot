@@ -83,6 +83,11 @@ class TitleUnavailable(Exception):
         # by its ORIGINAL fetch time, so it still expires at the age limit.
         self.retain = retain
 
+    def can_retain(self) -> bool:
+        """Evaluated by the gate at decision time: a global refusal latch
+        always wins over retention, however it was set meanwhile."""
+        return self.retain is True and latched() is None
+
 
 TERMINAL = ("blocked", "challenge", "restricted")
 _CHALLENGE_WORDS = ("integrity", "challenge", "captcha", "kasada")

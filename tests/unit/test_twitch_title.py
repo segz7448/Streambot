@@ -479,6 +479,38 @@ class RetainTransportOnly(TitleProvider):
             self.m.t += 5                         # backoff keeps it closed
             self.assertFalse(check().ok, repr(bad))
 
+    def test_global_latch_set_while_refresh_hangs_wins_over_retention(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        state = {"slow_calls": 0}
+
+        def op(req, timeout, limit, deadline, should_stop):
+            login = json.loads(req.data.decode())["variables"]["login"]
+            if login == "fastchan":
+                return (429, b"")
+            state["slow_calls"] += 1
+            if state["slow_calls"] == 1:
+                return (200, doc(login="slowchan"))
+            started.set()
+            release.wait(5)
+            raise tp.PlaybackRefused("error", "deadline reached")
+        cg.set_provider(lambda u: tt.fetch(u, opener=op, clock=self.m,
+                                           mono=self.m))
+        self.assertTrue(cg.check("slowchan", now=self.m).ok)
+        self.m.t += 20
+        out = {}
+        th = threading.Thread(target=lambda: out.setdefault(
+            "r", cg.check("slowchan", now=self.m)))
+        th.start()
+        self.assertTrue(started.wait(5))
+        self.assertFalse(cg.check("fastchan", now=self.m).ok)   # 429 -> latch
+        self.assertEqual(tt.latched(), "blocked")
+        release.set()
+        th.join(5)
+        self.assertFalse(out["r"].ok, out["r"].reason)          # latch wins
+        self.m.t += 1
+        self.assertFalse(cg.check("slowchan", now=self.m).ok)
+
     def test_provider_replacement_drops_kept_evidence(self):
         op = Op((200, doc()), tp.PlaybackRefused("error", "x"))
         check = self.gate(op)

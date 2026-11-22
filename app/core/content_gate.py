@@ -138,7 +138,8 @@ def check(username: str, now=time.time) -> Result:
             ev = fn(u)
         except Exception as exc:  # noqa: BLE001 - any failure is a closed gate
             res, ev = Result(False, "unavailable"), None
-            if getattr(exc, "retain", False) is True:
+            can = getattr(exc, "can_retain", None)
+            if callable(can) and can() is True:
                 # transport-only failure: no new answer arrived. Keep judging
                 # the last PASSING evidence by its original fetch time, so it
                 # still goes stale at MAX_TITLE_AGE_S. A newer negative answer
