@@ -15,7 +15,11 @@ Policy (all fail closed, no bypass attempts):
   quality / invalid: TERMINAL (RuntimeError naming only the kind). A
   restriction is never retried through a different route.
 - transient 'error' and ffmpeg exits: bounded reconnects with backoff and
-  a cumulative-gap limit, like RecordingWorker.
+  a cumulative-gap limit, like RecordingWorker. A cycle that ran healthy
+  for at least healthy_reset_seconds re-arms both budgets (RecordingWorker
+  has always done this); cycle boundaries re-resolve as soon as the
+  resolver's own rate window allows instead of idling a fixed interval
+  with no capture.
 """
 from __future__ import annotations
 
@@ -40,10 +44,12 @@ class PlaybackWorker:
                  cycle_deadline_seconds: float = 1800.0,
                  max_reconnects: int = 5, reconnect_base_seconds: float = 5.0,
                  max_gap_seconds: float = 300.0,
+                 healthy_reset_seconds: float = 300.0,
                  resolve_interval: float = tp.MIN_INTERVAL_SEC,
                  resolve_fn=None, capture_fn=None, opener=None, host_ok=None,
                  auth_poll_seconds: float = 2.0, sleep=asyncio.sleep,
-                 on_recording=None, probe=None, ffprobe=None):
+                 on_recording=None, probe=None, ffprobe=None,
+                 mono=time.monotonic):
         self.buffer, self.channel = buffer, channel
         self.db_path, self.state_dir, self.ffmpeg = db_path, state_dir, ffmpeg
         self.initial = initial_resolved
@@ -53,7 +59,10 @@ class PlaybackWorker:
         self.max_reconnects = max_reconnects
         self.reconnect_base = reconnect_base_seconds
         self.max_gap = max_gap_seconds
+        self.healthy_reset = healthy_reset_seconds
         self.resolve_interval = resolve_interval
+        self._mono = mono
+        self._last_resolve_mono = mono()
         self.resolve_fn = resolve_fn or tp.resolve
         self.capture_fn = capture_fn or hls_pump.capture
         self.opener, self.host_ok = opener, host_ok
@@ -142,6 +151,7 @@ class PlaybackWorker:
             if self.initial is not None:
                 resolved, self.initial = self.initial, None
             else:
+                self._last_resolve_mono = self._mono()
                 resolved = self.resolve_fn(
                     self.channel, authorized=True, max_height=self.max_height,
                     opener=self.opener, host_ok=self.host_ok,
@@ -258,6 +268,8 @@ class PlaybackWorker:
                 stop = lambda: ctx.stopping or self._stop_req
                 while not stop():
                     ctx.heartbeat()
+                    segs_before = self.captured_segments
+                    cycle_started = self._mono()
                     task = asyncio.create_task(asyncio.to_thread(self._cycle, stop))
                     while not task.done():
                         ctx.heartbeat()
@@ -268,14 +280,32 @@ class PlaybackWorker:
                         await asyncio.wait({task}, timeout=1.0)
                     outcome = task.result()   # RuntimeError/OSError propagate
                     task = None
+                    # a cycle that produced valid media and ran healthy for
+                    # a while is evidence of stability: re-arm the budgets
+                    # (the cap guards a stream dropping NOW, not total
+                    # drops over a long scheduled window)
+                    if (self.captured_segments > segs_before and
+                            self._mono() - cycle_started
+                            >= self.healthy_reset):
+                        self.reconnects = 0
+                        self.gap_seconds = 0.0
                     if outcome in ("ended", "stopped", "revoked"):
                         self.end_reason = ("gate_closed" if outcome == "revoked"
                                            and self.stop_cause == "gate"
                                            else outcome)
                         return
                     if outcome == "continue":
-                        self.gap_seconds += self.resolve_interval
-                        await self._wait(ctx, self.resolve_interval)
+                        # re-resolve as soon as the resolver's own rate
+                        # window allows (it was last used one full cycle
+                        # ago); a fixed full-interval idle here would just
+                        # be lost footage at every cycle boundary. The
+                        # small margin keeps wall/monotonic drift from
+                        # tripping the resolver's too-soon refusal.
+                        wait = max(0.5, self.resolve_interval
+                                   - (self._mono()
+                                      - self._last_resolve_mono) + 0.5)
+                        self.gap_seconds += wait
+                        await self._wait(ctx, wait)
                         continue
                     self.reconnects += 1
                     if self.reconnects > self.max_reconnects:

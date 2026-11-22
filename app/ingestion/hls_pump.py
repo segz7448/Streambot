@@ -221,7 +221,12 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
             if clock() >= t_end:
                 reason = "deadline"; break
             if proc.poll() is not None:
-                reason = "ffmpeg_exit"; break
+                # ffmpeg exiting cleanly exactly at its -t output cap while
+                # the pump has already fed the capped amount of media is
+                # the cap boundary, not a crash
+                reason = ("media_cap" if media >= max_media_seconds
+                          else "ffmpeg_exit")
+                break
             try:
                 text = _fetch(base, op, host_ok, timeout, PLAYLIST_MAX_BYTES,
                               dl, should_stop).decode("utf-8", "replace")
@@ -251,7 +256,13 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
                     reason = "stopped" if should_stop() else "deadline"
                     break
                 except (BrokenPipeError, OSError):
-                    reason = "ffmpeg_exit"; break
+                    # same boundary: ffmpeg stops reading once the output
+                    # reaches -t, which can fall inside the LAST segment
+                    # (its EXTINF count lands after the write succeeds), so
+                    # the final write can hit a closed pipe at the cap
+                    reason = ("media_cap" if media + dur >= max_media_seconds
+                              else "ffmpeg_exit")
+                    break
                 nbytes += len(blob); segs_n += 1; media += dur
                 next_seq = seq + 1
             if reason in ("ffmpeg_exit", "deadline", "stopped"):
