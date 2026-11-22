@@ -77,6 +77,7 @@ class ProofTests(_Base):
 
     def _registered_writer(self, reg, pid=5150, pgid=5150, start=7):
         p0 = _fake_proc({pid: (start, pgid)})
+        self.assertTrue(restartproof.init_registry(reg))
         tok = restartproof.record_spawn_intent(reg)
         self.assertIsNotNone(tok)
         self.assertTrue(restartproof.record_spawned(reg, tok, pid, pgid,
@@ -200,6 +201,7 @@ class ProofTests(_Base):
         # indistinguishable from a live unrecorded writer
         sid = self._session_with_leader()
         reg = self.work / f"writers-{sid}.json"
+        self.assertTrue(restartproof.init_registry(reg))
         tok = restartproof.record_spawn_intent(reg)
         self.assertIsNotNone(tok)
         ok, why = restartproof.writer_death_proof(
@@ -214,6 +216,7 @@ class ProofTests(_Base):
         # fence closed anyway
         sid = self._session_with_leader()
         reg = self.work / f"writers-{sid}.json"
+        self.assertTrue(restartproof.init_registry(reg))
         tok = restartproof.record_spawn_intent(reg)
         self.assertFalse(restartproof.record_spawned(reg, tok, 5150, 5150,
                                                      proc="/nonexistent"))

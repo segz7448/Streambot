@@ -433,9 +433,19 @@ class OwnerDrainedFailClosedTests(unittest.TestCase):
 
     def test_unresolved_intent_blocks_drained(self):
         from app.bot import restartproof as rp
+        self.assertTrue(rp.init_registry(self.registry))
         token = rp.record_spawn_intent(self.registry)
         self.assertIsNotNone(token)
         self.assertFalse(self.inst._owner_drained())
+
+    def test_missing_manifest_blocks_intent_creation(self):
+        # lost history must never be silently recreated: only explicit
+        # before-work initialization may create the manifest
+        from app.bot import restartproof as rp
+        self.assertIsNone(rp.record_spawn_intent(self.registry))
+        self.assertFalse(self.registry.exists())
+        self.assertTrue(rp.init_registry(self.registry))
+        self.assertIsNotNone(rp.record_spawn_intent(self.registry))
 
     def _entry(self, **over):
         import json as _json

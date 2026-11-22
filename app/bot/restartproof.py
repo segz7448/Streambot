@@ -167,7 +167,9 @@ def record_spawn_intent(registry_path: Path) -> str | None:
     """Durably persist an UNRESOLVED spawn intent BEFORE the child exists.
     Returns the intent token; None on any persistence failure, in which
     case the caller MUST NOT spawn: a writer that cannot be recorded may
-    never run. An intent left unresolved blocks proof forever (a crash
+    never run. Requires an initialized manifest (init_registry at
+    session setup); a missing manifest blocks rather than recreating
+    lost history. An intent left unresolved blocks proof forever (a crash
     between intent and completion is indistinguishable from a live
     unrecorded writer, and fails closed)."""
     import time
@@ -175,10 +177,12 @@ def record_spawn_intent(registry_path: Path) -> str | None:
     registry_path = Path(registry_path)
     with _LOCK:
         status, items = _read_manifest(registry_path)
-        if status == "missing":
-            items = []
-        elif status != "ok":
-            return None             # corrupt/legacy registry: cannot record
+        if status != "ok":
+            # a MISSING manifest is lost history, not a fresh start:
+            # recreating it here would let a new spawn bind while an
+            # earlier registered writer still runs unrecorded. Only
+            # explicit before-work initialization may create it.
+            return None
         items.append({"intent": token, "ts": time.time()})
         return token if _persist(
             registry_path, {"v": _MANIFEST_VERSION, "writers": items})             else None

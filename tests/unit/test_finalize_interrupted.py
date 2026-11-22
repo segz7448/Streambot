@@ -36,6 +36,11 @@ class FinalizeTests(unittest.TestCase):
         # raw media for the PENDING clip
         self.work = self.dir / "sessions" / "someuser"
         self.work.mkdir(parents=True)
+        # sessions that recovery may touch own a durable writer manifest
+        # (initialized before session work, exactly as _run_inner does);
+        # the real proof gate requires it to exist
+        from app.bot import restartproof as _rp
+        assert _rp.init_registry(self.work / f"writers-{self.sid}.json")
         (self.dir / "runtime").mkdir()
         self.raw = self.work / "raw-1.ts"
         self.raw.write_bytes(b"\x47" * 4096)
