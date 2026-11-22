@@ -189,15 +189,54 @@ class TitleProvider(unittest.TestCase):
         self.assertEqual(c.exception.kind, "latched")
         self.assertEqual(op.calls, [])
 
-    def test_unwritable_state_dir_still_latches_in_memory(self):
+    def test_unwritable_state_dir_blocks_every_request_across_starts(self):
         tt._latch_path_override = "/proc/definitely/not/writable/latch.json"
-        op = Op((429, b""), (200, doc()))
+        op = Op((429, b""), (200, doc()), (200, doc()))
+        for _ in range(3):                           # three fresh "starts"
+            tt._latched = None
+            tt.reset()
+            with self.assertRaises(tt.TitleUnavailable) as c:
+                self.fetch(op)
+            self.assertEqual(c.exception.kind, "no_state")
+        self.assertEqual(op.calls, [])               # no request ever issued
+        cg.set_provider(lambda u: tt.fetch(u, opener=op, mono=self.m))
+        self.assertEqual(cg.check("lacy").reason, "unavailable")
+        self.assertEqual(op.calls, [])
+
+    def test_refusal_wins_over_inflight_success_on_other_channel(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        out = {}
+
+        def slow(req, timeout, limit, deadline, should_stop):
+            started.set()
+            release.wait(5)
+            return 200, doc(login="otherchan", title="GTA 6")
+
+        def run():
+            try:
+                out["ev"] = tt.fetch("otherchan", opener=slow, clock=lambda: 5000.0,
+                                     mono=self.m)
+            except tt.TitleUnavailable as exc:
+                out["err"] = exc.kind
+        th = threading.Thread(target=run)
+        th.start()
+        self.assertTrue(started.wait(5))
         with self.assertRaises(tt.TitleUnavailable):
-            self.fetch(op)
+            tt.fetch("lacy", opener=Op((429, b"")), mono=self.m)
+        release.set()
+        th.join(5)
+        self.assertEqual(out, {"err": "latched"})    # positive never escapes
+        with self.assertRaises(tt.TitleUnavailable):  # nor from the cache
+            tt.fetch("otherchan", opener=Op(), mono=self.m)
+
+    def test_cached_positive_not_returned_after_latch(self):
+        op = Op((200, doc()))
+        self.assertTrue(self.fetch(op).live)
+        tt._set_latch("blocked", 1.0)
         with self.assertRaises(tt.TitleUnavailable) as c:
             self.fetch(op)
         self.assertEqual(c.exception.kind, "latched")
-        self.assertEqual(len(op.calls), 1)
 
     def test_only_explicit_authorized_reset_clears(self):
         op = Op((429, b""), (200, doc()))

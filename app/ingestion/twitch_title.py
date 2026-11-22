@@ -25,7 +25,11 @@ Evidence rules (all fail closed, enforced again by content_gate):
     time only), so an ordinary process restart does not clear it, and NO
     request is made again, ever, by any timer or scheduler. Only an explicit,
     authorized ``reset_latch(authorized=True)`` (or deleting the latch file)
-    clears it; nothing in the service calls that. Nothing is worked around;
+    clears it; nothing in the service calls that. Nothing is worked around.
+    The latch has priority over every result: a fetch that finished after a
+    latch was set (for any channel) is discarded, and no request is made at
+    all unless the latch file location is writable right now, so a refusal
+    that could not be persisted can never be forgotten by a restart;
   * a redirect, a non-JSON body, a 5xx or a transport error is transient:
     bounded retry after ERROR_BACKOFF_S; a query the endpoint rejects for
     another reason after REJECT_BACKOFF_S;
@@ -108,19 +112,40 @@ def latched():
     return _latched
 
 
+def _write(path: str, doc: dict) -> None:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    os.replace(tmp, path)
+
+
 def _set_latch(kind: str, now: float) -> None:
+    """Latch under the module lock so a concurrent publisher sees it. The
+    memory copy always holds; the file write is best effort here because
+    ``_durable_ready`` already proved the location writable before the
+    request was made."""
     global _latched
-    _latched = kind if kind in TERMINAL else "blocked"
-    path = latch_path()
+    with _lock:
+        _latched = kind if kind in TERMINAL else "blocked"
+        kind = _latched
     try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"kind": _latched, "at": int(now)}, fh)
-        os.replace(tmp, path)
+        _write(latch_path(), {"kind": kind, "at": int(now)})
     except OSError:
-        pass                    # the in-memory latch still holds
+        pass
+
+
+def _durable_ready() -> bool:
+    """True only if the latch file location can be written right now (a
+    probe file is written and replaced). Called before every request: if a
+    refusal could not be recorded, no request is made."""
+    try:
+        path = os.path.join(os.path.dirname(latch_path()), "title_source_ready")
+        _write(path, {"ok": 1})
+        return True
+    except OSError:
+        return False
 
 
 def reset_latch(*, authorized: bool = False) -> bool:
@@ -202,7 +227,12 @@ def fetch(channel: str, *, opener=None, clock=time.time,
         if t < until:
             raise TitleUnavailable("backoff")
         if hit is not None and t - hit[1] < MIN_INTERVAL_S:
+            with _lock:
+                if latched():
+                    raise TitleUnavailable("latched")
             return hit[0]
+        if not _durable_ready():
+            raise TitleUnavailable("no_state")      # cannot persist a refusal
         body = json.dumps({
             "operationName": "StreamTitle", "query": _QUERY,
             "variables": {"login": login}}).encode()
@@ -243,6 +273,8 @@ def fetch(channel: str, *, opener=None, clock=time.time,
                 _backoff[login] = mono() + ERROR_BACKOFF_S
             raise TitleUnavailable("error") from None
         with _lock:
+            if latched():                 # a refusal (any channel) won the race
+                raise TitleUnavailable("latched")
             _cache[login] = (ev, mono())
             _backoff.pop(login, None)
         return ev
