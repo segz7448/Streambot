@@ -169,6 +169,47 @@ class RunningRecheck(unittest.TestCase):
         self.assertEqual(s.terminal_kind, "qualification")
 
 
+class Ordering(unittest.TestCase):
+    def tearDown(self):
+        cg.set_provider(None)
+
+    def test_provider_revoked_in_flight_returns_closed_and_publishes_nothing(self):
+        import threading
+        gate, entered = threading.Event(), threading.Event()
+
+        def slow(u):
+            entered.set(); gate.wait(5)
+            return cg.Evidence(u, "GTA 6", time.time(), True)
+        cg.set_provider(slow)
+        out = []
+        t = threading.Thread(target=lambda: out.append(cg.check("a")), daemon=True)
+        t.start(); self.assertTrue(entered.wait(2))
+        cg.set_provider(None)                       # revoked during the fetch
+        gate.set(); t.join(5)
+        self.assertFalse(out[0].ok)
+        self.assertFalse(cg.check_cached("a").ok)   # nothing positive published
+
+    def test_older_positive_never_overwrites_newer_negative(self):
+        import threading
+        gate, entered = threading.Event(), threading.Event()
+        calls = []
+
+        def prov(u):
+            calls.append(1)
+            if len(calls) == 1:                     # the OLD check: slow, positive
+                entered.set(); gate.wait(5)
+                return cg.Evidence(u, "GTA 6", time.time(), True)
+            return cg.Evidence(u, "just chatting", time.time(), True)  # NEWER: negative
+        cg.set_provider(prov)
+        out = []
+        t = threading.Thread(target=lambda: out.append(cg.check("a")), daemon=True)
+        t.start(); self.assertTrue(entered.wait(2))
+        self.assertFalse(cg.check("a").ok)          # newer negative publishes first
+        gate.set(); t.join(5)
+        self.assertFalse(out[0].ok)                 # old positive loses
+        self.assertFalse(cg.check_cached("a").ok)
+
+
 class WorkerReason(unittest.TestCase):
     def test_playback_gate_closure_is_qualification_and_revocation_unauthorized(self):
         import types
@@ -213,6 +254,53 @@ class LockAndScheduler(unittest.TestCase):
         stalled = w.is_alive()
         gate.set(); starter.join(5); ss._sessions.clear()
         self.assertFalse(stalled, "stop/session controls stalled behind the provider")
+
+    def _blocked_start(self, which):
+        import sqlite3
+        import threading
+        from app.bot import source_auth
+        from app.core.database import migrate
+        sd = Path(tempfile.mkdtemp())
+        c = sqlite3.connect(str(sd / "nova.db")); migrate(c)
+        c.execute("INSERT INTO twitch_sources(username, created_at, updated_at) VALUES ('streamerx', 1.0, 1.0)")
+        c.commit(); c.close()
+        (sd / "feeds").mkdir()
+        (sd / "feeds" / "streamerx.url").write_text("https://relay.example/x.m3u8")
+        source_auth.set_scope(sd, "streamerx", "record", True)
+        gate, entered = threading.Event(), threading.Event()
+
+        def slow(u):
+            entered.set(); gate.wait(5)
+            return cg.Evidence(u, "GTA 6", time.time(), True)   # a MATCH
+        cg.set_provider(slow)
+        ss._sessions.clear()
+        factory, resolved, out = mock.Mock(), [], []
+
+        def resolve(*a, **k):
+            resolved.append(1); return object()
+        if which == "clip":
+            fn = lambda: out.append(ss.startclip_reply(
+                sd, "streamerx", "ff", "fp", session_factory=factory))
+        else:
+            fn = lambda: out.append(ss.startplayback_reply(
+                sd, "streamerx", "ff", "fp", resolve_fn=resolve))
+        with mock.patch.object(ss, "validate_feed", lambda f, d: f):
+            t = threading.Thread(target=fn, daemon=True); t.start()
+            self.assertTrue(entered.wait(2))
+            stop = ss.stopclip_reply(sd)               # during the blocked check
+            self.assertIn("Stopping 1", stop)          # it owns a cancel handle
+            gate.set(); t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertIn("stopped before launch", out[0])
+        factory.assert_not_called()
+        self.assertEqual(resolved, [])
+        self.assertEqual(ss._sessions, {})             # reservation released
+
+    def test_stop_during_blocked_title_check_prevents_launch_playback(self):
+        self._blocked_start("playback")
+
+    def test_stop_during_blocked_title_check_prevents_launch_feed(self):
+        self._blocked_start("clip")
 
     def test_start_scheduled_maps_gate_refusal_to_qualification(self):
         import sqlite3

@@ -294,9 +294,36 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
                 f"feeds/{username}.mp4. Nothing is recording. "
                 "Continuous capture of arbitrary Twitch channels is "
                 "not available without one (architecture boundary).")
+    res = None
     if _is_live_feed(feed_spec):
+        # own the username (and /stopclip's cancel handle) BEFORE the
+        # blocking title check; the provider itself runs outside the lock
+        res = _Reservation()
+        res._sched_token = getattr(_tl, "attempt", None)
+        with _lock:
+            existing = _sessions.get(username)
+            if existing is not None and (not existing._stopping.is_set()
+                                         or existing.alive()):
+                return f"A session for {username} is already running."
+            _sessions[username] = res
+    try:
+        return _startclip_owned(state_dir, username, ffmpeg, ffprobe,
+                                session_factory, feed_spec, res)
+    finally:
+        if res is not None:
+            with _lock:
+                if _sessions.get(username) is res:
+                    del _sessions[username]
+
+
+def _startclip_owned(state_dir, username, ffmpeg, ffprobe, session_factory,
+                     feed_spec, res):
+    if res is not None:
         refused = _gate_refusal(username)   # live capture: GTA6 title gate,
-        if refused is not None:             # before any feed validation
+        if res._stopping.is_set():          # before any feed validation
+            return ("Not started: stopped before launch. Nothing is "
+                    "recording.")
+        if refused is not None:
             return refused
     try:
         feed = validate_feed(feed_spec, state_dir / "feeds")
@@ -313,8 +340,11 @@ def startclip_reply(state_dir: Path, username: str, ffmpeg: str,
             return (f"Refused: local feed failed validation ({exc}). "
                     "Session NOT started.")
     with _lock:
+        if res is not None and res._stopping.is_set():
+            return ("Not started: stopped before launch. Nothing is "
+                    "recording.")
         existing = _sessions.get(username)
-        if existing is not None:
+        if existing is not None and existing is not res:
             if not existing._stopping.is_set():
                 return f"A session for {username} is already running."
             if existing.alive():
@@ -437,9 +467,6 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
         return (f"Recording is not authorized for {username} (default OFF). "
                 f"Nothing started. Only with the streamer's permission: "
                 f"/sourceauth {username} record on")
-    refused = _gate_refusal(username)       # before any network or media
-    if refused is not None:
-        return refused
     res = _Reservation()
     res._sched_token = getattr(_tl, "attempt", None)
     with _lock:
@@ -456,6 +483,15 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
             if _sessions.get(username) is res:
                 del _sessions[username]
     try:
+        # blocking title check AFTER the reservation (so /stopclip can
+        # cancel it) and outside the registry lock
+        refused = _gate_refusal(username)
+        if res._stopping.is_set():
+            release()
+            return "Not started: stopped before launch. Nothing is recording."
+        if refused is not None:
+            release()
+            return refused
         resolved = (resolve_fn or tp.resolve)(
             username, authorized=True,
             should_stop=lambda: res._stopping.is_set() or not

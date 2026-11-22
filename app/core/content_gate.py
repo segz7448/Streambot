@@ -35,6 +35,9 @@ FUTURE_SKEW_S = 5.0
 _lock = threading.Lock()      # guards only the two small dicts below
 _provider = None              # fn(username) -> Evidence
 _last: dict = {}              # username -> (Result, Evidence | None)
+_gen = 0                      # bumped on every set_provider
+_seq = 0                      # check start order
+_pub: dict = {}               # username -> seq of the published outcome
 
 
 @dataclass(frozen=True)
@@ -68,10 +71,12 @@ def describe(reason: str) -> str:
 
 
 def set_provider(fn) -> None:
-    global _provider
+    global _provider, _gen
     with _lock:
         _provider = fn
+        _gen += 1
         _last.clear()
+        _pub.clear()
 
 
 def _user(name) -> str:
@@ -110,10 +115,18 @@ def _judge(username: str, ev, now: float) -> Result:
 
 
 def check(username: str, now=time.time) -> Result:
-    """Ask the provider (blocking; never call under a registry lock)."""
+    """Ask the provider (blocking; never call under a registry lock).
+
+    A result is only valid for the provider generation it started under, and
+    an older in-flight check never overwrites or outranks a newer one: if the
+    provider was replaced or revoked meanwhile the answer is closed, and if a
+    newer check has already published, that newer outcome is returned."""
+    global _seq
     u = _user(username)
     with _lock:
-        fn = _provider
+        fn, gen = _provider, _gen
+        _seq += 1
+        seq = _seq
     if fn is None:
         res, ev = Result(False, "no_source"), None
     else:
@@ -127,8 +140,13 @@ def check(username: str, now=time.time) -> Result:
             except Exception:  # noqa: BLE001
                 res = Result(False, "invalid")
     with _lock:
-        if _provider is fn:
-            _last[u] = (res, ev)
+        if gen != _gen:
+            return Result(False, "unavailable")   # provider changed in flight
+        if _pub.get(u, 0) > seq:
+            newer = _last.get(u)                  # a newer check already won
+            return newer[0] if newer else Result(False, "unavailable")
+        _last[u] = (res, ev)
+        _pub[u] = seq
     return res
 
 
