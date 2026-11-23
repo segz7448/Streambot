@@ -33,7 +33,7 @@ from tempfile import TemporaryDirectory
 REPO = Path(__file__).resolve().parents[2]
 
 VICTIM = r'''
-import asyncio, hashlib, os, sys, time
+import asyncio, hashlib, json, os, sys, time
 from pathlib import Path
 sys.path.insert(0, {repo!r})
 state_dir = Path(sys.argv[1]); mode = sys.argv[2]
@@ -73,25 +73,35 @@ def resolved():
     return tp.Resolved("chan", v, (v,), time.time())
 
 db_path = str(state_dir/"nova.db")
+from app.bot import restartproof as rp
 conn = connect(db_path); migrate(conn)
 conn.execute("INSERT INTO twitch_sources (username, created_at, updated_at)"
              " VALUES ('chan', 0, 0)")
+# mirror the real service session setup (Session._run): leader birth
+# recorded in notes BEFORE any session work, durable writer manifest
+# initialized BEFORE any writer exists
+notes = rp.record_leader({})
 cur = conn.execute("INSERT INTO stream_sessions (source_id, state,"
                    " started_at, ingest_mode, notes) VALUES (1,'RECORDING',"
-                   " ?, 'playback', '{}')", (time.time(),))
+                   " ?, 'playback', ?)", (time.time(), json.dumps(notes)))
 sid = cur.lastrowid; conn.commit(); conn.close()
 source_auth.set_scope(state_dir, "chan", "record", True)
 cg.set_provider(lambda u: cg.Evidence(u, "GTA 6 live", time.time(), True))
 
 work = state_dir/"sessions"/"chan"; work.mkdir(parents=True, exist_ok=True)
 (state_dir/"runtime").mkdir(exist_ok=True)
+manifest = work/f"writers-{sid}.json"
+assert rp.init_registry(manifest)
+def _pre_spawn(): return rp.record_spawn_intent(manifest)
+def _on_spawn(pid, pgid, token): return rp.record_spawned(manifest, token, pid, pgid)
 buf = RollingBuffer(str(work), session_id=sid, segment_seconds=2,
                     pre_event_seconds=2, post_event_seconds=2,
                     max_storage_mb=64)
 worker = PlaybackWorker(buf, "chan", db_path, state_dir, "ffmpeg",
                         resolve_fn=lambda channel, **k: resolved(),
                         opener=opener, host_ok=lambda h: True,
-                        auth_poll_seconds=0.0, ffprobe="ffprobe")
+                        auth_poll_seconds=0.0, ffprobe="ffprobe",
+                        pre_spawn=_pre_spawn, on_spawn=_on_spawn)
 
 class Ctx:
     stopping = False
@@ -103,10 +113,15 @@ print("CAPTURE_DONE", worker.end_reason, "segments", len(buf.segments()),
 
 from app.detection.detector import CandidateDetector
 from app.clipping.auto import AutoClipper
+from app.clipping.extractor import extract_clip as _extract
 from app.intelligence.providers import HeuristicProvider
+import functools
 CandidateDetector("ffmpeg", buf, db_path).process_new_segments(True)
 made = AutoClipper(buf, db_path, HeuristicProvider(), "ffmpeg", str(work),
-                   pre_seconds=2, post_seconds=2).process_pending()
+                   pre_seconds=2, post_seconds=2,
+                   extract_fn=functools.partial(
+                       _extract, pre_spawn=_pre_spawn,
+                       on_spawn=_on_spawn)).process_pending()
 conn = connect(db_path)
 row = conn.execute("SELECT id, file_path, sealed_sha256 FROM clips"
                    " WHERE session_id=? AND status='PENDING'",
@@ -128,7 +143,7 @@ if mode == "kill_in_edit":
                          source_label="chan", out_dir=work/"edited",
                          runtime_dir=state_dir/"runtime", ffmpeg="ffmpeg",
                          ffprobe="ffprobe", auto_deliver=False,
-                         on_spawn=suicide)
+                         pre_spawn=_pre_spawn, on_spawn=suicide)
     print("FINISH_RETURNED_UNEXPECTEDLY", flush=True)
 else:
     print("IDLE", flush=True)

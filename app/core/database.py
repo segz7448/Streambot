@@ -173,6 +173,26 @@ MIGRATIONS: list[tuple[int, str]] = [
         notice_id INTEGER
     );
     """),
+    (6, """
+    -- Process-bound clip claims: every RECOVERING claim is bound to the
+    -- claiming process's verifiable birth evidence (pid + /proc start
+    -- tick + process group), recorded atomically with the claim itself.
+    -- One claim token names a whole run and may own many clips, so the
+    -- claim identity is (clip_id, token). A later recovery run may
+    -- reclaim a claim only on POSITIVE proof the exact owner process
+    -- and every registered writer are dead; an unprovable claim stays
+    -- fenced forever.
+    CREATE TABLE clip_claims (
+        clip_id INTEGER NOT NULL,
+        token TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        start INTEGER NOT NULL,
+        pgid INTEGER NOT NULL,
+        claimed_at REAL NOT NULL,
+        finished_at REAL,
+        PRIMARY KEY (clip_id, token)
+    );
+    """),
 ]
 
 JOB_STATES = (

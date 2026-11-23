@@ -11,6 +11,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from ..bot.restartproof import claim_owner_dead, read_start_time
 from ..subtitles.fonts import ensure_fontconfig_env
 from .presets import OutputPreset
 
@@ -142,6 +143,54 @@ def _kill_group(proc) -> None:
             pass
 
 
+class SpawnRefused(RuntimeError):
+    """The edit child was REFUSED, not failed, and NO live writer can
+    remain: either the durable spawn intent could not be recorded (no
+    child was ever spawned) or the spawned child's death - and its
+    whole group's - was positively confirmed after the bind failure.
+    Only then is the caller's retry-safe classification sound: the
+    reserved output may be removed and the claim released."""
+
+
+class SpawnUncertain(RuntimeError):
+    """A writer WAS spawned but could not be bound, and its death could
+    not be positively confirmed (best-effort kill returned with the
+    child or its group possibly alive). The child may still be writing
+    the reserved output: the caller must keep the claim (RECOVERING
+    with its owner token), keep the output, and leave the spawn intent
+    unresolved - fenced, no retry, no delete."""
+
+
+def _confirm_dead(proc, child_start, proc_fs: str = "/proc") -> bool:
+    """Positively confirm a spawned child AND its whole group are dead.
+    Reaps the child (escalating to a direct SIGKILL once when a plain
+    wait times out - _kill_group is best-effort only), then verifies
+    the recorded (pid, start, pgid) identity against /proc, including
+    a group-survivor scan. ANY ordinary failure of the confirmation
+    channel (wait OSError, kill failure, unreadable birth, proof
+    error) is uncertainty - False, never a propagated generic error.
+    Cancellation (KeyboardInterrupt and other BaseExceptions) is
+    never swallowed."""
+    try:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                return False
+        if child_start is None:
+            return False        # birth never readable: cannot prove
+        return bool(claim_owner_dead(proc.pid, child_start, proc.pid,
+                                     proc_fs)[0])
+    except Exception:
+        return False            # broken channel == unconfirmed
+
+
 def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
               subtitle_path: str | None = None, focus_x: float = 0.5,
               runtime_dir: str = ".nova-runtime",
@@ -159,7 +208,7 @@ def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
     # because a surviving edit child can still write its output file
     token = pre_spawn() if pre_spawn is not None else None
     if pre_spawn is not None and token is None:
-        raise RuntimeError("edit spawn intent not recordable; not spawning")
+        raise SpawnRefused("edit spawn intent not recordable; not spawning")
     proc = subprocess.Popen(
         edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x,
                   watermark=watermark),
@@ -171,8 +220,26 @@ def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
         except Exception:
             bound = False
         if not bound:
-            _kill_group(proc)
-            raise RuntimeError("edit writer identity not recorded; killed")
+            # the child must never run unrecorded; _kill_group is only
+            # best-effort, so refusal requires POSITIVELY confirmed
+            # death of the child and its whole group. Escalate with a
+            # direct kill and reap, then verify against /proc: only a
+            # confirmed-dead writer makes SpawnRefused retry-safe.
+            try:
+                child_start = read_start_time(proc.pid)
+            except Exception:
+                child_start = None    # unreadable birth: unprovable
+            try:
+                _kill_group(proc)
+            except Exception:
+                pass                  # best-effort by contract
+            if not _confirm_dead(proc, child_start):
+                _close_pipes(proc)
+                raise SpawnUncertain(
+                    "edit writer identity not recorded and child death"
+                    " unconfirmed; fenced, not retry-safe")
+            raise SpawnRefused(
+                "edit writer identity not recorded; killed")
     try:
         try:
             out_s, err_s = proc.communicate(timeout=600)

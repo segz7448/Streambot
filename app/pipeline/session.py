@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import threading
 import uuid
 import time
 from pathlib import Path
 
+from ..bot.restartproof import read_start_time, claim_owner_dead, \
+    proof_for_session, record_spawn_intent, record_spawned
 from ..core.database import connect, migrate
 from ..core.logging import get_logger
 
@@ -629,12 +632,23 @@ class _ClaimLost(Exception):
 def _claim_clip(conn, clip_id, token: str, auth_on_conn=None) -> bool:
     """Exclusive owner-token claim, one short transaction. Only a free
     PENDING row can be claimed; rowcount 1 wins. Interrupted RECOVERING
-    rows (a dead owner's claim) are NOT reclaimed here: they stay fenced
-    for review, never stolen via absence. When the caller supplies
+    rows are NOT reclaimed here: only reclaim_dead_claims may reset
+    one, and only on positive proof the exact recorded owner process
+    is dead; an unprovable claim stays fenced forever. The claim and
+    the owner process's birth evidence (pid + /proc start tick +
+    process group) commit atomically; when that evidence cannot be
+    read the claim is refused (fail closed). When the caller supplies
     auth_on_conn, CURRENT record authorization is re-read inside this
     same transaction BEFORE the claim: a revocation landing after any
     earlier preflight prevents the claim - and therefore the edit -
     entirely."""
+    my_start = read_start_time(os.getpid())
+    if my_start is None:
+        # fail closed BEFORE claiming: a claim whose owner process
+        # cannot later be proven dead would fence the clip forever
+        log.warning("claim refused for clip %s: own process birth "
+                    "unreadable", clip_id)
+        return False
     conn.execute("BEGIN IMMEDIATE")
     try:
         if auth_on_conn is not None and not auth_on_conn(conn):
@@ -646,6 +660,15 @@ def _claim_clip(conn, clip_id, token: str, auth_on_conn=None) -> bool:
             " AND recovery_owner IS NULL",
             (token, time.time(), clip_id))
         won = cur.rowcount == 1
+        if won:
+            # the claim and its owner-process birth evidence commit
+            # ATOMICALLY: a later recovery can reclaim this claim only
+            # on positive proof this exact process (and group) is dead
+            conn.execute(
+                "INSERT INTO clip_claims (clip_id, token, pid, start,"
+                " pgid, claimed_at) VALUES (?,?,?,?,?,?)",
+                (clip_id, token, os.getpid(), my_start, os.getpgrp(),
+                 time.time()))
         conn.commit()
         return won
     except Exception:
@@ -662,6 +685,9 @@ def _release_claim(conn, clip_id, token: str) -> None:
             "UPDATE clips SET status='PENDING', recovery_owner=NULL,"
             " claimed_at=NULL WHERE id=? AND status='RECOVERING'"
             " AND recovery_owner=?", (clip_id, token))
+        conn.execute(
+            "UPDATE clip_claims SET finished_at=? WHERE clip_id=?"
+            " AND token=?", (time.time(), clip_id, token))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -687,7 +713,7 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
     admission enqueue, exactly as in the live finalize path. auto_deliver
     (owner-preference immediate delivery) is used ONLY by the live
     finalize path; boot recovery passes False so nothing is flushed."""
-    from ..editing.editor import edit_clip
+    from ..editing.editor import edit_clip, SpawnRefused, SpawnUncertain
     from ..editing.presets import PRESETS
     from ..intelligence.memory import Memory
     from ..intelligence.planner import plan_clip
@@ -761,6 +787,21 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                     continue
             plan = plan_clip("auto", source_label, mem,
                              content_seconds=float(dur or 0))
+            # SPAWN FENCE: re-attest the exact claim against the row's
+            # CURRENT state immediately before any writer exists. A
+            # claim that was reclaimed (owner proven dead) or otherwise
+            # lost while we planned fails here and no edit child is
+            # ever spawned for it: a paused owner resuming after a
+            # reclaim cannot produce a second writer for the same clip.
+            cur = conn.execute(
+                "UPDATE clips SET claimed_at=? WHERE id=?"
+                " AND status='RECOVERING' AND recovery_owner=?",
+                (time.time(), clip_id, claim_token))
+            if cur.rowcount != 1:
+                log.warning("claim lost before edit spawn for clip %s;"
+                            " no writer started", clip_id)
+                _outcome(clip_id, "interrupted")
+                continue
             if output_name is None:
                 # per-attempt exclusive output ownership: the path is
                 # reserved O_CREAT|O_EXCL before any writer is spawned.
@@ -813,6 +854,10 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                          clip_id, claim_token))
                     if cur.rowcount != 1:
                         raise _ClaimLost()
+                    conn.execute(
+                        "UPDATE clip_claims SET finished_at=?"
+                        " WHERE clip_id=? AND token=?",
+                        (time.time(), clip_id, claim_token))
                     ev = conn.execute(
                         "SELECT metadata_json FROM candidate_events"
                         " WHERE id = (SELECT event_id FROM clips"
@@ -867,6 +912,9 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                     " WHERE id=? AND recovery_owner=?",
                     (json.dumps({"qc_passed": False}),
                      clip_id, claim_token))
+                conn.execute(
+                    "UPDATE clip_claims SET finished_at=? WHERE clip_id=?"
+                    " AND token=?", (time.time(), clip_id, claim_token))
                 conn.commit()
                 _outcome(clip_id, "QC_FAILED")
         except _AuthorizationRevoked:
@@ -884,6 +932,37 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
             edited.unlink(missing_ok=True)
             log.warning("claim lost for clip %s; left fenced", clip_id)
             _outcome(clip_id, "fenced")
+            continue
+        except SpawnUncertain as exc:
+            # a writer WAS spawned but could not be bound and its death
+            # is not positively confirmed: it may still be alive,
+            # writing the reserved output. Keep the claim (the row
+            # stays RECOVERING with our owner token and an unfinished
+            # claim record), keep the reserved output, and leave the
+            # spawn intent unresolved so future reclaim proof blocks:
+            # fenced, no retry, no delete.
+            conn.rollback()
+            log.warning("edit writer unbound, death unconfirmed for "
+                        "clip %s (%s); left fenced as RECOVERING with "
+                        "output preserved", clip_id, exc)
+            _outcome(clip_id, "interrupted")
+            continue
+        except SpawnRefused as exc:
+            # the writer was REFUSED, not run: the durable spawn intent
+            # was not recordable (no child ever existed) or the spawned
+            # child's death was positively confirmed after the bind
+            # failure. Not an edit failure: the clip goes back to
+            # PENDING intact, never burned to terminal FAILED, so a
+            # manifest-complete session or a separately reviewed
+            # legacy import path can still recover it. Only our own
+            # reserved, never-published output is removed.
+            conn.rollback()
+            if edited is not None:
+                edited.unlink(missing_ok=True)
+            _release_claim(conn, clip_id, claim_token)
+            log.warning("edit spawn refused for clip %s (%s); "
+                        "returned to PENDING", clip_id, exc)
+            _outcome(clip_id, "interrupted")
             continue
         except Exception as exc:
             if published:
@@ -923,6 +1002,9 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                 "UPDATE clips SET status='FAILED', recovery_owner=NULL,"
                 " claimed_at=NULL WHERE id=? AND recovery_owner=?",
                 (clip_id, claim_token))
+            conn.execute(
+                "UPDATE clip_claims SET finished_at=? WHERE clip_id=?"
+                " AND token=?", (time.time(), clip_id, claim_token))
             conn.commit()
             _outcome(clip_id, "FAILED")
     conn.commit()
@@ -945,6 +1027,120 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
     return held_ids
 
 
+# claim owner token families: exactly the shapes _claim_clip is ever
+# called with - live-<session id>-<8 hex> from the live finalizer and
+# recovery-<12 hex> from a /recoverclips run. Anything else is not a
+# claim this code can reason about and is fenced forever.
+_LIVE_TOKEN = re.compile(r"live-(\d+)-([0-9a-f]{8})")
+_RECOVERY_TOKEN = re.compile(r"recovery-[0-9a-f]{12}")
+
+
+def _claim_dead_owner(conn, clip_row, username: str, state_dir: Path,
+                      proc: str = "/proc") -> tuple[bool, str]:
+    """(True, why) ONLY on positive proof that BOTH the claim's exact
+    owner process AND the session's full writer set are dead. Never
+    infers death from incomplete visibility; an unprovable claim stays
+    fenced forever.
+
+    Legs, after the owner token is validated against a known family
+    (and for live-*, against THIS clip's session):
+      1. If a clip_claims birth record exists for this exact
+         (clip, token), the recorded owner process (pid + start tick +
+         group) must be verifiably dead with no survivor in its group.
+         A recovery-* claim without a record, or any already-finished
+         record, can never be proven and stays fenced.
+      2. ALWAYS the full session writer proof: recorded leader + every
+         durably registered writer dead, no unresolved spawn intent
+         (a lost registration blocks forever), no survivor in the
+         recorded groups, complete /proc visibility, and the
+         writer-quiet backstop. An owner-dead claim NEVER bypasses
+         this: an edit child starts its own process group, so the
+         owner's empty group says nothing about a surviving exporter.
+    """
+    token = clip_row["recovery_owner"] or ""
+    sid = int(clip_row["session_id"])
+    m = _LIVE_TOKEN.fullmatch(token)
+    if m is not None and int(m.group(1)) != sid:
+        m = None            # a live claim of a DIFFERENT session
+    if m is None and _RECOVERY_TOKEN.fullmatch(token) is None:
+        return False, "unrecognized claim owner identity"
+    claim = conn.execute(
+        "SELECT pid, start, pgid, finished_at FROM clip_claims"
+        " WHERE clip_id=? AND token=?",
+        (int(clip_row["id"]), token)).fetchone()
+    if claim is not None:
+        if claim["finished_at"] is not None:
+            return False, "claim already finished"
+        ok, why = claim_owner_dead(int(claim["pid"]),
+                                   int(claim["start"]),
+                                   int(claim["pgid"]), proc)
+        if not ok:
+            return False, why
+    elif _RECOVERY_TOKEN.fullmatch(token) is not None:
+        return False, "recovery claim has no owner record"
+    # legacy live-* claims (recorded before the registry existed, e.g.
+    # session 9 clip 6) have no birth record: the session proof alone
+    # decides. Every other claim reaches here with its owner already
+    # proven dead - and STILL must pass the full writer proof.
+    return proof_for_session(state_dir, username, sid, proc=proc)
+
+
+def reclaim_dead_claims(conn, session_id: int, username: str,
+                        state_dir: Path, proc: str = "/proc") -> dict:
+    """Reset this session's RECOVERING clips to PENDING, but only when
+    BOTH the exact claim owner process and the session's full recorded
+    writer set are verifiably dead (combined proof: an edit child runs
+    in its own process group, so the owner's death alone proves
+    nothing about a surviving exporter). Death is proven OUTSIDE the
+    transaction from current process state, then the reset is an
+    exact-(clip, owner) compare-and-swap INSIDE one transaction: a
+    claimant that replaced the owner since the proof is never reset,
+    and a proven-dead owner that was merely paused can never spawn a
+    second writer - the spawn fence in finish_pending_clips re-attests
+    the claim immediately before any edit child exists. Unprovable
+    claims stay fenced forever. Returns {"reclaimed": n, "fenced": ids}.
+    """
+    out = {"reclaimed": 0, "fenced": []}
+    rows = conn.execute(
+        "SELECT id, session_id, recovery_owner FROM clips"
+        " WHERE session_id=? AND status='RECOVERING'",
+        (session_id,)).fetchall()
+    for r in rows:
+        cid = int(r["id"])
+        token = r["recovery_owner"]
+        try:
+            provable, why = _claim_dead_owner(conn, r, username,
+                                              state_dir, proc)
+        except Exception as exc:   # a proof error must never unblock
+            log.warning("claim proof error for clip %s: %s", cid, exc)
+            provable, why = False, "proof error"
+        if not provable:
+            log.info("clip %s claim %s stays fenced: %s", cid, token, why)
+            out["fenced"].append(cid)
+            continue
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE clips SET status='PENDING', recovery_owner=NULL,"
+                " claimed_at=NULL WHERE id=? AND status='RECOVERING'"
+                " AND recovery_owner=?", (cid, token))
+            if cur.rowcount != 1:
+                conn.rollback()
+                out["fenced"].append(cid)
+                continue
+            conn.execute(
+                "UPDATE clip_claims SET finished_at=? WHERE clip_id=?"
+                " AND token=?", (time.time(), cid, token))
+            conn.commit()
+            out["reclaimed"] += 1
+            log.warning("clip %s claim reclaimed after owner-death"
+                        " proof (%s)", cid, why)
+        except Exception:
+            conn.rollback()
+            raise
+    return out
+
+
 def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                                   should_continue=None,
                                   on_spawn=None,
@@ -954,11 +1150,15 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
     work is not stranded invisible. Narrow and fail-closed on purpose:
 
     - ELIGIBILITY: PENDING rows with producer-committed seal evidence
-      (sealed_sha256/sealed_bytes) only. Legacy/unsealed PENDING rows
-      and interrupted RECOVERING rows stay fenced - never reclaimed,
-      never reset. Old session fences, capture state and delivery state
-      are untouched; nothing here resumes capture or declares old
-      writers dead (no process-visibility proof is consulted).
+      (sealed_sha256/sealed_bytes), plus RECOVERING rows whose claim
+      owner is reclaimed via reclaim_dead_claims - and only on positive
+      proof the exact recorded owner process is dead (clip_claims birth
+      record, or for pre-registry live claims the full session death
+      proof: leader + every recorded writer + process groups, with
+      complete process visibility). Legacy/unsealed rows and
+      unprovable claims stay fenced forever - never reset. Old session
+      fences, capture state and delivery state are untouched; nothing
+      here resumes capture.
     - INPUT: recovery never consumes the mutable source. It takes a
       private snapshot and verifies it against the producer's
       PRE-EXISTING committed digest; a mismatch fences the clip.
@@ -969,6 +1169,19 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
     - OUTPUT: unique never-reused recovery paths; nothing a previous
       writer could still touch is overwritten. Terminal state is HELD
       with ZERO admission jobs; HELD clips never auto-release.
+
+    KNOWN NARROWING vs pre-registry releases: the recovery edit child
+    is durably registered in the session writer manifest (intent
+    before spawn, bind-or-kill), so a session WITHOUT an initialized
+    manifest - legacy or hand-built rows that never went through
+    service session setup - can no longer be finished by this path:
+    the spawn is refused, the clip returns to PENDING (never burned
+    to FAILED), no manifest is created here (a missing manifest is
+    lost history; creating an empty one would forge it), and raw and
+    partial files stay untouched. Recovering such sessions needs a
+    separately reviewed import path, not a silent bootstrap. Every
+    session created by the current service has a manifest, so this
+    affects no session the current code produced.
 
     This function is a library entry point only: no boot or service
     wiring calls it. Returns the number of clips moved to HELD."""
@@ -986,7 +1199,8 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
             "SELECT s.id, t.username FROM stream_sessions s"
             " JOIN twitch_sources t ON t.id = s.source_id"
             " WHERE s.state='INTERRUPTED' AND EXISTS (SELECT 1 FROM clips c"
-            "  WHERE c.session_id=s.id AND c.status='PENDING'"
+            "  WHERE c.session_id=s.id"
+            "  AND c.status IN ('PENDING','RECOVERING')"
             "  AND c.sealed_sha256 IS NOT NULL)").fetchall()
         total = 0
         for sid, username in rows:
@@ -998,6 +1212,15 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
             if not source_auth.allowed(state_dir, username, "record"):
                 log.warning("recovery skipped for session %s (%s): "
                             "record authorization is off", sid, username)
+                continue
+            # Reclaim provably-dead RECOVERING claims (e.g. a finalizer
+            # that died mid-export) so they re-enter as PENDING below.
+            # Claims that cannot be proven dead stay fenced forever.
+            try:
+                reclaim_dead_claims(conn, sid, username, state_dir)
+            except Exception as exc:
+                log.warning("claim reclaim failed for session %s: %s; "
+                            "claims stay fenced", sid, exc)
                 continue
             work = state_dir / "sessions" / username
             work.mkdir(parents=True, exist_ok=True)
@@ -1025,6 +1248,25 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                               (f"srcauth:{u}:record",)).fetchone()
                 return bool(r and r[0] == "1")
 
+            # Recovery edit children are durably registered in the
+            # session's writer manifest, exactly like capture and live
+            # finalize writers: intent BEFORE the child exists (None
+            # forbids the spawn), identity bound right after (a bind
+            # failure kills the child group). Without this a recovery
+            # exporter would be an unrecorded writer its own later
+            # reclaim proof could never account for.
+            registry = work / f"writers-{sid}.json"
+
+            def _rec_pre_spawn(_p=registry):
+                return record_spawn_intent(_p)
+
+            def _rec_on_spawn(pid, pgid, token,
+                              _p=registry, _hook=on_spawn):
+                bound = record_spawned(_p, token, pid, pgid)
+                if bound and _hook is not None:
+                    _hook(pid, pgid, token)
+                return bound
+
             try:
                 held = finish_pending_clips(
                     conn, state_dir=state_dir, session_id=sid,
@@ -1038,7 +1280,8 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                     input_resolver=snapshot_resolver,
                     auth_on_conn=auth_now,
                     per_clip_authorization=should_continue,
-                    on_spawn=on_spawn,
+                    pre_spawn=_rec_pre_spawn,
+                    on_spawn=_rec_on_spawn,
                     outcome_cb=outcome_cb,
                     require_sealed=True)
             finally:

@@ -252,6 +252,36 @@ def _pid_dead(pid: int, start: int, proc: str):
     return False, f"pid {pid} visibility {why}"
 
 
+def claim_owner_dead(pid: int, start: int, pgid: int,
+                     proc: str = "/proc") -> tuple[bool, str]:
+    """(True, why) only when the EXACT recorded claim-owner process is
+    verifiably gone (pid absent or reused with a different start tick)
+    AND no live process remains in its recorded process group, with
+    complete process visibility. (False, why) for anything unprovable -
+    a denied or unreadable sweep is never evidence of absence."""
+    if not (_valid_pos_int(pid) and _valid_pos_int(start)
+            and _valid_pos_int(pgid)):
+        return False, "claim owner identity malformed"
+    dead, why = _pid_dead(pid, start, proc)
+    if not dead:
+        return False, f"claim owner {why}"
+    try:
+        pids = os.listdir(proc)
+    except OSError:
+        return False, "no process visibility: /proc not listable"
+    for p in pids:
+        if not p.isdigit() or int(p) == pid:
+            continue
+        d = stat_detail(int(p), proc)     # ONE authoritative read per pid
+        if not d[0]:
+            if d[1] == "absent":
+                continue            # exited while scanning: definitively gone
+            return False, f"process visibility {d[1]} for pid {p}"
+        if d[1] == pgid:
+            return False, f"survivor pid {p} in claim group {pgid}"
+    return True, "claim owner dead, group empty"
+
+
 def writer_death_proof(state_dir: Path, username: str, attempt_id,
                        proc: str = "/proc", writer_active=None,
                        registry_path: Path | None = None) -> tuple[bool, str]:
