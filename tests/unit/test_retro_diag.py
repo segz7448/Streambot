@@ -735,3 +735,145 @@ def test_regression_dead_leader_live_group_orphan(tmp_path, monkeypatch):
         except (ProcessLookupError, PermissionError):
             pass
         orphan.wait(timeout=5)
+
+
+def _stage_config(tmp_path, entries, mode=0o600):
+    """A private 0700 leaf dir holding the config at the given mode."""
+    d = tmp_path / "diag-activation"
+    d.mkdir(exist_ok=True)
+    os.chmod(d, 0o700)
+    f = d / "config.json"
+    f.write_text(json.dumps(entries))
+    os.chmod(f, mode)
+    return f
+
+
+def _entry(**kw):
+    base = {"request_id": "req-agent00-raw-044db707",
+            "path": os.path.realpath("/p"), "sha256": "0" * 64,
+            "bytes": 6554465, "max_total_seconds": 900}
+    base.update(kw)
+    return base
+
+
+def test_activation_config_loader(tmp_path, monkeypatch):
+    """Staged private config: happy path parses EXACTLY ONE tuple."""
+    monkeypatch.delenv("NOVA_RETRO_APPROVED_FILE", raising=False)
+    assert re_mod._load_approved() == ()  # unset env
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", "relative/path.json")
+    assert re_mod._load_approved() == ()  # not absolute
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE",
+                       str(tmp_path) + "/./diag-activation/config.json")
+    assert re_mod._load_approved() == ()  # non-canonical refused
+    f = _stage_config(tmp_path, [_entry()])
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", str(f))
+    ap = re_mod._load_approved()
+    assert len(ap) == 1
+    assert ap[0]["request_id"] == "req-agent00-raw-044db707"
+    assert ap[0]["max_total_seconds"] == 900
+
+
+def test_activation_config_loader_refusals(tmp_path, monkeypatch):
+    """Every deviation fails closed to empty."""
+    f = _stage_config(tmp_path, [_entry()])
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", str(f))
+    # symlink config file
+    link = f.parent / "link.json"
+    os.symlink(str(f), str(link))
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", str(link))
+    assert re_mod._load_approved() == ()
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", str(f))
+    # symlinked ancestor dir
+    dlink = tmp_path / "dlink"
+    os.symlink(str(f.parent), str(dlink))
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", str(dlink / "config.json"))
+    assert re_mod._load_approved() == ()
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", str(f))
+    # world/group-readable config
+    os.chmod(f, 0o644)
+    assert re_mod._load_approved() == ()
+    os.chmod(f, 0o640)
+    assert re_mod._load_approved() == ()
+    os.chmod(f, 0o600)
+    # shared-permission config dir
+    os.chmod(f.parent, 0o755)
+    assert re_mod._load_approved() == ()
+    os.chmod(f.parent, 0o700)
+    # wrong owner (simulated euid mismatch)
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+    assert re_mod._load_approved() == ()
+    monkeypatch.undo()
+    monkeypatch.setenv("NOVA_RETRO_APPROVED_FILE", str(f))
+    # invalid JSON
+    f.write_text("{not json")
+    assert re_mod._load_approved() == ()
+    # oversized config (fstat refused before parse)
+    f.write_text(json.dumps([_entry()]) + " " * 20000)
+    assert re_mod._load_approved() == ()
+    # not exactly one tuple
+    f.write_text(json.dumps([]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([_entry(), _entry(request_id="req-other")]))
+    assert re_mod._load_approved() == ()
+    # tuple field violations
+    f.write_text(json.dumps([dict(_entry(), request_id="bad id!!")]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), path="relative.mp4")]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), path="/x/./y.mp4")]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), sha256="zz")]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), bytes=True)]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), bytes=0)]))
+    assert re_mod._load_approved() == ()
+    # budget: NaN / bool / zero / negative / over the hard ceiling
+    f.write_text(json.dumps([dict(_entry(), max_total_seconds=float("nan"))]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), max_total_seconds=0)]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), max_total_seconds=-5)]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps([dict(_entry(), max_total_seconds=True)]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps(
+        [dict(_entry(), max_total_seconds=re_mod.HARD_CEILING_SECONDS + 1)]))
+    assert re_mod._load_approved() == ()
+    f.write_text(json.dumps(
+        [dict(_entry(), max_total_seconds=re_mod.HARD_CEILING_SECONDS)]))
+    assert len(re_mod._load_approved()) == 1  # exactly at ceiling OK
+
+
+def test_activation_fresh_import_integration(tmp_path):
+    """REAL activation path: a FRESH interpreter imports the module with
+    the env var already set (the staged-before-startup contract). Valid
+    config loads exactly one tuple; a policy-violating config loads
+    empty; env unset loads empty. Import-time evaluation order is what
+    this proves - post-import direct calls cannot."""
+    import subprocess as sp
+    repo_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(re_mod.__file__))))
+    code = ("from app.diag import retro_export as m; "
+            "print('LOADED', len(m.APPROVED))")
+
+    def fresh(env_file):
+        env = dict(os.environ)
+        env.pop("NOVA_RETRO_APPROVED_FILE", None)
+        if env_file is not None:
+            env["NOVA_RETRO_APPROVED_FILE"] = str(env_file)
+        env["PYTHONPATH"] = repo_root + os.pathsep + env.get(
+            "PYTHONPATH", "")
+        r = sp.run([sys.executable, "-B", "-c", code],
+                   capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == 0, r.stderr[-500:]
+        return r.stdout.strip()
+
+    good = _stage_config(tmp_path, [_entry()])
+    assert fresh(good) == "LOADED 1"          # valid staged config
+    os.chmod(good, 0o644)
+    assert fresh(good) == "LOADED 0"          # world-readable refused
+    os.chmod(good, 0o600)
+    good.write_text(json.dumps([_entry(), _entry(request_id="req-b")]))
+    assert fresh(good) == "LOADED 0"          # multi tuple refused
+    assert fresh(None) == "LOADED 0"          # unset env refused

@@ -11,3 +11,4 @@ logs/*
 dist/
 build/
 *.egg-info/
+diag-activation*.json

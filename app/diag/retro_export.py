@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -47,9 +48,12 @@ _LAUNCH_LOCK = threading.Lock()  # absolute bound; the APPROVED tuple carries
 # from measured work - never a pretend-tiny default
 
 # The ONLY request this diagnostic may serve: (request_id, source path,
-# sha256, size). The approval artifact is this reviewed constant itself.
-# Empty by default => every request is refused.
-APPROVED: tuple = ()
+# sha256, size). Empty by default => every request is refused. An
+# OPTIONAL private local activation config (JSON list of exact tuples)
+# may be named by NOVA_RETRO_APPROVED_FILE; it is untracked and never
+# committed, so no device path or source identity lives in the repo.
+# Absent, unreadable, or ANY malformed entry => empty (fail closed).
+MAX_APPROVED_BYTES = 16384  # bounded JSON: the config is one tuple
 
 
 class RequestError(Exception):
@@ -138,6 +142,72 @@ def _fsync_dir(path: Path) -> None:
         os.fsync(dfd)
     finally:
         os.close(dfd)
+
+
+def _load_approved() -> tuple:
+    """Staged EXACTLY as reviewed BEFORE service import: absolute,
+    already-canonical env path (non-canonical input is REFUSED, never
+    silently normalized), non-symlink ancestors, private 0700 euid leaf
+    dir, the file itself opened O_NOFOLLOW and fstat-verified regular/
+    euid/exactly 0600, then a BOUNDED read of MAX_APPROVED_BYTES + 1
+    (any growth past the cap rejects before JSON is parsed), EXACTLY
+    ONE tuple, tuple source path absolute canonical, 0 < finite budget
+    <= HARD_CEILING_SECONDS. Any deviation => empty (fail closed): the
+    env path alone is never an approval. Defined here, after every
+    helper it depends on; CALLED once at the very bottom of the module
+    so a fresh import can never hit an undefined name."""
+    p = os.environ.get("NOVA_RETRO_APPROVED_FILE")
+    if not p or not os.path.isabs(p) or os.path.normpath(p) != p:
+        return ()
+    parent = Path(p).parent
+    try:
+        if not _private700(parent):
+            return ()
+        _check_ancestors(parent.parent)
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    except (OSError, RequestError):
+        return ()
+    raw = None
+    try:
+        st = os.fstat(fd)
+        if (S.S_ISREG(st.st_mode) and st.st_uid == os.geteuid()
+                and (st.st_mode & 0o777) == 0o600
+                and 0 < st.st_size <= MAX_APPROVED_BYTES):
+            try:
+                with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                    fd = None  # owned by the file object now
+                    data = fh.read(MAX_APPROVED_BYTES + 1)
+                if len(data) <= MAX_APPROVED_BYTES:
+                    raw = json.loads(data)
+            except (OSError, ValueError):
+                raw = None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not isinstance(raw, list) or len(raw) != 1:
+        return ()
+    e = raw[0]
+    if not isinstance(e, dict):
+        return ()
+    rid = e.get("request_id")
+    path = e.get("path")
+    sha = e.get("sha256")
+    size = e.get("bytes")
+    budget = e.get("max_total_seconds")
+    if not (isinstance(rid, str) and ID_RE.match(rid)
+            and isinstance(path, str) and os.path.isabs(path)
+            and os.path.normpath(path) == path
+            and os.path.realpath(path) == path
+            and isinstance(sha, str) and HEX64.match(sha)
+            and isinstance(size, int) and not isinstance(size, bool)
+            and size > 0
+            and isinstance(budget, (int, float))
+            and not isinstance(budget, bool)
+            and math.isfinite(budget)
+            and 0 < budget <= HARD_CEILING_SECONDS):
+        return ()
+    return ({"request_id": rid, "path": path, "sha256": sha,
+             "bytes": size, "max_total_seconds": budget},)
 
 
 def _private_dir(path: Path) -> bool:
@@ -810,3 +880,10 @@ def _verify_output(diag: Path, o: dict) -> bool:
         return bool(row) and row[0] == "HELD" and row[1] == path
     except Exception:
         return False
+
+
+# Loaded ONCE here, after every helper/class definition above, so a
+# fresh interpreter import with the env var set can never hit an
+# undefined name. Import-time by design: the reviewed config must be
+# staged BEFORE the service process starts; no dynamic reload.
+APPROVED: tuple = _load_approved()
