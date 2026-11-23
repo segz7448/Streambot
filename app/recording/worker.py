@@ -68,6 +68,8 @@ class RecordingWorker:
         return not ctx.stopping
 
     async def run(self, ctx: ServiceContext) -> None:
+        # any segment on disk belongs to a dead writer: final
+        self.buffer.mark_drained()
         reconciled = self.buffer.reconcile(self.db_path)
         if reconciled:
             log.info("reconciled %d on-disk segments", reconciled)
@@ -129,6 +131,7 @@ class RecordingWorker:
                 await asyncio.sleep(self.sweep_seconds)
         finally:
             await self.runner.stop_session(self.session_name)
+            self.buffer.mark_drained()
             self.buffer.enforce_storage_cap()
             self.buffer.reconcile(self.db_path)
             log.info("recording stopped session=%s reconnects=%d",

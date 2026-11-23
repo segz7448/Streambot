@@ -12,6 +12,7 @@ class FakeSegment:
     def __init__(self, seq, created):
         self.sequence = seq
         self.created_at = created
+        self.duration_seconds = 5.0   # nominal fake: matches the 5s spacing
         self.path = Path(f"/tmp/seg-{seq}.ts")
 
 

@@ -366,6 +366,8 @@ class PlaybackWorker:
         task = None
         try:
             try:
+                # any segment on disk belongs to a dead writer: final
+                self.buffer.mark_drained()
                 reconciled = self.buffer.reconcile(self.db_path)
                 if reconciled:
                     log.info("reconciled %d on-disk segments", reconciled)
@@ -454,6 +456,7 @@ class PlaybackWorker:
                     task.exception() if not task.cancelled() else None
             try:
                 if not self.capture_thread_active():     # never touch the buffer under a live writer
+                    self.buffer.mark_drained()
                     self.buffer.enforce_storage_cap()
                     self.buffer.reconcile(self.db_path)
             except Exception as exc:

@@ -22,6 +22,11 @@ def scene_changes(ffmpeg: str, path: str,
          "-vf", "select='gte(scene,0)',metadata=print:key=lavfi.scene_score",
          "-f", "null", "-"],
         capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        # same contract as audio.loudness_samples: a failed decode must
+        # not parse as "no scene changes in valid media"
+        raise RuntimeError(
+            "ffmpeg visual analysis exit %d" % proc.returncode)
     out: list[tuple[float, float]] = []
     last_t: float | None = None
     for line in proc.stderr.splitlines():

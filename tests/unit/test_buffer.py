@@ -55,8 +55,13 @@ class RollingBufferTests(unittest.TestCase):
                 " VALUES (1, 'RECORDING')")
             buf = RollingBuffer(tmp, session_id=1)
             make_segments(buf, 3)
-            self.assertEqual(buf.reconcile(db), 3)
+            # only CLOSED segments get rows: the open tail's values are
+            # not final, so it is never persisted while still growing
+            self.assertEqual(buf.reconcile(db), 2)
             self.assertEqual(buf.reconcile(db), 0)  # idempotent
+            buf.mark_drained()                      # tail closes
+            self.assertEqual(buf.reconcile(db), 1)
+            self.assertEqual(buf.reconcile(db), 0)
 
 
 if __name__ == "__main__":

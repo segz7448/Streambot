@@ -5,7 +5,7 @@ import time
 import unittest
 
 from app.core.database import connect, migrate
-from app.detection import audio
+from app.detection import audio, visual
 from app.detection.detector import CandidateDetector, ensure_state_table
 from app.recording.buffer import RollingBuffer
 
@@ -140,6 +140,112 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(det.process_new_segments(), 0)
         self._make_segments(1, start=3)  # newer segment; previous tail finalizes
         self.assertEqual(det.process_new_segments(), 1)
+
+    def test_failed_analysis_is_recorded_not_silent(self):
+        # reviewer finding: analyzer exceptions were swallowed while
+        # detection_state advanced, making zero candidates indistinguishable
+        # from a silently failed analysis (session-8 evidence gap)
+        self._make_segments(3)
+
+        def bad_audio(ff, p):
+            raise RuntimeError("decoder exploded")
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=bad_audio,
+                                scene_fn=lambda ff, p: [(1.0, 0.9)])
+        written = det.process_new_segments()   # visual candidates survive
+        self.assertEqual(written, 2)
+        conn = connect(self.db)
+        rows = [tuple(r) for r in conn.execute(
+            "SELECT sequence, audio_ok, visual_ok FROM segment_analysis"
+            " ORDER BY sequence").fetchall()]
+        state = conn.execute(
+            "SELECT last_analyzed_sequence FROM detection_state"
+            " WHERE session_id=1").fetchone()
+        conn.close()
+        # both finalized segments recorded with audio FAILED, visual OK;
+        # state still advances (a broken analyzer must not wedge detection)
+        self.assertEqual(rows, [(0, 0, 1), (1, 0, 1)])
+        self.assertEqual(state[0], 1)
+
+    def test_fully_failed_segment_records_zero_zero(self):
+        self._make_segments(2)
+
+        def bad(ff, p):
+            raise RuntimeError("x")
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=bad, scene_fn=bad)
+        self.assertEqual(det.process_new_segments(), 0)
+        conn = connect(self.db)
+        rows = [tuple(r) for r in conn.execute(
+            "SELECT sequence, audio_ok, visual_ok FROM segment_analysis"
+            " ORDER BY sequence").fetchall()]
+        conn.close()
+        self.assertEqual(rows, [(0, 0, 0)])   # seg0 finalized, seg1 newest
+
+    def test_event_time_is_segment_start_plus_local_offset(self):
+        # created_at is the segment's content END; the event time must be
+        # its START plus the analyzer's intra-segment offset
+        self._make_segments(3)
+        det = CandidateDetector(
+            "ffmpeg", self.buf, self.db,
+            audio_fn=lambda ff, p: [audio.LoudnessSample(t * 0.1, -30.0)
+                                    for t in range(30)],
+            scene_fn=lambda ff, p: [(2.0, 0.9)])
+        det.process_new_segments()
+        conn = connect(self.db)
+        rows = [tuple(r) for r in conn.execute(
+            "SELECT detected_at, metadata_json FROM candidate_events"
+            " ORDER BY detected_at").fetchall()]
+        conn.close()
+        segs = self.buf.segments()
+        self.assertEqual(len(rows), 2)   # seg0 and seg1 (newest skipped)
+        for (detected_at, _meta), seg in zip(rows, segs):
+            self.assertAlmostEqual(
+                detected_at,
+                seg.created_at - seg.duration_seconds + 2.0, places=6)
+
+    def test_concurrent_passes_record_once(self):
+        # reviewer repro: two simultaneous passes double-recorded one
+        # event while the audit row collapsed to a single identity
+        import threading
+        self._make_segments(2)
+        barrier = threading.Barrier(2)
+
+        def audio_fn(ff, p):
+            barrier.wait(timeout=3)
+            return []
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=audio_fn,
+                                scene_fn=lambda ff, p: [(1.0, 0.8)])
+        results = []
+        threads = [threading.Thread(
+            target=lambda: results.append(det.process_new_segments()))
+            for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        conn = connect(self.db)
+        events = conn.execute(
+            "SELECT count(*) FROM candidate_events").fetchone()[0]
+        audits = conn.execute(
+            "SELECT count(*) FROM segment_analysis").fetchone()[0]
+        conn.close()
+        self.assertEqual(events, 1)
+        self.assertEqual(audits, 1)
+
+    def test_successful_analysis_records_ok_rows(self):
+        self._make_segments(3)
+        det = CandidateDetector("ffmpeg", self.buf, self.db,
+                                audio_fn=lambda ff, p: [],
+                                scene_fn=lambda ff, p: [])
+        det.process_new_segments()
+        conn = connect(self.db)
+        rows = [tuple(r) for r in conn.execute(
+            "SELECT sequence, audio_ok, visual_ok FROM segment_analysis"
+            " ORDER BY sequence").fetchall()]
+        conn.close()
+        self.assertEqual(rows, [(0, 1, 1), (1, 1, 1)])
 
     def test_sustained_episode_writes_one_event(self):
         # regression for the on-phone defect: one sustained loud burst in a
@@ -278,6 +384,47 @@ class DetectorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnalyzerReturnCodeTests(unittest.TestCase):
+    """A failed ffmpeg decode exits nonzero and previously returned EMPTY
+    output with no exception - recorded as successful analysis of silent
+    media (reviewer: audit claimed 1/1 on invalid TS). Analyzers must
+    raise a fixed nonsecret error so the audit records the failure."""
+
+    def _fake_ffmpeg(self, tmp, body, rc):
+        import os
+        import stat
+        path = os.path.join(tmp, "fake-ffmpeg")
+        with open(path, "w") as f:
+            f.write("#!" + os.sys.executable + "\n"
+                    "import sys\n"
+                    "sys.stderr.write(%r)\n"
+                    "sys.exit(%d)\n" % (body, rc))
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        return path
+
+    def test_audio_raises_on_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = self._fake_ffmpeg(tmp, "bogus decoder error text", 1)
+            with self.assertRaises(RuntimeError) as cm:
+                audio.loudness_samples(ff, "/x/seg.ts")
+            self.assertNotIn("bogus", str(cm.exception))  # no raw stderr
+
+    def test_visual_raises_on_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = self._fake_ffmpeg(tmp, "bogus decoder error text", 1)
+            with self.assertRaises(RuntimeError) as cm:
+                visual.scene_changes(ff, "/x/seg.ts")
+            self.assertNotIn("bogus", str(cm.exception))
+
+    def test_valid_empty_media_is_success_not_failure(self):
+        # rc 0 with no samples (valid silent media): NO raise - the
+        # empty-valid vs decode-failure distinction is the whole point
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = self._fake_ffmpeg(tmp, "", 0)
+            self.assertEqual(audio.loudness_samples(ff, "/x/seg.ts"), [])
+            self.assertEqual(visual.scene_changes(ff, "/x/seg.ts"), [])
 
 
 class SceneChangeParserTests(unittest.TestCase):

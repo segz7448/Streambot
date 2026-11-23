@@ -25,6 +25,12 @@ def loudness_samples(ffmpeg: str, path: str) -> list[LoudnessSample]:
         [ffmpeg, "-nostats", "-protocol_whitelist", "file",
          "-i", path, "-filter_complex", "ebur128", "-f", "null", "-"],
         capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        # a failed decode yields empty/partial output that parses as
+        # "silence": indistinguishable from valid quiet media without the
+        # return code. Fixed nonsecret error, never stderr text.
+        raise RuntimeError(
+            "ffmpeg audio analysis exit %d" % proc.returncode)
     samples: list[LoudnessSample] = []
     for line in proc.stderr.splitlines():
         m = _MOMENTARY.search(line)

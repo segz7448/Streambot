@@ -368,7 +368,7 @@ class ClipSession:
         from ..core.lifecycle import HealthRegistry, Service, Supervisor
         from ..detection.detector import CandidateDetector
         from ..intelligence.providers import HeuristicProvider
-        from ..recording.buffer import RollingBuffer
+        from ..recording.buffer import RollingBuffer, ffprobe_probe
         from ..recording.ffmpeg import FFmpegRunner
         from ..recording.worker import RecordingWorker
 
@@ -424,6 +424,8 @@ class ClipSession:
             # an unidentifiable writer never keeps running
             return _rp.record_spawned(_path, token, pid, pgid)
         self._pre_spawn, self._on_spawn_writer = _pre_spawn, _register
+        buf.probe = ffprobe_probe(self.ffprobe, pre_spawn=_pre_spawn,
+                                  on_spawn=_register)
         runner = FFmpegRunner(self.ffmpeg, self.ffprobe, max_concurrent=1,
                               pre_spawn=_pre_spawn, on_spawn=_register)
         if self.playback is not None:
@@ -564,7 +566,9 @@ class ClipSession:
                 try:
                     # every writer attested drained above, so the capture's
                     # final segment is safe to analyze here (it is skipped
-                    # during the live loop as possibly-still-written)
+                    # during the live loop as possibly-still-written); the
+                    # buffer tail closes so its true duration persists
+                    buf.mark_drained()
                     await self._owned(detector.process_new_segments, True)
                     await self._owned(clipper.process_pending)
                     await self._owned(

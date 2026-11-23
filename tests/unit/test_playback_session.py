@@ -195,6 +195,7 @@ class FakeBuf:
     session_id = 9
     def __init__(self, d): self.d, self.n = d, 0
     def reconcile(self, db): return 0
+    def mark_drained(self): pass
     def enforce_storage_cap(self): pass
     def next_seq(self): return self.n
     def segmenter_output_args(self, n=0): return ["x"]

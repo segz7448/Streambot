@@ -36,9 +36,11 @@ def plan_clip(buffer: RollingBuffer, event_time: float,
     window = [by_path[p] for p in segs if p in by_path]
     if not window:
         return None
-    seg_dur = buffer.segment_seconds
     first = window[0]
-    window_start = first.created_at - seg_dur
+    # the window starts at the first segment's content start; with
+    # keyframe-cut segments its ACTUAL duration governs, not the nominal
+    # target (a 6s first segment under a 5s target shifts every offset)
+    window_start = first.created_at - first.duration_seconds
     wanted_start = event_time - pre_seconds
     if wanted_start < window_start - 0.5:
         return None  # pre-event footage already rotated out

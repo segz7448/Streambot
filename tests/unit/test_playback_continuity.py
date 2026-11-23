@@ -118,6 +118,9 @@ class _FakeBuffer:
     def reconcile(self, db_path):
         return 0
 
+    def mark_drained(self):
+        pass
+
     def enforce_storage_cap(self, *a, **k):
         return 0
 

@@ -141,7 +141,14 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     validate_fn(ffprobe, src_path)
     result: dict = {"source": source_label, "src": src_path}
 
-    samples = audio_fn(ffmpeg, src_path)
+    try:
+        samples = audio_fn(ffmpeg, src_path)
+    except Exception as exc:
+        # same best-effort contract as scene analysis below: a failed
+        # decode (now rc-checked in the real analyzer) means no audio
+        # candidates for this pass, never a crashed ingest
+        log.warning("audio analysis failed for %s: %s", src_path, exc)
+        samples = []
     spikes = audio.loudness_spikes(samples, baseline=None)
     try:
         scenes = scene_fn(ffmpeg, src_path)
