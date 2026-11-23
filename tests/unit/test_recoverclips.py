@@ -87,7 +87,7 @@ class RecoveryTrackerTests(FinalizeTests):
         import threading as _t
         entered, release = _t.Event(), _t.Event()
         def edit(ffmpeg, src, dst, preset, a, b, runtime,
-                 watermark=None, pre_spawn=None, on_spawn=None):
+                 watermark=None, pre_spawn=None, on_spawn=None, framing=None):
             entered.set()
             release.wait(5)
             Path(dst).write_bytes(b"\x00" * 2048)
@@ -131,7 +131,7 @@ class RecoveryTrackerTests(FinalizeTests):
         entered, release = threading.Event(), threading.Event()
         calls = []
         def edit(ffmpeg, src, dst, preset, a, b, runtime,
-                 watermark=None, pre_spawn=None, on_spawn=None):
+                 watermark=None, pre_spawn=None, on_spawn=None, framing=None):
             calls.append(dst)
             if len(calls) == 1:
                 entered.set()
@@ -160,7 +160,7 @@ class RecoveryTrackerTests(FinalizeTests):
         self.addCleanup(mock.patch.stopall)
         tracker = sessions.RecoveryTracker()
         def edit(ffmpeg, src, dst, preset, a, b, runtime,
-                 watermark=None, pre_spawn=None, on_spawn=None):
+                 watermark=None, pre_spawn=None, on_spawn=None, framing=None):
             tracker.request_cancel()
             raise OSError("killed mid-edit")
         sent = []
