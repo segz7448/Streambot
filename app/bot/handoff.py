@@ -420,12 +420,29 @@ def recover(state_dir: Path) -> int:
 
 async def run_consumer(state_dir: Path, *, poll_interval: float = 5.0,
                        ffprobe: str = "ffprobe") -> None:
-    """Long-running service loop; cancel to stop."""
+    """Long-running service loop; cancel to stop.
+
+    Cancellation drains the in-flight cycle first: the worker thread is
+    shielded and always awaited to completion (the same semantics as
+    BotService._blocking), so a cancel can never return while a cycle -
+    including a native upload - is still running in the background."""
     while True:
-        try:
-            status = await asyncio.to_thread(
-                run_once, state_dir, ffprobe=ffprobe)
-        except Exception:
-            log.exception("handoff consumer cycle failed")
-            status = IDLE
+        fut = asyncio.ensure_future(
+            asyncio.to_thread(run_once, state_dir, ffprobe=ffprobe))
+        cancelled = False
+        while True:
+            try:
+                status = await asyncio.shield(fut)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if fut.done():
+                    fut.exception()
+                    break
+            except Exception:
+                log.exception("handoff consumer cycle failed")
+                status = IDLE
+                break
+        if cancelled:
+            raise asyncio.CancelledError
         await asyncio.sleep(0.2 if status == PROCESSED else poll_interval)
