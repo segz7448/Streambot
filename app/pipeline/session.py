@@ -1263,9 +1263,19 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
             def _rec_on_spawn(pid, pgid, token,
                               _p=registry, _hook=on_spawn):
                 bound = record_spawned(_p, token, pid, pgid)
-                if bound and _hook is not None:
-                    _hook(pid, pgid, token)
-                return bound
+                if not bound:
+                    return False
+                if _hook is None:
+                    return True
+                # the caller's hook may REFUSE the child (the service
+                # tracker refuses a child bound after cancellation so
+                # edit_clip tears down that exact child): propagate the
+                # refusal, never report a successful bind
+                try:
+                    ok = _hook(pid, pgid, token)
+                except Exception:
+                    ok = False
+                return bool(ok)
 
             try:
                 held = finish_pending_clips(

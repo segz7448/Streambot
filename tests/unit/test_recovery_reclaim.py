@@ -327,6 +327,44 @@ class ReclaimTests(FinalizeTests):
         self.assertEqual(len(rows), 2)             # one per attempt
         self.assertTrue(all(r[0] is not None for r in rows))
 
+    def test_hook_refusal_propagates_through_registry_bind(self):
+        # regression: _rec_on_spawn bound the child in the registry but
+        # dropped the caller hook's refusal return, so a child refused
+        # after cancellation was treated as bound and the edit kept
+        # running; the refusal must propagate so edit_clip tears down
+        # that exact child and the clip returns to PENDING
+        cid = self._add_clip()
+        self.assertTrue(rp.init_registry(self._manifest()))
+        calls = {"n": 0}
+        killed = []
+
+        from app.editing.editor import SpawnRefused
+
+        def _fake_edit(ffmpeg, src, dst, preset, a, b, runtime,
+                       watermark=None, pre_spawn=None, on_spawn=None):
+            token = pre_spawn() if pre_spawn else None
+            bound = on_spawn(41, 41, token) if on_spawn else True
+            if not bound:
+                killed.append(41)  # the refusal path tears down the child
+                raise SpawnRefused("refused")
+            raise AssertionError("refusal was swallowed")
+
+        def _hook(pid, pgid, token):
+            calls["n"] += 1
+            return False  # e.g. the tracker refuses a child after cancel
+
+        with mock.patch("app.editing.editor.edit_clip", _fake_edit):
+            n = ps.finalize_interrupted_sessions(self.dir, "ffmpeg",
+                                                 "ffprobe", on_spawn=_hook)
+        self.assertEqual(n, 0)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(killed, [41])
+        self.assertEqual(self._clip(cid)[0], "PENDING")
+        # the registry bind itself succeeded and stays recorded truthfully
+        doc = json.loads(self._manifest().read_text())
+        self.assertEqual(len(doc["writers"]), 1)
+        self.assertEqual(doc["writers"][0]["pid"], 41)
+
     def test_manifest_registered_edit_child_held(self):
         # with an initialized manifest the recovery edit child is
         # durably registered: intent bound with pid/pgid identity
