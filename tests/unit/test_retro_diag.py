@@ -17,9 +17,9 @@ from app.bot import restartproof as rp
 def _mkstate(tmp_path):
     state = tmp_path / "state"
     (state / "sessions" / "agent00").mkdir(parents=True)
-    (state / "retro-diag").mkdir(parents=True)
+    (state / re_mod.REQUEST_DIR).mkdir(parents=True)
     for d in (state, state / "sessions", state / "sessions" / "agent00",
-              state / "retro-diag"):
+              state / re_mod.REQUEST_DIR):
         os.chmod(d, 0o700)  # production creates these via _mkdir700
     return state
 
@@ -39,7 +39,7 @@ def _doc(src, rid="req-1", sha=None, size=None):
 
 
 def _write_req(state, doc):
-    (state / "retro-diag" / "request.json").write_text(json.dumps(doc))
+    (state / re_mod.REQUEST_DIR / "request.json").write_text(json.dumps(doc))
 
 
 def _approve(monkeypatch, doc):
@@ -105,19 +105,19 @@ def test_no_request(tmp_path):
 
 def test_consumed_fence_blocks(tmp_path):
     state = _mkstate(tmp_path)
-    (state / "retro-diag" / "CONSUMED").write_text("{}")
+    (state / re_mod.REQUEST_DIR / "CONSUMED").write_text("{}")
     with pytest.raises(re_mod.RequestError, match="consumed"):
         re_mod.run_request(str(state))
 
 
 def test_invalid_json_claimed_then_refused(tmp_path):
     state = _mkstate(tmp_path)
-    (state / "retro-diag" / "request.json").write_text("{nope")
+    (state / re_mod.REQUEST_DIR / "request.json").write_text("{nope")
     with pytest.raises(re_mod.RequestError):
         re_mod.run_request(str(state))
     # claimed away (no re-pick loop), refusal recorded
-    assert not (state / "retro-diag" / "request.json").exists()
-    refusals = list((state / "retro-diag" / "done").glob("refused-*.json"))
+    assert not (state / re_mod.REQUEST_DIR / "request.json").exists()
+    refusals = list((state / re_mod.REQUEST_DIR / "done").glob("refused-*.json"))
     assert refusals
 
 
@@ -136,9 +136,9 @@ def test_symlink_request_refused(tmp_path, monkeypatch):
     src = _source(tmp_path, state)
     doc = _doc(src)
     _approve(monkeypatch, doc)
-    real_req = state / "retro-diag" / "real.json"
+    real_req = state / re_mod.REQUEST_DIR / "real.json"
     real_req.write_text(json.dumps(doc))
-    os.symlink(str(real_req), str(state / "retro-diag" / "request.json"))
+    os.symlink(str(real_req), str(state / re_mod.REQUEST_DIR / "request.json"))
     with pytest.raises(re_mod.RequestError):
         re_mod.run_request(str(state))
 
@@ -160,8 +160,8 @@ def test_success_one_owned_child(tmp_path, monkeypatch):
     assert w["pgid"] == w["pid"] and w["start"] > 0
     assert result["source_unchanged"] is True
     assert re_mod.consumed(str(state))
-    assert not (state / "retro-diag" / "in-progress.json").exists()
-    assert (state / "retro-diag" / "done" / "req-1.json").exists()
+    assert not (state / re_mod.REQUEST_DIR / "in-progress.json").exists()
+    assert (state / re_mod.REQUEST_DIR / "done" / "req-1.json").exists()
     rj = json.loads((state / "diag" / "retro-diag-req-1" / "result.json").read_text())
     assert rj["status"] == "held"
     # second request ever: refused by the consumed fence
@@ -184,7 +184,7 @@ def test_worker_crash_is_uncertain_and_fenced(tmp_path, monkeypatch):
     assert result["worker_rc"] == 2
     # fence retained: NOT consumed, in-progress kept, no auto-retry
     assert not re_mod.consumed(str(state))
-    assert (state / "retro-diag" / "in-progress.json").exists()
+    assert (state / re_mod.REQUEST_DIR / "in-progress.json").exists()
     assert (state / "diag" / "retro-diag-req-1" / "result.json").exists()
 
 
@@ -199,7 +199,7 @@ def test_cancel_kills_registered_group(tmp_path, monkeypatch):
 
     def arm_cancel():
         time.sleep(2)
-        (state / "retro-diag" / "CANCEL").write_text("stop")
+        (state / re_mod.REQUEST_DIR / "CANCEL").write_text("stop")
 
     import threading
     t = threading.Thread(target=arm_cancel)
@@ -311,15 +311,15 @@ def test_real_ffmpeg_end_to_end_and_failure(tmp_path, monkeypatch):
     # failure path: a second approved id whose source is not media
     state2 = tmp_path / "state2"
     (state2 / "sessions" / "agent00").mkdir(parents=True)
-    (state2 / "retro-diag").mkdir(parents=True)
+    (state2 / re_mod.REQUEST_DIR).mkdir(parents=True)
     for d in (state2, state2 / "sessions",
-              state2 / "sessions" / "agent00", state2 / "retro-diag"):
+              state2 / "sessions" / "agent00", state2 / re_mod.REQUEST_DIR):
         os.chmod(d, 0o700)
     bad = os.path.realpath(str(state2 / "sessions" / "agent00" / "bad.mp4"))
     with open(bad, "wb") as fh:
         fh.write(b"this is not a video")
     doc2 = _doc(bad, rid="req-bad")
-    (state2 / "retro-diag" / "request.json").write_text(json.dumps(doc2))
+    (state2 / re_mod.REQUEST_DIR / "request.json").write_text(json.dumps(doc2))
     _approve(monkeypatch, doc2)
     result2 = re_mod.run_request(str(state2))
     assert result2["worker_rc"] == 2  # worker caught the validation error
@@ -458,7 +458,7 @@ def test_regression_mkdir_fresh_and_private(tmp_path):
     with pytest.raises(re_mod.RequestError):
         re_mod._ensure_private700(bad)
     # dangling symlink inside the control chain
-    req = state / "retro-diag"
+    req = state / re_mod.REQUEST_DIR
     (req / "claimed").mkdir()
     os.symlink("/nonexistent-target", str(req / "claimed" / "link"))
     assert not re_mod._private700(req / "claimed" / "link")
@@ -637,8 +637,8 @@ def test_bind_failure_terminal_record(tmp_path, monkeypatch):
     assert data["proof"]["clean"] is False
     assert "unresolved spawn intent" in data["proof"]["why"]
     # UNCERTAIN retains the in-progress fence; never consumed
-    assert (state / "retro-diag" / re_mod.IN_PROGRESS_FILE).exists()
-    assert not (state / "retro-diag" / re_mod.CONSUMED_FILE).exists()
+    assert (state / re_mod.REQUEST_DIR / re_mod.IN_PROGRESS_FILE).exists()
+    assert not (state / re_mod.REQUEST_DIR / re_mod.CONSUMED_FILE).exists()
 
 
 def test_regression_exception_before_normal_proof(tmp_path, monkeypatch):
@@ -725,9 +725,9 @@ def test_regression_dead_leader_live_group_orphan(tmp_path, monkeypatch):
         # no blind kill of the unverifiable orphan: still alive here
         assert orphan.poll() is None
         # fence and artifacts retained, never consumed
-        assert (state / "retro-diag"
+        assert (state / re_mod.REQUEST_DIR
                 / re_mod.IN_PROGRESS_FILE).exists()
-        assert not (state / "retro-diag"
+        assert not (state / re_mod.REQUEST_DIR
                     / re_mod.CONSUMED_FILE).exists()
     finally:
         try:
@@ -950,3 +950,11 @@ def test_regression_service_loop_shutdown_event_path(tmp_path, monkeypatch):
     assert req.exists(), "request must be preserved when stopping"
     assert not (state / re_mod.REQUEST_DIR / re_mod.CLAIM_FENCE).exists(), \
         "no claim may happen once the stop event is set"
+
+
+def test_regression_generation2_control_root():
+    """Generation boundary: the g2 control root must differ from the
+    cancelled g1 root so a recovery run never touches the preserved
+    fences, and the diag workdir name follows the request id."""
+    assert re_mod.REQUEST_DIR == "retro-diag-g2"
+    assert re_mod.REQUEST_DIR != "retro-diag"

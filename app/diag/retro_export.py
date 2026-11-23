@@ -31,7 +31,11 @@ from pathlib import Path
 
 from ..bot import restartproof as rp
 
-REQUEST_DIR = "retro-diag"
+# Generation 2 control root: the g1 root holds the cancelled
+# generation (CANCEL + CONSUMED fences) preserved byte-for-byte as
+# evidence. A fresh root is the only recovery that neither resets
+# nor weakens those fences; cancellation semantics are unchanged.
+REQUEST_DIR = "retro-diag-g2"
 REQUEST_FILE = "request.json"
 CLAIMED_DIR = "claimed"
 CLAIM_FENCE = "CLAIM-FENCE"
