@@ -4,8 +4,9 @@ Runs in its own process so the parent can enforce an absolute deadline and
 cancellation by killing the process group, covering DNS, connect, TLS,
 headers and body reads (none of which urllib can bound in total). Request
 comes on stdin as JSON {url, method, data(base64, optional), headers, limit, timeout} so a signed URL never
-appears in an argument list. Output on stdout: 4-byte big-endian status then
-the body (at most limit+1 bytes read; the parent detects overflow). Exit
+appears in an argument list. Output on stdout: 4-byte big-endian status,
+8-byte signed declared Content-Length (-1 when unknown), then the body (at
+most limit+1 bytes read; the parent detects overflow and truncation). Exit
 code 2 on any error, with no message text (nothing external is echoed).
 """
 import json
@@ -65,7 +66,26 @@ def main() -> int:
             status, cap = r.status, limit + 1
         except urllib.error.HTTPError as e:
             r, status, cap = e, e.code, 4096
-        out.write(struct.pack(">I", status)); out.flush()
+        # Declared body length for the parent's completeness check, as a
+        # fixed 8-byte signed value. -1 (unknown) whenever the value cannot
+        # govern the decoded body: Transfer-Encoding present (it overrides
+        # Content-Length and http.client decodes it), Content-Length
+        # absent, unparsable, negative, or beyond the packable/usable
+        # range. An invalid CL must never break framing or mask the real
+        # status. The parent can only compare the DECODED body against the
+        # declared length - bytes urllib consumes invisibly are beyond
+        # detection.
+        declared = -1
+        if not r.headers.get("Transfer-Encoding"):
+            cl = r.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    n = int(cl)
+                except (TypeError, ValueError):
+                    n = -1
+                if 0 <= n < (1 << 62):
+                    declared = n
+        out.write(struct.pack(">Iq", status, declared)); out.flush()
         n = 0
         while n < cap:
             b = r.read1(min(65536, cap - n)) if hasattr(r, "read1") else r.read(min(65536, cap - n))

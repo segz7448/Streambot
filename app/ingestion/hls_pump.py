@@ -52,6 +52,21 @@ class PumpResult:
     stderr_tail: str     # redacted, bounded
 
 
+def _expected_stop(e, should_stop, clock, t_end):
+    """A fetch refusal caused by the caller's OWN bounded stop is not a
+    failure: window expiry or an owner stop landing mid-fetch ends the
+    cycle cleanly with the media already piped, never as a transient
+    error. Mapped ONLY when the condition genuinely holds right now - an
+    unexplained cancellation/deadline refusal still propagates.
+    Returns the clean cycle reason or None."""
+    transport = getattr(e, "transport", None)
+    if transport == "cancelled" and should_stop():
+        return "stopped"
+    if transport == "deadline" and clock() >= t_end:
+        return "deadline"
+    return None
+
+
 def _fetch(url, opener, host_ok, timeout, limit, deadline, should_stop,
            stage=None):
     # stage tags any refusal with WHERE in the capture pipe it happened
@@ -193,7 +208,10 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
             output_args=None, pre_spawn=None, on_spawn=None) -> PumpResult:
     """Capture to out_path (single MPEG-TS file), or pass ``output_args``
     (list placed after the input, ending in the output target) for e.g. a
-    segmenter. ``should_stop()`` is polled before every request and write."""
+    segmenter. ``should_stop()`` is polled before every request and write.
+    An expected bounded stop (should_stop / capture deadline) landing
+    MID-FETCH still ends the cycle cleanly (reason stopped/deadline) with
+    already-piped media preserved; only unexplained refusals raise."""
     if not (0 < max_media_seconds <= 3600) or not (0 < deadline_sec <= 7200):
         raise ValueError("limits out of range")
     op = opener or tp.default_opener
@@ -262,6 +280,9 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
             except tp.PlaybackRefused as e:
                 if e.kind == "offline" and segs_n:
                     reason = "ended"; break
+                stop_reason = _expected_stop(e, should_stop, clock, t_end)
+                if stop_reason is not None:
+                    reason = stop_reason; break
                 raise
             segs, end, target = parse_media(text, base)
             if first and segs and not end:
@@ -278,6 +299,10 @@ def capture(resolved: tp.Resolved, ffmpeg: str, out_path: str, *,
                     if e.kind == "offline":      # expired segment: skip
                         next_seq = seq + 1
                         continue
+                    stop_reason = _expected_stop(e, should_stop, clock, t_end)
+                    if stop_reason is not None:
+                        reason = stop_reason
+                        break
                     raise
                 try:
                     _write(proc, blob, t_end, clock, should_stop)

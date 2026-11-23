@@ -18,6 +18,7 @@ These tests use the REAL fetch child process against a local server.
 import http.server
 import threading
 import time
+from unittest import mock
 import urllib.request
 import unittest
 
@@ -33,7 +34,49 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/trickle":
+        if self.path == "/cl-truncated":
+            self.send_response(200)
+            self.send_header("Content-Length", "10000")
+            self.end_headers()
+            try:
+                self.wfile.write(b"\x47" * 100)  # 100 of 10000, then close
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif self.path == "/cl-exact":
+            self.send_response(200)
+            self.send_header("Content-Length", "500")
+            self.end_headers()
+            self.wfile.write(b"\x47" * 500)
+        elif self.path == "/cl-truncated-403":
+            self.send_response(403)
+            self.send_header("Content-Length", "10000")
+            self.end_headers()
+            self.wfile.write(b"denied")
+        elif self.path == "/te-chunked-with-cl":
+            # Transfer-Encoding governs; the contradictory CL must be
+            # ignored - the decoded body is complete
+            body = b"\x47" * 6
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Content-Length", "99")
+            self.end_headers()
+            self.wfile.write(b"%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n")
+        elif self.path == "/cl-absurd":
+            self.send_response(200)
+            self.send_header("Content-Length", "99999999999999999999999")
+            self.end_headers()
+            self.wfile.write(b"\x47" * 5)
+        elif self.path == "/cl-absurd-403":
+            self.send_response(403)
+            self.send_header("Content-Length", "99999999999999999999999")
+            self.end_headers()
+            self.wfile.write(b"denied")
+        elif self.path == "/cl-negative":
+            self.send_response(200)
+            self.send_header("Content-Length", "-5")
+            self.end_headers()
+            self.wfile.write(b"\x47" * 5)
+        elif self.path == "/trickle":
             self.send_response(200)
             self.send_header("Content-Type", "video/mp2t")
             self.end_headers()
@@ -158,9 +201,163 @@ class FetchDeadlineTests(unittest.TestCase):
         self.assertEqual(res.segments, 1)
         self.assertEqual(res.bytes_written, CHUNK * CHUNKS)
 
+    def test_truncated_content_length_refused_not_partial(self):
+        # advertised 10000, delivered 100: must refuse, never return media
+        with self.assertRaises(tp.PlaybackRefused) as cm:
+            self._get("/cl-truncated", 5.0, time.monotonic() + 10)
+        self.assertEqual(cm.exception.transport, "truncated")
+
+    def test_exact_content_length_accepted(self):
+        code, body = self._get("/cl-exact", 5.0, time.monotonic() + 10)
+        self.assertEqual((code, body), (200, b"\x47" * 500))
+
+    def test_chunked_with_contradictory_cl_accepted(self):
+        # Transfer-Encoding governs: 6 decoded bytes with CL:99 is complete
+        code, body = self._get("/te-chunked-with-cl", 5.0,
+                               time.monotonic() + 10)
+        self.assertEqual((code, body), (200, b"\x47" * 6))
+
+    def test_absurd_cl_treated_as_unknown_status_preserved(self):
+        # un packable/unusable CL must not break framing or mask status
+        code, body = self._get("/cl-absurd", 5.0, time.monotonic() + 10)
+        self.assertEqual((code, body), (200, b"\x47" * 5))
+        code, body = self._get("/cl-absurd-403", 5.0, time.monotonic() + 10)
+        self.assertEqual((code, body), (403, b"denied"))
+
+    def test_negative_cl_treated_as_absent(self):
+        code, body = self._get("/cl-negative", 5.0, time.monotonic() + 10)
+        self.assertEqual((code, body), (200, b"\x47" * 5))
+
+    def test_truncated_error_page_keeps_http_classification(self):
+        # completeness is enforced on media-carrying 200s only; a short
+        # error page still surfaces its HTTP status for kind mapping
+        code, body = self._get("/cl-truncated-403", 5.0,
+                               time.monotonic() + 10)
+        self.assertEqual((code, body), (403, b"denied"))
+
     def test_fast_request_unchanged(self):
         code, body = self._get("/fast", 5.0, time.monotonic() + 30)
         self.assertEqual((code, body), (200, b"\x47" * CHUNK))
+
+
+class ExpectedStopTests(unittest.TestCase):
+    """Session 8 semantics: the bounded acceptance window expiring (or an
+    owner stop) MID-FETCH is an expected stop, not a network failure. The
+    cycle must end cleanly (stopped/deadline) with already-piped media
+    preserved; unexplained cancellations still raise."""
+
+    def _capture(self, opener, should_stop=lambda: False, clock=None):
+        import os
+        import stat
+        import tempfile
+        import types
+        from app.ingestion import hls_pump
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        fake_ff = os.path.join(td.name, "fake-ffmpeg")
+        with open(fake_ff, "w") as f:
+            f.write("#!" + os.sys.executable + "\n"
+                    "import sys\n"
+                    "open(sys.argv[-1], 'wb').write(sys.stdin.buffer.read())\n")
+        os.chmod(fake_ff, os.stat(fake_ff).st_mode | stat.S_IXUSR)
+        resolved = types.SimpleNamespace(
+            ffmpeg_input=lambda: "https://cdn.example/pl.m3u8")
+        kw = dict(max_media_seconds=1500, deadline_sec=25, opener=opener,
+                  host_ok=lambda h: True, timeout=1.0, output_args=None,
+                  grace=1.0, sleep=lambda s: None, should_stop=should_stop)
+        if clock is not None:
+            kw["clock"] = clock
+        return hls_pump.capture(resolved, fake_ff,
+                                os.path.join(td.name, "out.ts"), **kw)
+
+    def test_cancel_mid_playlist_refetch_is_clean_stop(self):
+        from app.ingestion import twitch_playback as tp
+        state = {"playlists": 0, "stop": False}
+        playlist = ("#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
+                    "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\nseg-0.ts\n")
+
+        def op(req, timeout, limit, deadline, should_stop):
+            if req.full_url.endswith(".ts"):
+                return 200, b"\x47" * 1000
+            state["playlists"] += 1
+            if state["playlists"] == 1:
+                return 200, playlist.encode()
+            # the window expires DURING the refetch (child-side cancel)
+            state["stop"] = True
+            raise tp.PlaybackRefused("error", "cancelled",
+                                     transport="cancelled")
+        res = self._capture(op, should_stop=lambda: state["stop"])
+        self.assertEqual(res.reason, "stopped")
+        self.assertEqual(res.segments, 1)
+        self.assertEqual(res.bytes_written, 1000)
+
+    def test_cancel_mid_segment_fetch_is_clean_stop(self):
+        from app.ingestion import twitch_playback as tp
+        state = {"stop": False}
+        playlist = ("#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
+                    "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\nseg-0.ts\n"
+                    "#EXTINF:2.0,\nseg-1.ts\n")
+
+        def op(req, timeout, limit, deadline, should_stop):
+            if req.full_url.endswith("seg-0.ts"):
+                return 200, b"\x47" * 1000
+            if req.full_url.endswith("seg-1.ts"):
+                state["stop"] = True
+                raise tp.PlaybackRefused("error", "cancelled",
+                                         transport="cancelled")
+            return 200, playlist.encode()
+        res = self._capture(op, should_stop=lambda: state["stop"])
+        self.assertEqual(res.reason, "stopped")
+        self.assertEqual(res.segments, 1)
+        self.assertEqual(res.bytes_written, 1000)
+
+    def test_unexplained_cancel_still_raises(self):
+        from app.ingestion import twitch_playback as tp
+
+        def op(req, timeout, limit, deadline, should_stop):
+            raise tp.PlaybackRefused("error", "cancelled",
+                                     transport="cancelled")
+        with self.assertRaises(tp.PlaybackRefused):
+            self._capture(op, should_stop=lambda: False)
+
+    def test_mid_fetch_deadline_maps_only_when_window_expired(self):
+        from app.ingestion import twitch_playback as tp
+        now = [1000.0]
+
+        def op(req, timeout, limit, deadline, should_stop):
+            now[0] = 1026.0     # past t_end = 1000 + deadline_sec(25)
+            raise tp.PlaybackRefused("error", "deadline reached",
+                                     transport="deadline")
+        res = self._capture(op, clock=lambda: now[0],
+                            should_stop=lambda: False)
+        # capture's own deadline really passed -> clean deadline outcome
+        self.assertEqual(res.reason, "deadline")
+        self.assertEqual(res.segments, 0)
+
+        now2 = [1000.0]
+
+        def op2(req, timeout, limit, deadline, should_stop):
+            raise tp.PlaybackRefused("error", "deadline reached",
+                                     transport="deadline")
+        # window NOT expired: an unexplained deadline refusal propagates
+        with self.assertRaises(tp.PlaybackRefused):
+            self._capture(op2, clock=lambda: now2[0],
+                          should_stop=lambda: False)
+
+    def test_single_cycle_stopped_outcome_ends_clean_with_media(self):
+        import asyncio
+        import types
+        from app.ingestion import hls_pump
+        from tests.unit.test_capture_diagnostics import _worker
+        w = _worker()
+        w.buffer.reconcile.return_value = 0
+        w.buffer.enforce_storage_cap.return_value = None
+        w._cycle = mock.Mock(return_value="stopped")
+        w._closed_media_ready = lambda: False
+        ctx = types.SimpleNamespace(stopping=False, heartbeat=lambda: None)
+        asyncio.run(w.run(ctx))          # no error: expected bounded stop
+        self.assertEqual(w.end_reason, "single_cycle_complete")
+        self.assertIsNone(w.error_text)
 
 
 if __name__ == "__main__":

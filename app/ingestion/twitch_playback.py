@@ -54,7 +54,7 @@ _QUERY = ("query PlaybackAccessToken($login: String!, $isLive: Boolean!, "
 REFUSAL_STAGES = frozenset({"token", "playlist", "segment", "spawn", "pipe"})
 TRANSPORTS = frozenset({"http", "timeout", "dns", "refused", "tls",
                         "connect", "reset", "too_large", "parse", "spawn",
-                        "deadline", "cancelled", "other"})
+                        "deadline", "cancelled", "truncated", "other"})
 _CHILD_CLASSES = {1: "timeout", 2: "dns", 3: "refused", 4: "tls",
                   5: "reset", 6: "connect"}
 
@@ -178,7 +178,7 @@ def default_opener(req: urllib.request.Request, timeout: float,
                     break
                 buf.extend(b)
                 last_progress = time.monotonic()
-                if len(buf) > 4 + limit + 4096 and len(buf) > 4 + limit:
+                if len(buf) > 12 + limit + 4096 and len(buf) > 12 + limit:
                     why = "response too large"; break
         if why is None:
             try:
@@ -210,12 +210,18 @@ def default_opener(req: urllib.request.Request, timeout: float,
             if status0 == 0:
                 transport = _CHILD_CLASSES.get(cls, "other")
         raise PlaybackRefused("error", "network error", transport=transport)
-    if len(buf) < 4:
+    if len(buf) < 12:
         raise PlaybackRefused("error", "network error", transport="other")
-    status = struct.unpack(">I", bytes(buf[:4]))[0]
-    body = bytes(buf[4:])
+    status, declared = struct.unpack(">Iq", bytes(buf[:12]))
+    body = bytes(buf[12:])
     if status == 200 and len(body) > limit:
         raise PlaybackRefused("error", "response too large", transport="too_large")
+    if status == 200 and declared >= 0 and len(body) != declared:
+        # exact Content-Length completeness: a short read is a refused
+        # partial, never silently accepted media. Chunked/close-delimited
+        # responses (declared == -1) are legitimate and unchecked.
+        raise PlaybackRefused("error", "truncated response",
+                              transport="truncated")
     return status, body
 
 
