@@ -182,7 +182,9 @@ class MediaPathTests(unittest.TestCase):
                 {"src": src, "work": work, "db": db,
                  "source_label": source_label})
             return {
-                "status": "ok", "event_kind": "audio_spike",
+                # production status contract: process_recording reports
+                # "held" for a produced clip ("ok" never occurs there)
+                "status": "held", "event_kind": "audio_spike",
                 "event_confidence": 0.9,
                 "clip_duration_seconds": 24.0,
                 "plan": {"preset": "vertical",

@@ -172,3 +172,47 @@ class DeliveryJournalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoClipStatusTruthTests(unittest.TestCase):
+    def test_below_score_gate_summary_never_claims_clip(self):
+        from app.bot import media
+        result = {"status": "below_score_gate", "best_score": 0.412,
+                  "candidates": 1}
+        text = media._summarize(result)
+        self.assertIn("No clip was created", text)
+        self.assertNotIn("Clip ready", text)
+        self.assertIn("0.412", text)
+
+    def test_unknown_status_summary_never_claims_clip(self):
+        from app.bot import media
+        text = media._summarize({"status": "some_future_status"})
+        self.assertIn("no clip was created", text.lower())
+        self.assertNotIn("Clip ready", text)
+
+    def test_scoring_failed_summary_truthful(self):
+        from app.bot import media
+        text = media._summarize({"status": "scoring_failed",
+                                 "detail": "candidate scoring failed (RuntimeError)"})
+        self.assertIn("scoring failed", text.lower())
+        self.assertNotIn("Clip ready", text)
+
+    def test_handler_reports_gate_rejection_truthfully(self):
+        # handler-level: process_recording returning below_score_gate
+        # must surface a no-clip outcome, never a clip-ready claim
+        from app.bot import media
+        from app.clipping import retrospective as r
+        orig_pr, orig_vr = r.process_recording, r.validate_recording
+        r.process_recording = lambda *a, **k: {
+            "status": "below_score_gate", "best_score": 0.58,
+            "candidates": 2, "source": "owner-upload:7"}
+        r.validate_recording = lambda *a, **k: {"duration": 60.0}
+        try:
+            d = pathlib.Path(tempfile.mkdtemp())
+            payload = b"\x00\x00\x00\x18ftypmp42fake"
+            out = asyncio.run(media.ingest_media(
+                _update(7, file_size=len(payload)), FakeBot(payload), d))
+        finally:
+            r.process_recording, r.validate_recording = orig_pr, orig_vr
+        self.assertIn("No clip was created", out)
+        self.assertNotIn("Clip ready", out)

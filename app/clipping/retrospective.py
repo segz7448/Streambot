@@ -14,6 +14,7 @@ override the derived duration.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 import time
 from pathlib import Path
@@ -25,7 +26,45 @@ from ..detection import audio, visual
 from ..editing.editor import edit_clip
 from ..editing.presets import PRESETS
 from ..intelligence.planner import plan_clip
+from ..intelligence.providers import HeuristicProvider
 from ..qc.verify import check_media, probe
+
+
+def _default_score(duration_seconds, spikes, scenes):
+    """Heuristic scoring parity with the live path (clipping/auto.py):
+    the same HeuristicProvider fusion - a scene change alone scores
+    0.5*score and can only boost an audio spike at the SAME timestamp,
+    never trigger alone. This is heuristic parity ONLY: a configured
+    remote/paid provider is deliberately never wired in here."""
+    return HeuristicProvider().score_moments(duration_seconds, spikes,
+                                             scenes)
+
+
+def _validated_moments(moments, duration_seconds):
+    """score_fn output contract: keep only moments with a finite score
+    in [0, 1] and a finite timestamp inside [0, duration]; re-sorted by
+    score descending. A non-finite or non-positive duration rejects the
+    whole batch rather than silently widening the accepted range."""
+    if not (isinstance(duration_seconds, (int, float))
+            and not isinstance(duration_seconds, bool)
+            and math.isfinite(duration_seconds) and duration_seconds > 0):
+        return []
+    out = []
+    for m in moments:
+        score = getattr(m, "score", None)
+        ts = getattr(m, "timestamp", None)
+        if (not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or not math.isfinite(score)
+                or not (0.0 <= score <= 1.0)):
+            continue
+        if (not isinstance(ts, (int, float))
+                or isinstance(ts, bool)
+                or not math.isfinite(ts)
+                or not (0.0 <= ts <= duration_seconds)):
+            continue
+        out.append(m)
+    return sorted(out, key=lambda m: m.score, reverse=True)
 
 log = get_logger("clipping.retrospective")
 
@@ -73,8 +112,8 @@ def validate_recording(ffprobe: str, src: str,
         duration = float(meta.get("format", {}).get("duration", 0) or 0)
     except (TypeError, ValueError):
         duration = 0.0
-    if duration <= 0:
-        raise ValidationError("duration unknown")
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValidationError("duration unknown or not finite")
     if duration > max_seconds:
         raise ValidationError(
             f"duration {duration:.0f}s above {max_seconds:.0f}s limit")
@@ -130,7 +169,9 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
                       qc_fn: Callable = check_media,
                       validate_fn: Callable = validate_recording,
                       runtime_dir: str = ".nova-runtime",
-                      final_probe_fn: Callable = probe) -> dict:
+                      final_probe_fn: Callable = probe,
+                      min_score: float = 0.6,
+                      score_fn: Callable = _default_score) -> dict:
     """Run detect -> size -> plan -> extract -> edit -> QC over a local
     recording. Returns an evidence dict; never fabricates a clip: when
     no candidate is detected the result says so and nothing is
@@ -139,8 +180,21 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     work.mkdir(parents=True, exist_ok=True)
     # fail closed: validation runs even when the caller claims to have
     # validated (defense in depth; the probe disables network protocols)
-    validate_fn(ffprobe, src_path)
+    media_info = validate_fn(ffprobe, src_path)
     result: dict = {"source": source_label, "src": src_path}
+    try:
+        validated_seconds = float(
+            media_info.get("duration", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        raise ValidationError(
+            "validate_fn returned a non-numeric duration: %r"
+            % (media_info.get("duration"),))
+    if not math.isfinite(validated_seconds) or validated_seconds <= 0:
+        # reject: a NaN/inf/non-positive duration must not be normalized
+        # to 0 (which used to disable timestamp bounds below)
+        raise ValidationError(
+            "validate_fn returned a non-finite or non-positive "
+            "duration: %r" % (media_info.get("duration"),))
 
     try:
         samples = audio_fn(ffmpeg, src_path)
@@ -168,9 +222,39 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
                             "no clip extracted (nothing fabricated)")
         return result
 
-    best = max(candidates, key=lambda c: c["conf"])
+    # Shared score/gate contract with the live path: the SAME provider
+    # fusion and the SAME min_score gate decide here. Pre-fix, retro
+    # picked the raw max-conf candidate with no gate, so a standalone
+    # scene_change (raw 0.825) was extracted while the live path
+    # rejected the identical event at its fused 0.41.
+    try:
+        scored = _validated_moments(
+            score_fn(validated_seconds, spikes, scenes),
+            validated_seconds)
+    except Exception as exc:
+        # explicit no-score outcome; NEVER a fallback to raw-confidence
+        # picking (that is the pre-fix behavior this gate replaces)
+        result["status"] = "scoring_failed"
+        result["detail"] = ("candidate scoring failed (%s) - no clip "
+                            "extracted; no fallback scoring"
+                            % type(exc).__name__)
+        return result
+    if not scored or scored[0].score < min_score:
+        result["status"] = "below_score_gate"
+        result["detail"] = ("best fused score %s below min_score %s - "
+                            "no clip extracted (same gate as live path)"
+                            % (round(scored[0].score, 3) if scored else
+                               "none", min_score))
+        result["best_score"] = (round(scored[0].score, 3)
+                                if scored else None)
+        return result
+    best_moment = scored[0]
+    best = {"kind": ("audio_spike" if "audio_spike" in best_moment.reasons
+                     else "scene_change"),
+            "t": best_moment.timestamp, "conf": best_moment.score}
     result["event_kind"] = best["kind"]
     result["event_confidence"] = round(best["conf"], 3)
+    result["event_reasons"] = list(best_moment.reasons)
     if best["kind"] == "audio_spike":
         start, window = content_window(samples, best["t"])
     else:

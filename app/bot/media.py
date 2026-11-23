@@ -132,6 +132,19 @@ def _summarize(result: dict, delivery: dict | None = None) -> str:
                 f"({result.get('event_kind')}) but the edited clip failed "
                 f"quality checks ({result.get('detail', 'unknown')}). "
                 "Nothing was delivered.")
+    if status == "below_score_gate":
+        return ("Processed your video: detected moments scored below "
+                f"the clipping gate (best score "
+                f"{result.get('best_score')}). No clip was created - "
+                "I won't fabricate one.")
+    if status == "scoring_failed":
+        return ("Processed your video: moment scoring failed "
+                f"({result.get('detail', 'unknown error')}). "
+                "No clip was created.")
+    if status != "held":
+        # never claim a clip for a status we do not positively know
+        return ("Processed your video: no clip was created "
+                f"(outcome: {status or 'unknown'}).")
     plan = result.get("plan", {})
     reasons = plan.get("reasons", [])
     lines = [

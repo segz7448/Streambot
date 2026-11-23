@@ -243,3 +243,127 @@ class GeneratedAdmissionCycleTests(unittest.TestCase):
         # atomic: no stranded HELD clip and no orphan admission job
         self.assertEqual(clips, 0)
         self.assertEqual(jobs_n, 0)
+
+
+class ScoreGateTests(unittest.TestCase):
+    """Shared score/gate contract: retro must apply the same provider
+    fusion + min_score gate as the live path (clipping/auto.py)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        (self.dir / "src.mp4").write_bytes(b"fake")
+        self.mem = Memory(str(self.dir / "memory.json"))
+
+    def _run(self, samples, scenes=(), **over):
+        args = dict(
+            ffmpeg="ff", ffprobe="fp", src_path=str(self.dir / "src.mp4"),
+            work_dir=str(self.dir / "work"), db_path=str(self.dir / "n.db"),
+            memory=self.mem,
+            audio_fn=lambda ff, p: samples,
+            scene_fn=lambda ff, p: list(scenes),
+            extract_fn=lambda ff, s, o, st, d: Path(o).write_bytes(b"x" * 20000) or Path(o),
+            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None, framing=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
+            qc_fn=lambda fp, ff, p, a, b, c, d: type("QC", (), {"ok": True, "failures": []})(),
+            validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,
+                                       "height": 240},
+        )
+        args.update(over)
+        return retrospective.process_recording(**args)
+
+    @staticmethod
+    def _quiet(n=100):
+        return [LoudnessSample(i * 0.1, -45.0) for i in range(n)]
+
+    @staticmethod
+    def _spike(level, t0=5.0, n=100):
+        return [LoudnessSample(i * 0.1,
+                               level if t0 <= i * 0.1 <= t0 + 3.0 else -45.0)
+                for i in range(n)]
+
+    def test_scene_only_below_gate_extracts_nothing(self):
+        # W11 evidence: standalone scene 0.825 fused to 0.4125 < 0.6
+        result = self._run(self._quiet(), scenes=[(5.0, 0.825)])
+        self.assertEqual(result["status"], "below_score_gate")
+        self.assertEqual(result["best_score"], 0.412)
+        self.assertNotIn("event_kind", result)
+
+    def test_audio_spike_below_gate_extracts_nothing(self):
+        # spike to -25.4 LUFS -> conf 0.577 < 0.6
+        result = self._run(self._spike(-25.4))
+        self.assertEqual(result["status"], "below_score_gate")
+        self.assertNotIn("event_kind", result)
+
+    def test_audio_spike_above_gate_held(self):
+        result = self._run(_samples())
+        self.assertEqual(result["status"], "held")
+        self.assertEqual(result["event_kind"], "audio_spike")
+
+    def test_scene_boosts_audio_over_gate(self):
+        # audio 0.5 + scene 0.4 at same ts -> fused 0.7 >= 0.6
+        result = self._run(self._spike(-30.0), scenes=[(5.0, 0.4)])
+        self.assertEqual(result["status"], "held")
+        self.assertEqual(result["event_kind"], "audio_spike")
+        self.assertIn("scene_change", result["event_reasons"])
+        self.assertGreaterEqual(result["event_confidence"], 0.69)
+
+    def test_min_score_parameter_respected(self):
+        result = self._run(self._spike(-25.4), min_score=0.5)
+        self.assertEqual(result["status"], "held")
+
+    def test_scoring_failure_is_explicit_no_fallback(self):
+        def boom(dur, spikes, scenes):
+            raise RuntimeError("provider exploded")
+        result = self._run(_samples(), score_fn=boom)
+        self.assertEqual(result["status"], "scoring_failed")
+        self.assertNotIn("event_kind", result)
+
+    def test_out_of_contract_moments_filtered(self):
+        from app.intelligence.providers import ScoredMoment
+        result = self._run(_samples(), score_fn=lambda d, s, c: [
+            ScoredMoment(5.0, 1.5, ("audio_spike",)),      # score > 1
+            ScoredMoment(500.0, 0.9, ("audio_spike",)),    # beyond duration
+            ScoredMoment(6.0, float("nan"), ("audio_spike",)),
+            ScoredMoment(float("nan"), 0.9, ("audio_spike",)),  # NaN ts
+        ])
+        self.assertEqual(result["status"], "below_score_gate")
+        self.assertIsNone(result["best_score"])
+
+    def test_score_fn_receives_validated_duration(self):
+        seen = {}
+        def spy(dur, spikes, scenes):
+            seen["dur"] = dur
+            return []
+        result = self._run(_samples(), score_fn=spy)
+        self.assertEqual(result["status"], "below_score_gate")
+        self.assertEqual(seen["dur"], 60.0)   # from validate_fn fake
+
+    def test_real_validator_rejects_nan_duration(self):
+        # regression: NaN slips `duration <= 0` and `duration > max`
+        # comparisons, so validate_recording used to accept it
+        orig = retrospective.probe
+        retrospective.probe = lambda fp, p: {
+            "format": {"format_name": "mp4", "duration": "nan"},
+            "streams": [{"codec_type": "video",
+                         "width": 320, "height": 240}]}
+        try:
+            with self.assertRaises(retrospective.ValidationError):
+                retrospective.validate_recording("fp", "p")
+        finally:
+            retrospective.probe = orig
+
+    def test_invalid_duration_from_injected_validator_rejected(self):
+        # defense in depth: an invalid duration from validate_fn must
+        # fail closed, never normalize to 0 and disable bounds
+        for bad in (float("nan"), float("inf"), 0.0, -5.0, "soon"):
+            with self.assertRaises(retrospective.ValidationError):
+                self._run(_samples(),
+                          validate_fn=lambda fp, p, _b=bad: {
+                              "duration": _b, "width": 320,
+                              "height": 240})
+
+    def test_validated_moments_rejects_nonfinite_or_nonpositive_duration(self):
+        from app.intelligence.providers import ScoredMoment
+        m = [ScoredMoment(5.0, 0.9, ("audio_spike",))]
+        for bad in (float("nan"), float("inf"), 0.0, -10.0, "60", True):
+            self.assertEqual(
+                retrospective._validated_moments(m, bad), [])
