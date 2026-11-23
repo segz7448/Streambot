@@ -40,20 +40,45 @@ def _escape_drawtext(text: str) -> str:
     return t
 
 
+def full_frame_filter(preset: OutputPreset) -> str:
+    """Content-preserving representation: NO source pixel is cropped.
+    The full frame is scaled to the preset width and centered on the
+    preset canvas over a blurred fill derived from the same frame
+    (deterministic, no vision, no per-source layout assumption). For a
+    16:9 source into the vertical preset this keeps overlays that a
+    center crop discards (e.g. a corner facecam), at the cost of a
+    smaller active picture; the canvas is still an upscale of the
+    source, never new detail."""
+    return (
+        f"split=2[src_bg][src_fg];"
+        f"[src_bg]scale={preset.width}:{preset.height}:"
+        f"force_original_aspect_ratio=increase:force_divisible_by=2,"
+        f"crop={preset.width}:{preset.height},boxblur=20:2[bg];"
+        f"[src_fg]scale={preset.width}:-2[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
+    )
+
+
 def build_filter_graph(preset: OutputPreset,
                        subtitle_path: str | None = None,
                        focus_x: float = 0.5,
-                       watermark: str | None = None) -> str:
-    """Video filter chain. focus_x shifts the crop window (0=left, 1=right);
-    centered by default. Subtitles are burned last so they render at output
-    resolution. An owner watermark is drawn bottom-right via drawtext."""
-    target_ar = preset.width / preset.height
-    x_expr = (f"'if(gt(a,{target_ar:.6f}),(iw-ih*{target_ar:.6f})*{focus_x:.3f},0)'")
-    chain = (
-        f"crop=w='if(gt(a,{target_ar:.6f}),ih*{target_ar:.6f},iw)'"
-        f":h='if(gt(a,{target_ar:.6f}),ih,iw/{target_ar:.6f})':x={x_expr}:y=0,"
-        f"scale={preset.width}:{preset.height}"
-    )
+                       watermark: str | None = None,
+                       framing: str = "crop") -> str:
+    """Video filter chain. framing="crop" center-crops to the preset
+    aspect (focus_x shifts the window: 0=left, 1=right); framing="full"
+    preserves every source pixel via full_frame_filter. Subtitles are
+    burned last so they render at output resolution. An owner watermark
+    is drawn bottom-right via drawtext."""
+    if framing == "full":
+        chain = full_frame_filter(preset)
+    else:
+        target_ar = preset.width / preset.height
+        x_expr = (f"'if(gt(a,{target_ar:.6f}),(iw-ih*{target_ar:.6f})*{focus_x:.3f},0)'")
+        chain = (
+            f"crop=w='if(gt(a,{target_ar:.6f}),ih*{target_ar:.6f},iw)'"
+            f":h='if(gt(a,{target_ar:.6f}),ih,iw/{target_ar:.6f})':x={x_expr}:y=0,"
+            f"scale={preset.width}:{preset.height}"
+        )
     if watermark:
         chain += (",drawtext=text='" + _escape_drawtext(watermark) +
                   "':x=w-text_w-24:y=h-text_h-24:fontsize=36"
@@ -66,10 +91,11 @@ def build_filter_graph(preset: OutputPreset,
 
 def edit_args(ffmpeg: str, src: str, out: str, preset: OutputPreset,
               subtitle_path: str | None = None, focus_x: float = 0.5,
-              loudnorm: bool = True, watermark: str | None = None) -> list[str]:
+              loudnorm: bool = True, watermark: str | None = None,
+              framing: str = "crop") -> list[str]:
     args = [ffmpeg, "-y", "-i", src,
             "-vf", build_filter_graph(preset, subtitle_path, focus_x,
-                                      watermark),
+                                      watermark, framing),
             "-c:v", "libx264", "-preset", "veryfast",
             "-crf", str(preset.video_crf), "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", preset.audio_bitrate,
@@ -195,7 +221,8 @@ def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
               subtitle_path: str | None = None, focus_x: float = 0.5,
               runtime_dir: str = ".nova-runtime",
               watermark: str | None = None,
-              pre_spawn=None, on_spawn=None) -> Path:
+              pre_spawn=None, on_spawn=None,
+              framing: str = "crop") -> Path:
     env = dict(os.environ)
     if subtitle_path or watermark:
         # drawtext and libass both resolve fonts through fontconfig;
@@ -211,7 +238,7 @@ def edit_clip(ffmpeg: str, src: str, out: str, preset: OutputPreset,
         raise SpawnRefused("edit spawn intent not recordable; not spawning")
     proc = subprocess.Popen(
         edit_args(ffmpeg, src, out, preset, subtitle_path, focus_x,
-                  watermark=watermark),
+                  watermark=watermark, framing=framing),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
         start_new_session=True)
     if on_spawn is not None:

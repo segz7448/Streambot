@@ -33,6 +33,25 @@ class PresetTests(unittest.TestCase):
         self.assertIn("*0.000", left)
         self.assertIn("*1.000", right)
 
+    def test_full_framing_preserves_all_source_pixels(self):
+        g = build_filter_graph(VERTICAL, framing="full")
+        # no blind crop of the source: the foreground branch only
+        # scales the full frame; the crop applies to the blurred
+        # background fill only
+        self.assertIn("split=2", g)
+        self.assertIn("[src_fg]scale=1080:-2[fg]", g)
+        self.assertIn("overlay=(W-w)/2:(H-h)/2", g)
+        self.assertNotIn("[src_fg]crop", g)
+
+    def test_full_framing_threads_through_edit_args(self):
+        args = edit_args("ffmpeg", "in.mp4", "out.mp4", VERTICAL,
+                         framing="full")
+        self.assertIn("split=2", args[args.index("-vf") + 1])
+
+    def test_default_framing_unchanged(self):
+        self.assertEqual(build_filter_graph(VERTICAL),
+                         build_filter_graph(VERTICAL, framing="crop"))
+
     def test_edit_args_full(self):
         args = edit_args("ffmpeg", "in.mp4", "out.mp4", HORIZONTAL)
         self.assertIn("libx264", args)
