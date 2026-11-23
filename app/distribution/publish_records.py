@@ -27,7 +27,33 @@ CREATE TABLE IF NOT EXISTS publish_records (
     updated_at REAL NOT NULL,
     attempt_token TEXT
 );
+-- Daily upload-START budget ledger: one durable row per (local day,
+-- clip). This is a conservative count of distinct clip upload STARTS
+-- per reserve-day, NOT proven successful publications per finish-day;
+-- a midnight-spanning upload is charged to its start day. source_key
+-- is written once at first charge and never rewritten, so a later
+-- source-identity change cannot mint a second allowance.
+CREATE TABLE IF NOT EXISTS publication_budget (
+    day TEXT NOT NULL,
+    clip_id INTEGER NOT NULL,
+    source_key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(day, clip_id)
+);
+-- Evidence that the conservative same-day bootstrap ran (once per day).
+CREATE TABLE IF NOT EXISTS publication_budget_meta (
+    day TEXT PRIMARY KEY,
+    bootstrapped_at REAL NOT NULL,
+    rows_charged INTEGER NOT NULL
+);
 """
+
+# (global, per-source) distinct clip upload starts per local day. The
+# per-source rule is redundant while both equal the retained global
+# ceiling of 8; it exists for deliberate future policy, and only tests
+# inject different (smaller) values via reserve(budget_limits=...).
+DEFAULT_BUDGET_LIMITS = (8, 8)
+_UNKNOWN_SOURCE = "unknown"
 
 class PublishBusy(RuntimeError):
     pass
@@ -96,6 +122,101 @@ def _connect(state_dir):
         os.close(fd)
 
 
+def _budget_tz():
+    from ..core.intake import resolve_timezone, DEFAULT_TIMEZONE
+    return resolve_timezone(DEFAULT_TIMEZONE)
+
+
+def _local_day(ts, tz) -> str:
+    from datetime import datetime
+    return datetime.fromtimestamp(float(ts), tz).date().isoformat()
+
+
+def _valid_budget_ts(ts, now) -> bool:
+    """A bootstrap timestamp must be a finite real number, not in the
+    future, and convertible by the local-day function; anything else
+    leaves the day UNRESOLVED (fail closed)."""
+    import math
+    if (ts is None or isinstance(ts, bool)
+            or not isinstance(ts, (int, float)) or not math.isfinite(ts)
+            or ts > float(now)):
+        return False
+    try:
+        _local_day(ts, _budget_tz())
+    except (OverflowError, OSError, ValueError):
+        return False
+    return True
+
+
+def _budget_source_key(conn, clip_id) -> str:
+    """Resolve a clip's budget identity from provenance TYPE, never from
+    the human source label. Registered feed/playback sources use the
+    canonical broadcaster id when present, else the stable source row id;
+    owner-uploaded (retrospective) ingest and anything unresolvable share
+    the 'unknown' bucket, which has its own per-source allowance and is
+    never identified with a registered source. Existing budget rows are
+    never treated as proof of a live identity. Unreadable rows degrade
+    to 'unknown' rather than failing the reservation.
+    """
+    try:
+        c = conn.execute('SELECT session_id FROM clips WHERE id=?',
+                         (int(clip_id),)).fetchone()
+        if c is None or c[0] is None:
+            return _UNKNOWN_SOURCE
+        s = conn.execute('SELECT source_id, ingest_mode FROM stream_sessions'
+                         ' WHERE id=?', (c[0],)).fetchone()
+        if s is None:
+            return _UNKNOWN_SOURCE
+        if s[1] not in ('feed', 'playback'):
+            return _UNKNOWN_SOURCE
+        t = conn.execute('SELECT id, broadcaster_id FROM twitch_sources'
+                         ' WHERE id=?', (s[0],)).fetchone()
+        if t is None:
+            return _UNKNOWN_SOURCE
+        if t[1]:
+            return 'twitch:' + str(t[1])
+        return 'source-row:' + str(t[0])
+    except sqlite3.Error:
+        return _UNKNOWN_SOURCE
+
+
+def _bootstrap_budget(conn, today, now, tz) -> str | None:
+    """Charge every existing publish-records row whose created_at OR
+    updated_at falls on today. Overcount is deliberate and documented:
+    same-day confirm/recovery/reconciliation updates charge a row whose
+    upload actually started earlier; a charged row that was never truly
+    started today consumes budget anyway (conservative). A timestamp
+    that is missing, non-numeric or in the future leaves the day
+    UNRESOLVED, which fails the reservation closed (never silently
+    skipped). Runs once per day; the meta row is written in the same
+    transaction as the charges.
+    """
+    if conn.execute('SELECT 1 FROM publication_budget_meta WHERE day=?',
+                    (today,)).fetchone():
+        return None
+    rows = conn.execute(
+        'SELECT clip_id, created_at, updated_at FROM publish_records').fetchall()
+    charged = 0
+    for r in rows:
+        days = set()
+        for ts in (r['created_at'], r['updated_at']):
+            if not _valid_budget_ts(ts, now):
+                return ('unresolved timestamp on publish-records clip %s'
+                        % r['clip_id'])
+            days.add(_local_day(ts, tz))
+        if today in days:
+            conn.execute(
+                'INSERT OR IGNORE INTO publication_budget '
+                '(day, clip_id, source_key, created_at) VALUES (?,?,?,?)',
+                (today, int(r['clip_id']),
+                 _budget_source_key(conn, r['clip_id']), float(r['created_at'])))
+            charged += 1
+    conn.execute(
+        'INSERT INTO publication_budget_meta (day, bootstrapped_at, rows_charged)'
+        ' VALUES (?,?,?)', (today, float(now), charged))
+    return None
+
+
 def get(state_dir, clip_id):
     with closing(_connect(state_dir)) as conn:
         row = conn.execute('SELECT * FROM publish_records WHERE clip_id=?',
@@ -103,9 +224,18 @@ def get(state_dir, clip_id):
         return dict(row) if row else None
 
 
-def reserve(state_dir, clip_id, reserved_by, *, lease, gate=None):
+def reserve(state_dir, clip_id, reserved_by, *, lease, gate=None,
+            budget_limits=None):
     """gate(conn)->bool is evaluated inside BEGIN IMMEDIATE; False returns
-    ('gated', None) with nothing written."""
+    ('gated', None) with nothing written.
+
+    budget_limits is (global, per-source) distinct-clip upload STARTS per
+    local day; None means DEFAULT_BUDGET_LIMITS. A reservation past a
+    limit returns ('budget_capped', {'scope','limit','day'}), or scope
+    'bootstrap' when conservative same-day reconstruction could not be
+    resolved, with nothing written. Production callers never pass this:
+    the retained global ceiling of 8 applies.
+    """
     lease.require(state_dir, clip_id)
     now, token = time.time(), secrets.token_hex(16)
     with closing(_connect(state_dir)) as conn:
@@ -127,6 +257,43 @@ def reserve(state_dir, clip_id, reserved_by, *, lease, gate=None):
         if row is not None and row['state'] != 'FAILED':
             conn.rollback()
             return 'blocked', dict(row)
+        # Authoritative reservation time is captured HERE, after the
+        # schema lock, BEGIN IMMEDIATE and the gate/provenance reads: a
+        # wait that crosses local midnight must charge the day the
+        # reservation actually starts on, never the day the caller
+        # arrived. The row timestamps below use this same value.
+        now = time.time()
+        # Existing publication state is settled above; only a genuinely
+        # new reservation consumes daily budget. Bootstrap of same-day
+        # legacy evidence runs first, in this same transaction.
+        if budget_limits is None:
+            budget_limits = DEFAULT_BUDGET_LIMITS
+        tz = _budget_tz()
+        today = _local_day(now, tz)
+        err = _bootstrap_budget(conn, today, now, tz)
+        if err is not None:
+            conn.rollback()
+            return 'budget_capped', {'scope': 'bootstrap', 'day': today,
+                                     'reason': err}
+        key = _budget_source_key(conn, clip_id)
+        conn.execute('INSERT OR IGNORE INTO publication_budget '
+                     '(day, clip_id, source_key, created_at) VALUES (?,?,?,?)',
+                     (today, int(clip_id), key, now))
+        glim, slim = (int(budget_limits[0]), int(budget_limits[1]))
+        n_global = conn.execute(
+            'SELECT COUNT(DISTINCT clip_id) FROM publication_budget WHERE day=?',
+            (today,)).fetchone()[0]
+        if n_global > glim:
+            conn.rollback()
+            return 'budget_capped', {'scope': 'global', 'limit': glim,
+                                     'day': today}
+        n_src = conn.execute(
+            'SELECT COUNT(DISTINCT clip_id) FROM publication_budget'
+            ' WHERE day=? AND source_key=?', (today, key)).fetchone()[0]
+        if n_src > slim:
+            conn.rollback()
+            return 'budget_capped', {'scope': 'source', 'limit': slim,
+                                     'day': today, 'source_key': key}
         if row is None:
             conn.execute("INSERT INTO publish_records (clip_id,state,attempts,reserved_by,"
                          "created_at,updated_at,attempt_token) VALUES (?,'RESERVED',1,?,?,?,?)",

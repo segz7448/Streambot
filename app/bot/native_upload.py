@@ -138,6 +138,20 @@ def _confirmed_notice(row_id: int, vid: str) -> str:
             f"video id had an unexpected format - see /publishhistory")
 
 
+def _next_local_midnight(now=None):
+    """Epoch of the next local midnight in the intake day timezone
+    (DST-aware: a spring-forward or fall-back midnight resolves through
+    the same zone the daily budget uses)."""
+    from datetime import datetime, timedelta
+    from ..core.intake import resolve_timezone, DEFAULT_TIMEZONE
+    tz = resolve_timezone(DEFAULT_TIMEZONE)
+    dt = datetime.fromtimestamp(time.time() if now is None else float(now),
+                                tz)
+    nxt = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0,
+                                           microsecond=0)
+    return nxt.timestamp()
+
+
 LOCK_NAME = "native-upload.lock"
 
 
@@ -459,6 +473,26 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                                                job_id))
                 log.info("native upload job %s: paused at reserve; returned "
                          "to the queue unspent", job_id)
+                return True
+            if decision == "budget_capped":
+                # Daily upload-start budget reached: defer to the next
+                # local midnight, unspent. Not a failure: no outcome
+                # notice, no slot or publisher interaction, no probe
+                # churn. The CAS makes the defer land only while this
+                # worker still owns this captured attempt.
+                run_after = _next_local_midnight()
+                with conn:
+                    conn.execute(
+                        "UPDATE job_queue SET state='PENDING', locked_by=NULL,"
+                        " locked_at=NULL, attempts=MAX(attempts-1,0),"
+                        " run_after=?, last_error=?, updated_at=? WHERE id=?"
+                        " AND state='ANALYZING' AND locked_by=? AND attempts=?",
+                        (run_after, "budget_capped: deferred to next local day",
+                         time.time(), job_id, WORKER_NAME,
+                         int(job["attempts"])))
+                log.info("native upload job %s: daily budget reached (%s);"
+                         " deferred to next local midnight",
+                         job_id, rec.get("scope"))
                 return True
             if decision == "repost_denied":
                 from ..core.provenance import DENIED_PREFIX, UNREADABLE_PREFIX

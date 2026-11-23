@@ -1,5 +1,6 @@
 from contextlib import closing
 from tests.unit import _prov
+from datetime import datetime, timedelta
 import os
 import subprocess
 import sys
@@ -7,7 +8,10 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
+from app.core import database
 from app.core.database import migrate
 from app.distribution import publish_records as pr
 
@@ -15,6 +19,229 @@ from app.distribution import publish_records as pr
 def _reserve(sd, cid, *a, **k):
     _prov.seed_clip(sd, cid)
     return pr.reserve(sd, cid, *a, **k)
+
+
+class DailyBudgetTests(unittest.TestCase):
+    """Daily upload-START budget. reserve(budget_limits=...) is a TEST
+    injection point for small ceilings; nothing here asserts production
+    behavior - production keeps the retained global ceiling (8,8) via
+    the reserve default and never passes budget_limits.
+    """
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        with closing(database.connect(str(self.d / 'nova.db'))) as conn, conn:
+            migrate(conn)
+
+    def _seed(self, cid, user='fixture-feed', mode='feed',
+              broadcaster_id=None, d=None):
+        d = d or self.d
+        conn = database.connect(str(d / 'nova.db'))
+        try:
+            n = time.time()
+            with conn:
+                conn.execute('INSERT OR IGNORE INTO twitch_sources'
+                             ' (username,created_at,updated_at) VALUES (?,?,?)',
+                             (user, n, n))
+                if broadcaster_id is not None:
+                    conn.execute('UPDATE twitch_sources SET broadcaster_id=?'
+                                 ' WHERE username=?', (broadcaster_id, user))
+                sid = conn.execute('SELECT id FROM twitch_sources'
+                                   ' WHERE username=?', (user,)).fetchone()[0]
+                sess = conn.execute("INSERT INTO stream_sessions"
+                                    " (source_id,state,ingest_mode)"
+                                    " VALUES (?,'ENDED',?)",
+                                    (sid, mode)).lastrowid
+                conn.execute("INSERT INTO clips (id,session_id,status,created_at)"
+                             " VALUES (?,?,'HELD',?)", (int(cid), sess, n))
+        finally:
+            conn.close()
+
+    def _reserve(self, cid, limits=(2, 2)):
+        with pr.ClipLease(self.d, cid) as lease:
+            return pr.reserve(self.d, cid, 'test', lease=lease,
+                              budget_limits=limits)
+
+    def _budget_rows(self):
+        with closing(database.connect(str(self.d / 'nova.db'))) as conn:
+            return conn.execute(
+                'SELECT day, clip_id, source_key FROM publication_budget'
+                ' ORDER BY clip_id').fetchall()
+
+    def test_global_cap_on_distinct_clip_starts(self):
+        for cid in (1, 2):
+            self._seed(cid)
+            self.assertEqual(self._reserve(cid)[0], 'reserved')
+        self._seed(3)
+        decision, info = self._reserve(3)
+        self.assertEqual(decision, 'budget_capped')
+        self.assertEqual(info['scope'], 'global')
+        self.assertEqual(info['limit'], 2)
+        # nothing reserved and the capped charge rolled back
+        self.assertIsNone(pr.get(self.d, 3))
+        self.assertEqual([r['clip_id'] for r in self._budget_rows()], [1, 2])
+
+    def test_per_source_cap_and_disjoint_namespaces(self):
+        self._seed(1, 'alice'); self._seed(2, 'alice'); self._seed(3, 'alice')
+        self._seed(4, 'bob', broadcaster_id='b-77')
+        for cid in (1, 2):
+            self.assertEqual(self._reserve(cid, (10, 2))[0], 'reserved')
+        decision, info = self._reserve(3, (10, 2))
+        self.assertEqual((decision, info['scope']), ('budget_capped', 'source'))
+        self.assertTrue(info['source_key'].startswith('source-row:'))
+        # a different source keeps its own allowance
+        self.assertEqual(self._reserve(4, (10, 2))[0], 'reserved')
+        keys = {r['source_key'] for r in self._budget_rows()}
+        self.assertEqual(len(keys), 2)
+        self.assertIn('twitch:b-77', keys)
+        self.assertTrue(any(k.startswith('source-row:') for k in keys))
+
+    def test_failed_retry_same_day_is_free(self):
+        self._seed(1)
+        decision, row = self._reserve(1, (1, 1))
+        self.assertEqual(decision, 'reserved')
+        with pr.ClipLease(self.d, 1) as lease:
+            pr.fail_definitive(self.d, 1, 'nope', lease=lease,
+                               attempt_token=row['attempt_token'])
+        # retrying the same clip the same day consumes nothing new
+        self.assertEqual(self._reserve(1, (1, 1))[0], 'reserved')
+        self._seed(2)
+        decision, info = self._reserve(2, (1, 1))
+        self.assertEqual((decision, info['scope']), ('budget_capped', 'global'))
+        self.assertEqual(len(self._budget_rows()), 1)
+
+    def test_in_flight_state_settles_before_budget(self):
+        self._seed(1)
+        self.assertEqual(self._reserve(1, (1, 1))[0], 'reserved')
+        # an in-flight reservation is blocked by state, not by budget,
+        # and never double-charged
+        self.assertEqual(self._reserve(1, (1, 1))[0], 'blocked')
+        self.assertEqual(len(self._budget_rows()), 1)
+
+    def test_repost_denied_consumes_no_budget(self):
+        self._seed(1, mode='playback')  # no repost grant
+        decision, _ = self._reserve(1, (8, 8))
+        self.assertEqual(decision, 'repost_denied')
+        self.assertEqual(self._budget_rows(), [])
+
+    def test_upload_ingest_clips_share_the_unknown_bucket(self):
+        self._seed(1, 'alice', mode='upload')
+        self._seed(2, 'bob', mode='upload')
+        self.assertEqual(self._reserve(1, (10, 1))[0], 'reserved')
+        decision, info = self._reserve(2, (10, 1))
+        self.assertEqual((decision, info['scope']), ('budget_capped', 'source'))
+        self.assertEqual(info['source_key'], 'unknown')
+
+    def test_bootstrap_charges_same_day_legacy_rows(self):
+        tz = pr._budget_tz()
+        noon = datetime.fromtimestamp(time.time(), tz).replace(
+            hour=12, minute=0, second=0, microsecond=0)
+        y = (noon - timedelta(days=1)).timestamp()
+        now = time.time()
+        with closing(database.connect(str(self.d / 'nova.db'))) as conn, conn:
+            # clip 9: created yesterday but touched today -> charged
+            # clip 10: entirely yesterday -> never charged
+            for cid, ca, ua in ((9, y, now), (10, y, y + 60)):
+                conn.execute("INSERT INTO publish_records"
+                             " (clip_id,state,attempts,created_at,updated_at)"
+                             " VALUES (?,'CONFIRMED',1,?,?)", (cid, ca, ua))
+        self._seed(1); self._seed(2)
+        self.assertEqual(self._reserve(1, (2, 2))[0], 'reserved')
+        decision, info = self._reserve(2, (2, 2))
+        self.assertEqual((decision, info['scope']), ('budget_capped', 'global'))
+        with closing(database.connect(str(self.d / 'nova.db'))) as conn:
+            meta = conn.execute('SELECT rows_charged FROM'
+                                ' publication_budget_meta').fetchone()
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta[0], 1)  # exactly one legacy row charged
+        self.assertEqual({r['clip_id'] for r in self._budget_rows()}, {1, 9})
+
+    def test_bootstrap_fails_closed_on_unresolved_timestamp(self):
+        now = time.time()
+        with closing(database.connect(str(self.d / 'nova.db'))) as conn, conn:
+            conn.execute("INSERT INTO publish_records"
+                         " (clip_id,state,attempts,created_at,updated_at)"
+                         " VALUES (9,'RESERVED',1,?,?)", (now, now + 90000))
+        self._seed(1)
+        decision, info = self._reserve(1, (8, 8))
+        self.assertEqual((decision, info['scope']),
+                         ('budget_capped', 'bootstrap'))
+        self.assertIsNone(pr.get(self.d, 1))
+        with closing(database.connect(str(self.d / 'nova.db'))) as conn:
+            self.assertIsNone(conn.execute(
+                'SELECT 1 FROM publication_budget_meta').fetchone())
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM publication_budget').fetchone()[0], 0)
+
+    def test_reserve_time_recaptured_after_lock_across_midnight(self):
+        # A caller arriving at 23:59:59 local whose reservation actually
+        # starts at 00:00:01 the next day is charged to the NEW day; the
+        # prior day's ceiling cannot be bypassed by schema-lock wait.
+        tz = pr._budget_tz()
+        before = datetime(2026, 11, 23, 23, 59, 59, tzinfo=tz).timestamp()
+        after = datetime(2026, 11, 24, 0, 0, 1, tzinfo=tz).timestamp()
+        day1, day2 = pr._local_day(before, tz), pr._local_day(after, tz)
+        self.assertNotEqual(day1, day2)
+        pr.get(self.d, 0)  # create budget tables via publish_records DDL
+        with closing(database.connect(str(self.d / 'nova.db'))) as conn, conn:
+            conn.execute('INSERT INTO publication_budget_meta'
+                         ' (day,bootstrapped_at,rows_charged) VALUES (?,?,?)',
+                         (day1, before, 2))
+            for cid in (11, 12):
+                conn.execute('INSERT INTO publication_budget'
+                             ' (day,clip_id,source_key,created_at)'
+                             ' VALUES (?,?,?,?)', (day1, cid, 'unknown', before))
+        self._seed(1)
+
+        class _Clock:
+            val = before
+
+        def gate(conn):  # runs inside BEGIN IMMEDIATE, after the lock
+            _Clock.val = after  # the lock wait crossed local midnight
+            return True
+
+        with mock.patch.object(pr.time, 'time',
+                               side_effect=lambda: _Clock.val):
+            with pr.ClipLease(self.d, 1) as lease:
+                decision, row = pr.reserve(self.d, 1, 'test', lease=lease,
+                                           gate=gate, budget_limits=(2, 2))
+        self.assertEqual(decision, 'reserved')
+        days = [r['day'] for r in self._budget_rows() if r['clip_id'] == 1]
+        self.assertEqual(days, [day2])
+
+    def test_bootstrap_fails_closed_on_nonfinite_or_out_of_range(self):
+        # (NULL is impossible: columns are NOT NULL and sqlite maps NaN
+        # to NULL, so both are excluded by schema; the remaining
+        # unverifiable classes are nonfinite and out-of-range values.)
+        for bad in (float('-inf'), -1e20):
+            d = Path(tempfile.mkdtemp())
+            with closing(database.connect(str(d / 'nova.db'))) as conn, conn:
+                migrate(conn)
+                now = time.time()
+                # one valid same-day legacy row, then one unverifiable:
+                # the failure must roll back the partial bootstrap too
+                conn.execute("INSERT INTO publish_records"
+                             " (clip_id,state,attempts,created_at,updated_at)"
+                             " VALUES (8,'CONFIRMED',1,?,?)", (now, now))
+                conn.execute("INSERT INTO publish_records"
+                             " (clip_id,state,attempts,created_at,updated_at)"
+                             " VALUES (9,'CONFIRMED',1,?,?)", (now, bad))
+            self._seed(1, d=d)
+            with pr.ClipLease(d, 1) as lease:
+                decision, info = pr.reserve(d, 1, 'test', lease=lease,
+                                            budget_limits=(8, 8))
+            self.assertEqual((decision, info['scope']),
+                             ('budget_capped', 'bootstrap'), repr(bad))
+            self.assertIsNone(pr.get(d, 1))
+            with closing(database.connect(str(d / 'nova.db'))) as conn:
+                self.assertEqual(conn.execute(
+                    'SELECT COUNT(*) FROM publication_budget').fetchone()[0], 0)
+                self.assertIsNone(conn.execute(
+                    'SELECT 1 FROM publication_budget_meta').fetchone())
+
+    def test_default_limits_are_the_retained_ceiling(self):
+        # documents the default constant; not a production-behavior claim
+        self.assertEqual(pr.DEFAULT_BUDGET_LIMITS, (8, 8))
 
 
 class PublishRecordsTests(unittest.TestCase):

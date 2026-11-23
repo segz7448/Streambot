@@ -272,6 +272,44 @@ class PublishCommandTests(unittest.TestCase):
         from app.bot import ops
         self.assertIn("publish", ops.SIDE_EFFECTING)
 
+    def test_publish_daily_budget_fixed_reply_no_upload(self):
+        # TEST ceiling (0,0): the very first reservation of the day is
+        # already capped. Not a claim about production limits.
+        from app.distribution import publish_records as pr
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        fake = mock.Mock()
+        fake.publish.side_effect = AssertionError("publisher must not run")
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake), \
+             mock.patch.object(pr, "DEFAULT_BUDGET_LIMITS", (0, 0)):
+            out = cf.publish_reply(d, "1", 557)
+        self.assertEqual(out, "Daily upload limit reached. This request did "
+                              "not upload anything. Try again next local day.")
+        fake.publish.assert_not_called()
+        self.assertIsNone(pr.get(d, 1))
+
+    def test_publish_budget_unverified_history_distinct_reply(self):
+        # bootstrap fails closed: the reply names inspection, never a
+        # quota, and never promises "tomorrow".
+        from app.distribution import publish_records as pr
+        d = Path(tempfile.mkdtemp())
+        self._clip(d)
+        with closing(sqlite3.connect(str(d / "nova.db"))) as conn, conn:
+            conn.execute("INSERT INTO publish_records (clip_id,state,attempts,"
+                         "created_at,updated_at) VALUES (9,'RESERVED',1,0,?)",
+                         (float("-inf"),))
+        fake = mock.Mock()
+        fake.publish.side_effect = AssertionError("publisher must not run")
+        with mock.patch("app.distribution.youtube.publisher_from_state",
+                        return_value=fake):
+            out = cf.publish_reply(d, "1", 558)
+        self.assertEqual(out, "Upload paused because daily upload history "
+                              "could not be verified. This request did not "
+                              "upload anything; inspection is needed.")
+        fake.publish.assert_not_called()
+        self.assertIsNone(pr.get(d, 1))
+
 
 class YouTubeAuthTests(unittest.TestCase):
 

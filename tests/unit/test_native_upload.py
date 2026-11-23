@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from unittest import mock
 from datetime import datetime
@@ -138,6 +139,52 @@ class NativeUploadTests(unittest.TestCase):
         self.assertEqual(rec["video_id"], "ytNative123")
         self.assertEqual(self._jobs()[0]["state"], "COMPLETED")
         # Second cycle: nothing pending, no further network.
+        self.assertEqual(self._run_once(), handoff.IDLE)
+        self.assertEqual(len(self.publisher.calls), 1)
+
+    def test_budget_cap_defers_to_next_midnight_unspent(self):
+        # TEST ceiling via the reserve default constant: not a claim
+        # about production limits.
+        cid1 = self._add_held_clip()
+        self._admit(cid1)
+        cid2 = self._add_held_clip()
+        self._admit(cid2)
+
+        def _notices():
+            conn = database.connect(self.db)
+            try:
+                if not conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND"
+                        " name='schedule_notices'").fetchone():
+                    return 0
+                return conn.execute(
+                    "SELECT COUNT(*) FROM schedule_notices").fetchone()[0]
+            finally:
+                conn.close()
+
+        t0 = time.time()
+        with mock.patch.object(publish_records, "DEFAULT_BUDGET_LIMITS",
+                               (1, 1)):
+            self.assertEqual(self._run_once(), handoff.PROCESSED)
+            n0 = _notices()  # notice state after the successful upload
+            self.assertEqual(self._run_once(), handoff.PROCESSED)
+        self.assertEqual(len(self.publisher.calls), 1)
+        conn = database.connect(self.db)
+        jobs = conn.execute(
+            "SELECT state, attempts, run_after, last_error FROM job_queue"
+            " WHERE kind = ?", (HANDOFF_JOB_KIND,)).fetchall()
+        conn.close()
+        self.assertEqual(sorted(j["state"] for j in jobs),
+                         ["COMPLETED", "PENDING"])
+        deferred = [j for j in jobs if j["state"] == "PENDING"][0]
+        self.assertEqual(deferred["attempts"], 0)  # unspent attempt
+        self.assertIn("budget_capped", deferred["last_error"])
+        expected = native_upload._next_local_midnight(t0)
+        self.assertLess(abs(deferred["run_after"] - expected), 5)
+        # no reservation, no provider outcome, no new notice
+        self.assertIsNone(self._record(cid2))
+        self.assertEqual(_notices(), n0)  # deferral writes no notice
+        # the deferred job is not runnable again before midnight
         self.assertEqual(self._run_once(), handoff.IDLE)
         self.assertEqual(len(self.publisher.calls), 1)
 

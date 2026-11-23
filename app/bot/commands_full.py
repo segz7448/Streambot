@@ -375,6 +375,13 @@ def publish_reply(state_dir: Path, args: str, update_id: int = 0) -> str:
                    else "operator-native")
     def _publish_with_lease(lease):
         decision, rec = publish_records.reserve(state_dir, clip_id, reserved_by, lease=lease)
+        if decision == "budget_capped":
+            if rec.get("scope") == "bootstrap":
+                return ("Upload paused because daily upload history "
+                        "could not be verified. This request did not "
+                        "upload anything; inspection is needed.")
+            return ("Daily upload limit reached. This request did not "
+                    "upload anything. Try again next local day.")
         if decision == "repost_denied":
             why = rec.get("reason", "unknown")
             if rec.get("retryable"):
