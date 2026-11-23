@@ -481,6 +481,46 @@ class BotService:
                                  ffprobe=ffprobe_path))
         self._sched_task = asyncio.create_task(self._schedule_loop())
         self._pollwatch_task = asyncio.create_task(self._pollwatch_loop())
+        if not self._retro_diag_disabled():
+            self._retro_diag_task = asyncio.create_task(self._retro_diag_loop())
+
+    def _retro_diag_disabled(self) -> bool:
+        from ..diag import retro_export
+        try:
+            return retro_export.consumed(str(self._state_dir()))
+        except Exception:
+            return True  # unreadable fence state: never auto-run
+
+    async def _retro_diag_loop(self, interval: float = 2.0) -> None:
+        """ONE-OFF diagnostic export: at most one request, ever, and
+        only while the global consumed fence is clear. The heavy work
+        is one owned child (retro_export.run_request) with its own
+        fixed deadline; after any outcome this task disables itself -
+        an UNCERTAIN outcome keeps the fence and needs human review,
+        never an automatic retry."""
+        from ..diag import retro_export
+        while True:
+            await asyncio.sleep(interval)
+            if getattr(self, "_retro_diag_stopping", False):
+                return
+            if self._retro_diag_disabled():
+                return
+            try:
+                if (self._state_dir() / retro_export.REQUEST_DIR
+                        / retro_export.REQUEST_FILE).exists():
+                    ev = getattr(self, "_retro_diag_stop_event", None)
+                    if ev is None:
+                        import threading as _th
+                        ev = self._retro_diag_stop_event = _th.Event()
+                    result = await self._blocking(
+                        retro_export.run_request, str(self._state_dir()),
+                        stop_event=ev)
+                    log.info("retro diag outcome: %s", result.get("status"))
+                    return  # one-off: never a second request
+            except retro_export.RequestError as exc:
+                log.warning("retro diag request refused: %s", exc)
+            except Exception:
+                log.exception("retro diag loop error")
 
     async def _pollwatch_loop(self, interval: float = 300.0) -> None:
         """Periodic content-free heartbeat: positive proof in the logs that
@@ -603,6 +643,46 @@ class BotService:
             tracker.request_cancel()
 
     async def _stop_handoff_consumer(self, _app) -> None:
+        # shutdown-active child proof for the one-off diagnostic: cancel
+        # its registered group, then drain the task so no diag worker
+        # survives service shutdown unproven
+        try:
+            from ..diag import retro_export
+            state_dir = str(self._state_dir())
+            # stop flag BEFORE cancel: the poller must not claim or
+            # spawn anything new once shutdown begins; the shared event
+            # is checked inside run_request before claim and under the
+            # launch lock before Popen, and CANCEL is durable
+            self._retro_diag_stopping = True
+            ev = getattr(self, "_retro_diag_stop_event", None)
+            if ev is not None:
+                ev.set()
+            cancel_result = await self._blocking(
+                retro_export.cancel_active, state_dir, "service shutdown")
+            if isinstance(cancel_result, dict) and (
+                    cancel_result.get("cancel_record_error")
+                    or cancel_result.get("uncertain")):
+                log.error("retro diag shutdown cancel incomplete: %s",
+                          cancel_result)
+            # drain = the controller task reaches a TERMINAL state,
+            # not a fixed wait that ignores a pending thread
+            task = getattr(self, "_retro_diag_task", None)
+            if task is not None and not task.done():
+                await asyncio.wait([task], timeout=30)
+            if task is not None and not task.done():
+                # unknown controller state: the claim fence and
+                # in-progress record are retained; deployment stop
+                # clearance must treat this as NOT cleanly stopped
+                log.error("retro diag controller NOT drained during "
+                          "shutdown; fence retained, state UNCERTAIN - "
+                          "blocking clean-stop clearance")
+            else:
+                proof_note = await self._blocking(
+                    retro_export.watchdog_check, state_dir)
+                if proof_note:
+                    log.warning("retro diag shutdown state: %s", proof_note)
+        except Exception as exc:
+            log.error("retro diag shutdown handling failed: %s", exc)
         from . import sessions as _sess
         tracker = _sess.recovery_tracker()
         # whole-sequence ownership under cancellation AND errors: every
