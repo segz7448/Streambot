@@ -514,7 +514,7 @@ class BotService:
                         ev = self._retro_diag_stop_event = _th.Event()
                     result = await self._blocking(
                         retro_export.run_request, str(self._state_dir()),
-                        stop_event=ev)
+                        ev)  # positional: _blocking is (fn, *args) only
                     log.info("retro diag outcome: %s", result.get("status"))
                     return  # one-off: never a second request
             except retro_export.RequestError as exc:

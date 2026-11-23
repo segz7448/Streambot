@@ -877,3 +877,76 @@ def test_activation_fresh_import_integration(tmp_path):
     good.write_text(json.dumps([_entry(), _entry(request_id="req-b")]))
     assert fresh(good) == "LOADED 0"          # multi tuple refused
     assert fresh(None) == "LOADED 0"          # unset env refused
+
+
+def test_regression_service_loop_real_blocking_call(tmp_path, monkeypatch):
+    """Regression for the deployed TypeError: the service loop must pass
+    the stop event POSITIONALLY through the real positional-only
+    _blocking wrapper. Drives the REAL BotService._retro_diag_loop with
+    the REAL _blocking and the REAL run_request (unapproved tuple: real
+    claim happens, then durable refusal - no ffmpeg, fast). With the
+    kwarg bug the TypeError is swallowed by the loop's broad except and
+    the claim fence never appears, so this test hangs then fails."""
+    import asyncio
+    import threading
+    from app.bot.service import BotService
+
+    state = _mkstate(tmp_path)
+    req = state / re_mod.REQUEST_DIR / re_mod.REQUEST_FILE
+    req.write_text(json.dumps(
+        {"request_id": "req-loop-unapproved", "source_path": "/nope",
+         "source_sha256": "0" * 64, "source_bytes": 1}),
+        encoding="utf-8")
+    monkeypatch.setattr(re_mod, "APPROVED", ())  # refuse after real claim
+
+    svc = BotService.__new__(BotService)
+    svc._state_dir = lambda: state
+
+    async def drive():
+        task = asyncio.ensure_future(svc._retro_diag_loop(interval=0.01))
+        for _ in range(1000):
+            if (state / re_mod.REQUEST_DIR / re_mod.CLAIM_FENCE).exists():
+                break
+            if task.done():
+                break
+            await asyncio.sleep(0.01)
+        svc._retro_diag_stopping = True
+        await asyncio.wait_for(task, 10)
+
+    asyncio.run(drive())
+    fence = state / re_mod.REQUEST_DIR / re_mod.CLAIM_FENCE
+    assert fence.exists(), "loop never reached run_request through _blocking"
+
+
+def test_regression_service_loop_shutdown_event_path(tmp_path, monkeypatch):
+    """The stop Event must travel through the wrapper and be honored
+    BEFORE any claim: a pre-set event means no fence, no claim, request
+    preserved, and the loop exits cleanly once stopping is set."""
+    import asyncio
+    import threading
+    from app.bot.service import BotService
+
+    state = _mkstate(tmp_path)
+    req = state / re_mod.REQUEST_DIR / re_mod.REQUEST_FILE
+    req.write_text(json.dumps(
+        {"request_id": "req-loop-stop", "source_path": "/nope",
+         "source_sha256": "0" * 64, "source_bytes": 1}),
+        encoding="utf-8")
+    monkeypatch.setattr(re_mod, "APPROVED", ())
+
+    svc = BotService.__new__(BotService)
+    svc._state_dir = lambda: state
+    ev = threading.Event()
+    ev.set()  # shutdown signalled before the loop ever claims
+    svc._retro_diag_stop_event = ev
+
+    async def drive():
+        task = asyncio.ensure_future(svc._retro_diag_loop(interval=0.01))
+        await asyncio.sleep(0.2)  # several cycles with the event set
+        svc._retro_diag_stopping = True
+        await asyncio.wait_for(task, 10)
+
+    asyncio.run(drive())
+    assert req.exists(), "request must be preserved when stopping"
+    assert not (state / re_mod.REQUEST_DIR / re_mod.CLAIM_FENCE).exists(), \
+        "no claim may happen once the stop event is set"
