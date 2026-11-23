@@ -89,6 +89,26 @@ class FinalizeTests(unittest.TestCase):
                 mock.patch("app.qc.verify.probe",
                            lambda *a, **k: {"format": {"duration": "28.5"}})]
 
+    def test_planned_180_limit_and_framing_reach_shared_editor(self):
+        from app.intelligence.memory import Memory
+        Memory(str(self.dir / "memory.json")).remember(
+            "preference", "shorts_target_seconds", "180", "owner")
+        cid = self._add_clip()
+        seen = {}
+        def edit(ff, src, dst, preset, *a, **kw):
+            seen["limit"] = preset.max_duration_seconds
+            seen["framing"] = kw["framing"]
+            Path(dst).write_bytes(b"x" * 2048)
+        patches = self._patches()
+        for p in patches[1:]:
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch("app.editing.editor.edit_clip", edit):
+            self.assertEqual(ps.finalize_interrupted_sessions(
+                self.dir, "ffmpeg", "ffprobe"), 1)
+        self.assertEqual(seen, {"limit": 180, "framing": "full"})
+        self.assertEqual(self._clip(cid)[0], "HELD")
+
     def test_sealed_clip_recovered_to_held_no_admission(self):
         cid = self._add_clip()
         for p in self._patches():

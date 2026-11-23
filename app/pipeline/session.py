@@ -13,6 +13,7 @@ silently resumed.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import os
 import re
@@ -813,7 +814,8 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                 edited = _seal.reserve_exact_or_unique(
                     Path(out_dir) / output_name(clip_id))
             edit_clip(ffmpeg, str(input_path), str(edited),
-                      PRESETS.get(plan.preset, PRESETS["vertical"]),
+                      replace(PRESETS.get(plan.preset, PRESETS["vertical"]),
+                              max_duration_seconds=max(1, min(180, plan.target_seconds))),
                       None, 0.5, str(runtime_dir),
                       watermark=plan.watermark or None,
                       pre_spawn=pre_spawn, on_spawn=on_spawn,

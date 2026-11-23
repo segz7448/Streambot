@@ -14,6 +14,7 @@ override the derived duration.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import time
 from pathlib import Path
 from typing import Callable
@@ -179,7 +180,8 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     plan = plan_clip(best["kind"], source_label, memory,
                      content_seconds=window)
     result["plan"] = {"target_seconds": plan.target_seconds,
-                      "preset": plan.preset, "title": plan.title,
+                      "preset": plan.preset, "framing": plan.framing,
+                      "title": plan.title,
                       "tags": plan.tags, "watermark": plan.watermark,
                       "reasons": plan.reasons}
 
@@ -205,10 +207,11 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     extract_fn(ffmpeg, src_path, raw, start, duration)
     result["extracted"] = Path(raw).exists()
 
-    preset = PRESETS.get(plan.preset, PRESETS["vertical"])
+    preset = replace(PRESETS.get(plan.preset, PRESETS["vertical"]),
+                     max_duration_seconds=max(1, min(180, plan.target_seconds)))
     edited = str(reserve_output(work, "clip-edited", ".mp4"))
     edit_fn(ffmpeg, raw, edited, preset, None, 0.5, runtime_dir,
-            watermark=plan.watermark or None)
+            watermark=plan.watermark or None, framing=plan.framing)
     result["edited"] = Path(edited).exists()
 
     qc = qc_fn(ffprobe, ffmpeg, edited, 1.0, 100, 100, True)

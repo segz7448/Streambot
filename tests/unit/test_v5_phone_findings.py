@@ -200,7 +200,7 @@ class TitleUsesMeasuredDuration(unittest.TestCase):
             audio_fn=lambda ff, p: samples, scene_fn=lambda ff, p: [],
             extract_fn=lambda ff, s_, o, st, du:
                 Path(o).write_bytes(b"x" * 20000) or Path(o),
-            edit_fn=lambda ff, s_, o, pr, sub, fx, rt, watermark=None:
+            edit_fn=lambda ff, s_, o, pr, sub, fx, rt, watermark=None, framing=None:
                 Path(o).write_bytes(b"y" * 20000) or Path(o),
             qc_fn=lambda *a: type("QC", (), {"ok": True, "failures": []})(),
             validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,

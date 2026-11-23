@@ -47,7 +47,7 @@ class ProcessRecordingTests(unittest.TestCase):
             audio_fn=lambda ff, p: _samples(),
             scene_fn=lambda ff, p: [],
             extract_fn=lambda ff, s, o, st, d: Path(o).write_bytes(b"x" * 20000) or Path(o),
-            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
+            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None, framing=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
             qc_fn=lambda fp, ff, p, a, b, c, d: type("QC", (), {"ok": True, "failures": []})(),
             validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,
                                        "height": 240},
@@ -105,12 +105,23 @@ class ProcessRecordingTests(unittest.TestCase):
             rows = (0,)
         self.assertEqual(rows[0], 0)
 
+    def test_planned_duration_and_framing_reach_editor(self):
+        self.mem.remember("preference", "shorts_target_seconds", "180", "owner")
+        seen = {}
+        def edit(ff, src, dst, preset, *a, **kw):
+            seen["limit"] = preset.max_duration_seconds
+            seen["framing"] = kw["framing"]
+            Path(dst).write_bytes(b"y" * 20000)
+        result = self._run(edit_fn=edit)
+        self.assertEqual(seen, {"limit": 180, "framing": "full"})
+        self.assertEqual(result["plan"]["framing"], "full")
+
     def test_watermark_from_memory_passed_to_editor(self):
         self.mem.remember("preference", "watermark", "@streamer", "owner",
                           confidence="stated")
         seen = {}
 
-        def edit(ff, s, o, preset, sub, fx, rt, watermark=None):
+        def edit(ff, s, o, preset, sub, fx, rt, watermark=None, framing=None):
             seen["watermark"] = watermark
             Path(o).write_bytes(b"y" * 20000)
             return Path(o)
@@ -143,7 +154,7 @@ class RetrospectiveAdmissionEnqueueTests(unittest.TestCase):
             audio_fn=lambda ff, p: _samples(),
             scene_fn=lambda ff, p: [],
             extract_fn=lambda ff, s, o, st, d: Path(o).write_bytes(b"x" * 20000) or Path(o),
-            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
+            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None, framing=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
             qc_fn=lambda fp, ff, p, a, b, c, d: type("QC", (), {"ok": True, "failures": []})(),
             validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,
                                        "height": 240})
@@ -178,7 +189,7 @@ class GeneratedAdmissionCycleTests(unittest.TestCase):
             audio_fn=lambda ff, p: _samples(),
             scene_fn=lambda ff, p: [],
             extract_fn=lambda ff, s, o, st, d: Path(o).write_bytes(b"x" * 20000) or Path(o),
-            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
+            edit_fn=lambda ff, s, o, preset, sub, fx, rt, watermark=None, framing=None: Path(o).write_bytes(b"y" * 20000) or Path(o),
             qc_fn=lambda fp, ff, p, a, b, c, d: type("QC", (), {"ok": True, "failures": []})(),
             validate_fn=lambda fp, p: {"duration": 60.0, "width": 320,
                                        "height": 240},

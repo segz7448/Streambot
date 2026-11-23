@@ -397,6 +397,16 @@ def stopclip_reply(state_dir: Path) -> str:
     return "No clipping session is running."
 
 
+def active_status() -> str:
+    """In-memory owned-session snapshot, without source names or network I/O."""
+    with _lock:
+        phases = [getattr(s, "phase", None) or "registered"
+                  for s in _sessions.values()]
+    if not phases:
+        return "no in-process session registered"
+    return f"{len(phases)} in-process session(s): " + ", ".join(phases)
+
+
 def sessions_reply(state_dir: Path) -> str:
     with _lock:
         live = {k: s for k, s in _sessions.items()}

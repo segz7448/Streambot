@@ -282,7 +282,32 @@ class BotService:
                 f"updates handled: {handled}, failed pending: {len(failed)}\n"
                 f"{polling}\n"
                 f"token source: {_tok_src()}\n"
-                f"pipeline: capture idle - no Twitch source authorized yet")
+                f"{self._pipeline_status()}")
+
+    def _pipeline_status(self) -> str:
+        """Read-only snapshot; DB state is recorded state, not writer proof."""
+        from . import sessions
+        active = sessions.active_status()
+        db = self._state_dir() / "nova.db"
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+            try:
+                authorized = conn.execute(
+                    "SELECT COUNT(*) FROM twitch_sources s JOIN settings t"
+                    " ON t.key='srcauth:' || s.username || ':record'"
+                    " WHERE t.value='1'").fetchone()[0]
+                recorded = conn.execute(
+                    "SELECT COUNT(*) FROM stream_sessions WHERE state IN"
+                    " ('CONNECTING','RECORDING','ANALYZING','CLIPPING',"
+                    " 'EDITING','QUALITY_CHECK')").fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return (f"pipeline: {active}; source authorization and recorded "
+                    "session state unavailable (database unreadable)")
+        return (f"pipeline: {active}; {authorized} source(s) record-authorized; "
+                f"{recorded} recorded active session row(s) "
+                "(not process-liveness proof)")
 
     def _storage(self, _cmd) -> str:
         state = Path(os.environ.get("NOVA_STATE_DIR",
