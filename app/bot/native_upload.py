@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -72,15 +73,69 @@ def enabled() -> bool:
         "1", "true", "yes")
 
 
-def _fail_permanent(queue: JobQueue, job_id: int, error: str) -> None:
+def _fail_permanent(queue: JobQueue, job_id: int, error: str, *,
+                    notice: str | None = None,
+                    expected_attempts: int | None = None) -> None:
     """Terminal failure with no further retry, for outcomes whose retry
     is unsafe (uncertain upload, confirmation-write failure, uncertain
-    prior state). The FAILED row stays for reconciliation."""
+    prior state). The FAILED row stays for reconciliation. The flip is
+    a guarded CAS fenced to the CAPTURED claim identity (active
+    ANALYZING state, this worker's lock, and the claim's attempt count
+    when given): a duplicate, stale-callback or missing job is a no-op
+    - never a state overwrite, never an orphan notice. When notice is
+    given, it commits in the SAME transaction as a successful flip:
+    outbox-idempotent, exactly one row per terminal outcome, and a
+    crash persists neither half."""
+    guard = " WHERE id = ? AND state = 'ANALYZING' AND locked_by = ?"
+    params: list = [error[:2000], time.time(), job_id, WORKER_NAME]
+    if expected_attempts is not None:
+        guard += " AND attempts = ?"
+        params.append(expected_attempts)
+    if notice is not None:
+        from ..core import schedule
+        queue.conn.executescript(schedule.DDL)
+        queue.conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = queue.conn.execute(
+                "UPDATE job_queue SET state = 'FAILED', locked_by = NULL,"
+                " locked_at = NULL, last_error = ?, updated_at = ?"
+                + guard, params)
+            if cur.rowcount == 1:
+                schedule.notice_on_conn(queue.conn, notice)
+        except BaseException:
+            queue.conn.execute("ROLLBACK")
+            raise
+        queue.conn.execute("COMMIT")
+        return
     with queue.conn:
         queue.conn.execute(
             "UPDATE job_queue SET state = 'FAILED', locked_by = NULL,"
             " locked_at = NULL, last_error = ?, updated_at = ?"
-            " WHERE id = ?", (error[:2000], time.time(), job_id))
+            + guard, params)
+
+
+_STAGE_LABELS = {"auth": "auth", "session": "session",
+                 "upload": "upload"}
+
+
+def _stage_label(exc: Exception) -> str:
+    """Allowlisted stage token for owner-facing text; anything else,
+    including provider-shaped strings, collapses to 'unknown'."""
+    return _STAGE_LABELS.get(getattr(exc, "stage", None), "unknown")
+
+
+_VID_TEXT_RE = re.compile(r"[A-Za-z0-9_-]{6,64}")
+
+
+def _confirmed_notice(row_id: int, vid: str) -> str:
+    """Owner text for a confirmed upload. The returned video id is only
+    rendered into the URL when it has the expected YouTube id charset;
+    an unexpected provider string is never interpolated."""
+    if _VID_TEXT_RE.fullmatch(vid):
+        return (f"Clip #{row_id} uploaded to YouTube as PRIVATE: "
+                f"https://www.youtube.com/watch?v={vid}")
+    return (f"Clip #{row_id} uploaded to YouTube as PRIVATE; the returned "
+            f"video id had an unexpected format - see /publishhistory")
 
 
 LOCK_NAME = "native-upload.lock"
@@ -223,7 +278,12 @@ def _process_one_locked(conn, state_dir: Path, *,
                       job["id"])
         try:
             queue.fail(int(job["id"]),
-                       f"unexpected error: {exc.__class__.__name__}")
+                       f"unexpected error: {exc.__class__.__name__}",
+                       terminal_notice="A clip upload job ended "
+                                       "unexpectedly; no further "
+                                       "automatic retry. See /publishqueue",
+                       expected_worker=WORKER_NAME,
+                       expected_attempts=int(job["attempts"]))
             err = _terminal_error(queue, int(job["id"]))
             if err is not None:
                 _record_terminal_failure(state_dir, "native upload",
@@ -326,7 +386,11 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
         probe_fn = _default_probe(ffprobe)
     problem = _measure_clip(probe_fn, str(resolved))
     if problem is not None:
-        queue.fail(job_id, f"media check: {problem}")
+        queue.fail(job_id, f"media check: {problem}",
+                   terminal_notice=f"Clip #{row_id} failed the media check; "
+                                   f"no further automatic retry",
+                   expected_worker=WORKER_NAME,
+                   expected_attempts=int(job["attempts"]))
         log.warning("native upload job %s media check failed: %s",
                     job_id, problem)
         err = _terminal_error(queue, job_id)
@@ -344,7 +408,12 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
     try:
         pub = publisher_factory()
     except YouTubeNotConfigured:
-        queue.fail(job_id, "YouTube credentials not configured")
+        queue.fail(job_id, "YouTube credentials not configured",
+                   terminal_notice=f"Clip #{row_id} upload failed: YouTube "
+                                   f"credentials not configured; no "
+                                   f"further automatic retry",
+                   expected_worker=WORKER_NAME,
+                   expected_attempts=int(job["attempts"]))
         log.warning("native upload job %s: publisher not configured",
                     job_id)
         err = _terminal_error(queue, job_id)
@@ -397,7 +466,10 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                     queue, job_id,
                     (DENIED_PREFIX if rec.get("retryable") else UNREADABLE_PREFIX)
                     + str(rec.get("reason"))
-                    + " (clip stays HELD, nothing uploaded)")
+                    + " (clip stays HELD, nothing uploaded)",
+                    notice=f"Clip #{row_id} upload not authorized; nothing "
+                           f"was uploaded and the clip stays HELD",
+                    expected_attempts=int(job["attempts"]))
                 log.info("native upload job %s: repost not authorized; "
                          "no upload", job_id)
                 return True
@@ -413,7 +485,12 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                     _fail_permanent(
                         queue, job_id,
                         "prior upload outcome uncertain; reconcile in "
-                        "YouTube Studio before any retry")
+                        "YouTube Studio before any retry",
+                        notice=f"Clip #{row_id} upload outcome UNKNOWN: an "
+                               f"earlier attempt may already have uploaded "
+                               f"it. No automatic retry. Reconcile in "
+                               f"YouTube Studio, then see /publishqueue",
+                        expected_attempts=int(job["attempts"]))
                     _record_terminal_failure(
                         state_dir, "native upload", job_id,
                         f"clip #{row_id} uncertain; reconcile in Studio")
@@ -422,7 +499,9 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                 # UNCERTAIN at startup; a live one holds the lease (and
                 # we would have raised PublishBusy). Defer.
                 queue.fail(job_id, "upload already in progress "
-                           "(lease contention)")
+                           "(lease contention)",
+                           expected_worker=WORKER_NAME,
+                           expected_attempts=int(job["attempts"]))
                 err = _terminal_error(queue, job_id)
                 if err is not None:
                     _record_terminal_failure(state_dir, "native upload",
@@ -441,7 +520,12 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                     _fail_permanent(
                         queue, job_id,
                         f"upload outcome uncertain ({exc.stage}); "
-                        "reconcile in YouTube Studio")
+                        "reconcile in YouTube Studio",
+                        notice=f"Clip #{row_id} upload outcome UNKNOWN: the "
+                               f"video may already exist on YouTube. No "
+                               f"automatic retry. Reconcile in YouTube "
+                               f"Studio, then see /publishqueue",
+                        expected_attempts=int(job["attempts"]))
                     record_error(
                         state_dir,
                         f"native upload clip #{row_id} uncertain "
@@ -451,7 +535,12 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                     state_dir, row_id, str(exc), lease=lease,
                     attempt_token=token)
                 queue.fail(job_id,
-                           f"upload failed pre-flight ({exc.stage})")
+                           f"upload failed pre-flight ({exc.stage})",
+                           terminal_notice=f"Clip #{row_id} YouTube upload "
+                                           f"failed ({_stage_label(exc)}); "
+                                           f"no further automatic retry",
+                           expected_worker=WORKER_NAME,
+                           expected_attempts=int(job["attempts"]))
                 log.warning("native upload job %s definitive failure: %s",
                             job_id, exc.stage)
                 err = _terminal_error(queue, job_id)
@@ -466,7 +555,12 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                 _fail_permanent(
                     queue, job_id,
                     "upload outcome uncertain (unexpected error); "
-                    "reconcile in YouTube Studio")
+                    "reconcile in YouTube Studio",
+                    notice=f"Clip #{row_id} upload outcome UNKNOWN: the "
+                           f"video may already exist on YouTube. No "
+                           f"automatic retry. Reconcile in YouTube "
+                           f"Studio, then see /publishqueue",
+                    expected_attempts=int(job["attempts"]))
                 record_error(
                     state_dir,
                     f"native upload clip #{row_id} outcome uncertain: "
@@ -474,7 +568,9 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                 return True
             try:
                 publish_records.confirm(state_dir, row_id, vid,
-                                        lease=lease, attempt_token=token)
+                                        lease=lease, attempt_token=token,
+                                        notice=_confirmed_notice(row_id,
+                                                                 vid))
             except Exception:
                 # YouTube answered; local confirmation did not persist.
                 # Never report success, never retry. Keep the id.
@@ -488,7 +584,13 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
                 _fail_permanent(
                     queue, job_id,
                     "confirmation write failed after upload; reconcile "
-                    "in YouTube Studio")
+                    "in YouTube Studio",
+                    notice=f"Clip #{row_id} upload outcome UNKNOWN: YouTube "
+                           f"answered but the local confirmation failed, "
+                           f"so the video may already exist. No automatic "
+                           f"retry. Reconcile in YouTube Studio, then see "
+                           f"/publishqueue",
+                    expected_attempts=int(job["attempts"]))
                 record_error(
                     state_dir,
                     f"native upload clip #{row_id} confirmation write "
@@ -502,7 +604,9 @@ def _handle_claimed(conn, queue, state_dir: Path, job, *,
             return True
     except publish_records.PublishBusy:
         # A live publisher owns this clip; try again later.
-        queue.fail(job_id, "a live publisher holds this clip lease")
+        queue.fail(job_id, "a live publisher holds this clip lease",
+                   expected_worker=WORKER_NAME,
+                   expected_attempts=int(job["attempts"]))
         err = _terminal_error(queue, job_id)
         if err is not None:
             _record_terminal_failure(state_dir, "native upload", job_id,

@@ -140,11 +140,33 @@ def reserve(state_dir, clip_id, reserved_by, *, lease, gate=None):
 
 
 def _transition(state_dir, clip_id, from_state, to_state, *, lease,
-                attempt_token, video_id=None, error=None):
+                attempt_token, video_id=None, error=None, notice=None):
     lease.require(state_dir, clip_id)
     if not attempt_token:
         raise PublishStateError('nonempty attempt token required')
     with closing(_connect(state_dir)) as conn:
+        if notice is not None:
+            # The owner outcome notice commits in the SAME transaction as
+            # the terminal transition: a crash can never persist one
+            # without the other, and the (state, attempt_token) guard
+            # makes the pair exactly-once per attempt - a retried job
+            # finds the row already transitioned and cannot re-notify.
+            from ..core import schedule
+            conn.executescript(schedule.DDL)
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                cur = conn.execute('UPDATE publish_records SET state=?,video_id=COALESCE(?,video_id),'
+                                   'last_error=?,updated_at=? WHERE clip_id=? AND state=? AND attempt_token=?',
+                                   (to_state, video_id, (error or '')[:2000] or None,
+                                    time.time(), clip_id, from_state, attempt_token))
+                if cur.rowcount != 1:
+                    raise PublishStateError('publish transition rejected: stale attempt or state mismatch')
+                schedule.notice_on_conn(conn, notice)
+            except BaseException:
+                conn.execute('ROLLBACK')
+                raise
+            conn.execute('COMMIT')
+            return
         cur = conn.execute('UPDATE publish_records SET state=?,video_id=COALESCE(?,video_id),'
                            'last_error=?,updated_at=? WHERE clip_id=? AND state=? AND attempt_token=?',
                            (to_state, video_id, (error or '')[:2000] or None,
@@ -153,11 +175,11 @@ def _transition(state_dir, clip_id, from_state, to_state, *, lease,
             raise PublishStateError('publish transition rejected: stale attempt or state mismatch')
 
 
-def confirm(state_dir, clip_id, video_id, *, lease, attempt_token):
+def confirm(state_dir, clip_id, video_id, *, lease, attempt_token, notice=None):
     if not isinstance(video_id, str) or not video_id.strip():
         raise PublishStateError('nonempty confirmed video id required')
     _transition(state_dir, clip_id, 'RESERVED', 'CONFIRMED', lease=lease,
-                attempt_token=attempt_token, video_id=video_id)
+                attempt_token=attempt_token, video_id=video_id, notice=notice)
 
 
 def fail_definitive(state_dir, clip_id, error, *, lease, attempt_token):

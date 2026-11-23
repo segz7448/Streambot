@@ -53,27 +53,91 @@ class JobQueue:
     def complete(self, job_id: int) -> None:
         self._finish(job_id, "COMPLETED", None)
 
-    def fail(self, job_id: int, error: str) -> None:
+    def _ownership_guard(self, expected_worker, expected_attempts,
+                         sql: str, params: list) -> tuple[str, list]:
+        """Fence a mutation to the CAPTURED claim identity: the active
+        ANALYZING state plus the attempt count (and worker) read from
+        the job row at claim time. A stale callback from a recovered
+        and re-claimed attempt then matches nothing. Only callers
+        opting into ownership get the guard; legacy callers keep the
+        historical unguarded write."""
+        if expected_attempts is None and expected_worker is None:
+            return sql, params
+        sql += " AND state = 'ANALYZING'"
+        if expected_attempts is not None:
+            sql += " AND attempts = ?"
+            params.append(expected_attempts)
+        if expected_worker is not None:
+            sql += " AND locked_by = ?"
+            params.append(expected_worker)
+        return sql, params
+
+    def fail(self, job_id: int, error: str, *,
+             terminal_notice: Optional[str] = None,
+             expected_worker: Optional[str] = None,
+             expected_attempts: Optional[int] = None) -> None:
+        """terminal_notice is used only when THIS failure exhausts the
+        job's attempts: the owner notice then commits in the same
+        transaction as the FAILED flip (outbox-idempotent, exactly one
+        row per terminal outcome). Bounded retries stay silent. When
+        expected_worker/expected_attempts carry the captured claim
+        identity, a duplicate, stale or missing call mutates nothing
+        and never notifies."""
         row = self.conn.execute(
             "SELECT attempts, max_attempts FROM job_queue WHERE id = ?",
             (job_id,)).fetchone()
         if row and row["attempts"] < row["max_attempts"]:
             backoff = min(60, 2 ** row["attempts"])
+            sql, params = self._ownership_guard(
+                expected_worker, expected_attempts,
+                "UPDATE job_queue SET state = 'PENDING', run_after = ?,"
+                " locked_by = NULL, locked_at = NULL, last_error = ?,"
+                " updated_at = ? WHERE id = ?",
+                [time.time() + backoff, error[:2000], time.time(), job_id])
             with self.conn:
-                self.conn.execute(
-                    "UPDATE job_queue SET state = 'PENDING', run_after = ?,"
-                    " locked_by = NULL, locked_at = NULL, last_error = ?,"
-                    " updated_at = ? WHERE id = ?",
-                    (time.time() + backoff, error[:2000], time.time(), job_id))
+                self.conn.execute(sql, params)
         else:
-            self._finish(job_id, "FAILED", error)
+            self._finish(job_id, "FAILED", error, notice=terminal_notice,
+                         expected_worker=expected_worker,
+                         expected_attempts=expected_attempts)
 
-    def _finish(self, job_id: int, state: str, error: Optional[str]) -> None:
+    def _finish(self, job_id: int, state: str, error: Optional[str],
+                *, notice: Optional[str] = None,
+                expected_worker: Optional[str] = None,
+                expected_attempts: Optional[int] = None) -> None:
+        if notice is not None:
+            from . import schedule
+            self.conn.executescript(schedule.DDL)
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                sql, params = self._ownership_guard(
+                    expected_worker, expected_attempts,
+                    "UPDATE job_queue SET state = ?, locked_by = NULL,"
+                    " locked_at = NULL, last_error = ?, updated_at = ?"
+                    " WHERE id = ?",
+                    [state, error[:2000] if error else None, time.time(),
+                     job_id])
+                if expected_attempts is None and expected_worker is None:
+                    # notice callers always opt into ownership of the
+                    # active claim; keep a minimal active-state guard
+                    sql += " AND state = 'ANALYZING'"
+                cur = self.conn.execute(sql, params)
+                if cur.rowcount == 1:
+                    schedule.notice_on_conn(self.conn, notice)
+                # rowcount 0: duplicate/stale/missing - no state
+                # overwrite, no notice.
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+            self.conn.execute("COMMIT")
+            return
+        sql, params = self._ownership_guard(
+            expected_worker, expected_attempts,
+            "UPDATE job_queue SET state = ?, locked_by = NULL, locked_at = NULL,"
+            " last_error = ?, updated_at = ? WHERE id = ?",
+            [state, error[:2000] if error else None, time.time(), job_id])
         with self.conn:
-            self.conn.execute(
-                "UPDATE job_queue SET state = ?, locked_by = NULL, locked_at = NULL,"
-                " last_error = ?, updated_at = ? WHERE id = ?",
-                (state, error[:2000] if error else None, time.time(), job_id))
+            self.conn.execute(sql, params)
 
     def recover_interrupted(self) -> int:
         """Requeue jobs whose worker died. Called once at startup before any

@@ -74,6 +74,57 @@ class PublishRecordsTests(unittest.TestCase):
         self.assertEqual(pr.get(self.d, 1)['state'], 'UNCERTAIN')
         self.assertEqual(pr.recover_interrupted(self.d), 0)
 
+    def _notices(self):
+        with closing(sqlite3.connect(str(self.d / 'nova.db'))) as conn:
+            conn.row_factory = sqlite3.Row
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                "AND name='schedule_notices'").fetchone():
+                return []
+            return [dict(r) for r in conn.execute(
+                'SELECT * FROM schedule_notices ORDER BY id').fetchall()]
+
+    def test_confirm_notice_commits_atomically_exactly_once(self):
+        with pr.ClipLease(self.d, 1) as lease:
+            _, row = _reserve(self.d, 1, 'test', lease=lease)
+            token = row['attempt_token']
+            pr.confirm(self.d, 1, 'video-id', lease=lease,
+                       attempt_token=token, notice='uploaded yt:video-id')
+            # stale retry of the same attempt cannot duplicate the notice
+            with self.assertRaises(pr.PublishStateError):
+                pr.confirm(self.d, 1, 'video-id', lease=lease,
+                           attempt_token=token, notice='uploaded yt:video-id')
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]['text'], 'uploaded yt:video-id')
+        self.assertIsNone(notices[0]['sent_at'])
+        self.assertEqual(pr.get(self.d, 1)['state'], 'CONFIRMED')
+
+    def test_notice_rolls_back_with_failed_transition(self):
+        from app.core import schedule
+        original = schedule.notice_on_conn
+        def boom(c, text, schedule_id=None, now=None):
+            raise RuntimeError('simulated crash at enqueue')
+        schedule.notice_on_conn = boom
+        try:
+            with pr.ClipLease(self.d, 1) as lease:
+                _, row = _reserve(self.d, 1, 'test', lease=lease)
+                with self.assertRaises(RuntimeError):
+                    pr.confirm(self.d, 1, 'video-id', lease=lease,
+                               attempt_token=row['attempt_token'],
+                               notice='uploaded yt:video-id')
+        finally:
+            schedule.notice_on_conn = original
+        # neither half persisted: still RESERVED, zero notices
+        self.assertEqual(pr.get(self.d, 1)['state'], 'RESERVED')
+        self.assertEqual(self._notices(), [])
+
+    def test_transitions_without_notice_stay_silent(self):
+        with pr.ClipLease(self.d, 1) as lease:
+            _, row = _reserve(self.d, 1, 'test', lease=lease)
+            pr.confirm(self.d, 1, 'video-id', lease=lease,
+                       attempt_token=row['attempt_token'])
+        self.assertEqual(self._notices(), [])
+
     def _start_holder(self):
         from tests.process_helpers import track_children
         from tests.proc_workers import spawn_ready

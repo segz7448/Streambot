@@ -185,6 +185,287 @@ class NativeUploadTests(unittest.TestCase):
         self.assertIn("pre-flight", job["last_error"])
         self.assertIn("native upload", self._errors_ring())
 
+    def _notices(self):
+        conn = database.connect(self.db)
+        try:
+            if not conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND"
+                    " name='schedule_notices'").fetchone():
+                return []
+            return conn.execute(
+                "SELECT id, text, sent_at FROM schedule_notices"
+                " ORDER BY id").fetchall()
+        finally:
+            conn.close()
+
+    def _drain(self, n=6):
+        for _ in range(n):
+            conn = database.connect(self.db)
+            with conn:
+                conn.execute("UPDATE job_queue SET run_after = 0")
+            conn.close()
+            if self._run_once() != handoff.PROCESSED:
+                break
+
+    def test_preflight_retry_silent_then_confirmed_one_notice(self):
+        self.publisher.behavior = "definitive"
+        cid = self._add_held_clip()
+        self._admit(cid)
+        self.assertEqual(self._run_once(), handoff.PROCESSED)
+        self.assertEqual(self._jobs()[0]["state"], "PENDING")  # retry
+        self.assertEqual(self._notices(), [])  # retries stay silent
+        self.publisher.behavior = "ok"
+        self._drain()
+        self.assertEqual(self._jobs()[0]["state"], "COMPLETED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn(f"Clip #{cid} uploaded to YouTube as PRIVATE",
+                      notices[0]["text"])
+        self.assertIn("watch?v=ytNative123", notices[0]["text"])
+        # later cycles add nothing
+        self.assertEqual(self._run_once(), handoff.IDLE)
+        self.assertEqual(len(self._notices()), 1)
+
+    def test_exhaustion_exactly_one_terminal_notice(self):
+        self.publisher.behavior = "definitive"
+        cid = self._add_held_clip()
+        self._admit(cid)
+        self.assertEqual(self._run_once(), handoff.PROCESSED)
+        self.assertEqual(self._notices(), [])
+        self._drain()
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn(f"Clip #{cid} YouTube upload failed (auth)",
+                      notices[0]["text"])
+        self.assertIn("no further automatic retry", notices[0]["text"])
+        self.assertEqual(self._run_once(), handoff.IDLE)
+        self.assertEqual(len(self._notices()), 1)
+
+    def test_uncertain_one_honest_notice(self):
+        self.publisher.behavior = "uncertain"
+        cid = self._add_held_clip()
+        self._admit(cid)
+        self.assertEqual(self._run_once(), handoff.PROCESSED)
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        text = notices[0]["text"]
+        self.assertIn("UNKNOWN", text)
+        self.assertIn("may already exist", text)
+        self.assertIn("No automatic retry", text)
+        self.assertNotIn("definitively", text)
+        self.assertNotIn("connection dropped", text)  # no provider text
+        self.assertEqual(self._run_once(), handoff.IDLE)
+        self.assertEqual(len(self.publisher.calls), 1)
+        self.assertEqual(len(self._notices()), 1)
+
+    def test_unexpected_error_one_uncertain_notice(self):
+        self.publisher.behavior = "unexpected"
+        cid = self._add_held_clip()
+        self._admit(cid)
+        self.assertEqual(self._run_once(), handoff.PROCESSED)
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("UNKNOWN", notices[0]["text"])
+
+    def test_confirmation_write_failure_notice_keeps_uncertainty(self):
+        cid = self._add_held_clip()
+        self._admit(cid)
+        real_confirm = publish_records.confirm
+        publish_records.confirm = _raising_confirm
+        try:
+            self.assertEqual(self._run_once(), handoff.PROCESSED)
+        finally:
+            publish_records.confirm = real_confirm
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("UNKNOWN", notices[0]["text"])
+        self.assertIn("may already exist", notices[0]["text"])
+
+    def test_duplicate_processing_no_extra_notice(self):
+        cid = self._add_held_clip()
+        self._admit(cid)
+        self.assertEqual(self._run_once(), handoff.PROCESSED)
+        conn = database.connect(self.db)
+        with conn:
+            conn.execute(
+                "INSERT INTO job_queue (kind, payload_json, state,"
+                " max_attempts, run_after, created_at, updated_at)"
+                " VALUES (?, ?, 'PENDING', 3, 0, 0, 0)",
+                (HANDOFF_JOB_KIND,
+                 json.dumps({"clip_id": f"cliprow:{cid}",
+                             "intake_date": "2026-11-21"})))
+        conn.close()
+        self.assertEqual(self._run_once(), handoff.PROCESSED)
+        self.assertEqual(len(self.publisher.calls), 1)
+        self.assertEqual(len(self._notices()), 1)
+
+    def test_terminal_notice_rolls_back_with_failed_flip(self):
+        self.publisher.behavior = "definitive"
+        cid = self._add_held_clip()
+        self._admit(cid)
+        self.assertEqual(self._run_once(), handoff.PROCESSED)
+        from app.core import schedule
+        original = schedule.notice_on_conn
+        def boom(c, text, schedule_id=None, now=None):
+            raise RuntimeError("simulated crash at enqueue")
+        schedule.notice_on_conn = boom
+        try:
+            self._drain()
+        finally:
+            schedule.notice_on_conn = original
+        # the FAILED flip never persisted without its notice, and no
+        # partial notice exists
+        self.assertNotEqual(self._jobs()[0]["state"], "FAILED")
+        self.assertEqual(self._notices(), [])
+        # real startup recovery requeues the stranded job; the terminal
+        # outcome and its notice then land together, exactly once
+        conn = database.connect(self.db)
+        native_upload._prepare(self.state_dir, conn)
+        conn.close()
+        self._drain()
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        self.assertEqual(len(self._notices()), 1)
+
+    def test_crash_seam_uncertain_record_analyzing_job_recovers_once(self):
+        # crash between the UNCERTAIN record commit and the terminal
+        # flip+notice: real recovery must produce exactly one honest
+        # UNKNOWN notice and no second publisher call
+        self.publisher.behavior = "uncertain"
+        cid = self._add_held_clip()
+        self._admit(cid)
+        from app.core import schedule
+        original = schedule.notice_on_conn
+        def boom(c, text, schedule_id=None, now=None):
+            raise RuntimeError("simulated crash at enqueue")
+        schedule.notice_on_conn = boom
+        try:
+            self.assertEqual(self._run_once(), handoff.PROCESSED)
+        finally:
+            schedule.notice_on_conn = original
+        self.assertEqual(self._record(cid)["state"], "UNCERTAIN")
+        self.assertNotEqual(self._jobs()[0]["state"], "FAILED")
+        self.assertEqual(self._notices(), [])
+        conn = database.connect(self.db)
+        native_upload._prepare(self.state_dir, conn)
+        conn.close()
+        self._drain()
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("UNKNOWN", notices[0]["text"])
+        self.assertIn("may already", notices[0]["text"])
+        self.assertIn("No automatic retry", notices[0]["text"])
+        self.assertEqual(len(self.publisher.calls), 1)  # no re-upload
+
+    def test_credentials_exhaustion_one_terminal_notice(self):
+        cid = self._add_held_clip()
+        self._admit(cid)
+        def not_configured():
+            raise YouTubeNotConfigured("no credentials")
+        self.assertEqual(handoff.run_once(
+            self.state_dir, probe_fn=self.probe_fn,
+            publisher_factory=not_configured), handoff.PROCESSED)
+        self.assertEqual(self._notices(), [])  # bounded retry silent
+        for _ in range(6):
+            conn = database.connect(self.db)
+            with conn:
+                conn.execute("UPDATE job_queue SET run_after = 0")
+            conn.close()
+            if handoff.run_once(
+                    self.state_dir, probe_fn=self.probe_fn,
+                    publisher_factory=not_configured) != handoff.PROCESSED:
+                break
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("credentials not configured", notices[0]["text"])
+        self.assertEqual(len(self.publisher.calls), 0)
+
+    def test_media_check_exhaustion_one_terminal_notice(self):
+        cid = self._add_held_clip()
+        self._admit(cid)
+        bad_probe = lambda path: {"format": {"duration": "999.0"},
+                                  "streams": []}
+        run = lambda: handoff.run_once(self.state_dir, probe_fn=bad_probe,
+                                       publisher_factory=lambda: self.publisher)
+        self.assertEqual(run(), handoff.PROCESSED)
+        self.assertEqual(self._notices(), [])
+        for _ in range(6):
+            conn = database.connect(self.db)
+            with conn:
+                conn.execute("UPDATE job_queue SET run_after = 0")
+            conn.close()
+            if run() != handoff.PROCESSED:
+                break
+        self.assertEqual(self._jobs()[0]["state"], "FAILED")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("failed the media check", notices[0]["text"])
+        self.assertEqual(len(self.publisher.calls), 0)
+
+    def test_fail_permanent_duplicate_and_missing_never_notify(self):
+        cid = self._add_held_clip()
+        self._admit(cid)
+        conn = database.connect(self.db)
+        try:
+            queue = handoff.JobQueue(conn)
+            job = queue.claim(native_upload.WORKER_NAME)
+            jid = int(job["id"])
+            native_upload._fail_permanent(queue, jid, "first",
+                                          notice="terminal one")
+            # duplicate call on the already-FAILED job: no state
+            # overwrite, no second notice
+            native_upload._fail_permanent(queue, jid, "second",
+                                          notice="terminal two")
+            # missing job: no orphan notice, no error
+            native_upload._fail_permanent(queue, 999999, "ghost",
+                                          notice="orphan")
+        finally:
+            conn.close()
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["text"], "terminal one")
+        self.assertEqual(self._jobs()[0]["last_error"], "first")
+
+    def test_fail_permanent_stale_attempt_callback_no_mutation(self):
+        # claim attempt 1, real recovery, re-claim attempt 2 with the
+        # same worker, then a STALE attempt-1 permanent callback:
+        # nothing may change and no notice may be enqueued
+        cid = self._add_held_clip()
+        self._admit(cid)
+        conn = database.connect(self.db)
+        try:
+            queue = handoff.JobQueue(conn)
+            job1 = queue.claim(native_upload.WORKER_NAME)
+            jid = int(job1["id"])
+            self.assertEqual(int(job1["attempts"]), 1)
+            queue.recover_interrupted()
+            job2 = queue.claim(native_upload.WORKER_NAME)
+            self.assertEqual(int(job2["attempts"]), 2)
+            native_upload._fail_permanent(
+                queue, jid, "stale old error", notice="stale",
+                expected_attempts=1)
+            row = conn.execute(
+                "SELECT state, last_error FROM job_queue WHERE id=?",
+                (jid,)).fetchone()
+            self.assertEqual(row["state"], "ANALYZING")
+            self.assertIsNone(row["last_error"])
+            self.assertEqual(self._notices(), [])
+            # the LIVE attempt-2 callback still flips and notifies once
+            native_upload._fail_permanent(
+                queue, jid, "real error", notice="real terminal",
+                expected_attempts=2)
+        finally:
+            conn.close()
+        self.assertEqual(self._jobs()[0]["last_error"], "real error")
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["text"], "real terminal")
+
     def test_uncertain_failure_never_retried(self):
         self.publisher.behavior = "uncertain"
         cid = self._add_held_clip()
@@ -219,6 +500,10 @@ class NativeUploadTests(unittest.TestCase):
         self.assertEqual(self._jobs()[0]["state"], "FAILED")
         self.assertEqual(len(self.publisher.calls), 0)
         self.assertIn("reconcile", self._errors_ring())
+        notices = self._notices()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("UNKNOWN", notices[0]["text"])
+        self.assertIn("No automatic retry", notices[0]["text"])
 
     def test_confirmation_write_failure_keeps_video_id(self):
         cid = self._add_held_clip()
