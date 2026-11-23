@@ -282,7 +282,8 @@ class ReclaimTests(FinalizeTests):
 
     @staticmethod
     def _honest_edit(ffmpeg, src, dst, preset, a, b, runtime,
-                     watermark=None, pre_spawn=None, on_spawn=None):
+                     watermark=None, pre_spawn=None, on_spawn=None,
+                     framing=None):
         # mimics the real edit_clip contract: intent before spawn,
         # bind-or-refuse, then produce output
         from app.editing.editor import SpawnRefused
@@ -341,7 +342,8 @@ class ReclaimTests(FinalizeTests):
         from app.editing.editor import SpawnRefused
 
         def _fake_edit(ffmpeg, src, dst, preset, a, b, runtime,
-                       watermark=None, pre_spawn=None, on_spawn=None):
+                       watermark=None, pre_spawn=None, on_spawn=None,
+                       framing=None):
             token = pre_spawn() if pre_spawn else None
             bound = on_spawn(41, 41, token) if on_spawn else True
             if not bound:
@@ -485,7 +487,8 @@ class ReclaimTests(FinalizeTests):
         created = []
 
         def uncertain_edit(ffmpeg, src, dst, preset, a, b, runtime,
-                           watermark=None, pre_spawn=None, on_spawn=None):
+                           watermark=None, pre_spawn=None, on_spawn=None,
+                           framing=None):
             Path(dst).write_bytes(b"\x00" * 512)   # partial, uncertain
             created.append(dst)
             raise SpawnUncertain("death unconfirmed")
@@ -543,7 +546,7 @@ class ReclaimTests(FinalizeTests):
 
         def cancelled_edit(ffmpeg, src, dst, preset, a, b, runtime,
                            watermark=None, pre_spawn=None,
-                           on_spawn=None):
+                           on_spawn=None, framing=None):
             Path(dst).write_bytes(b"\x00" * 256)
             created.append(dst)
             raise KeyboardInterrupt()

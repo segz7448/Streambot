@@ -816,7 +816,8 @@ def finish_pending_clips(conn, *, state_dir, session_id: int, source_label,
                       PRESETS.get(plan.preset, PRESETS["vertical"]),
                       None, 0.5, str(runtime_dir),
                       watermark=plan.watermark or None,
-                      pre_spawn=pre_spawn, on_spawn=on_spawn)
+                      pre_spawn=pre_spawn, on_spawn=on_spawn,
+                      framing=plan.framing)
             qc = check_media(ffprobe, ffmpeg, str(edited),
                              1.0, 100, 100, True)
             if qc.ok:

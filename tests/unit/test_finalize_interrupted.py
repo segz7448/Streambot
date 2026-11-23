@@ -80,7 +80,7 @@ class FinalizeTests(unittest.TestCase):
         return rows
 
     def _patches(self):
-        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime,
+        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime, framing=None,
                       watermark=None, pre_spawn=None, on_spawn=None):
             Path(dst).write_bytes(b"\x00" * 2048)
         qc = mock.Mock(ok=True)
@@ -146,7 +146,7 @@ class FinalizeTests(unittest.TestCase):
         c2 = self._add_clip()
         edits = []
 
-        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime,
+        def fake_edit(ffmpeg, src, dst, preset, a, b, runtime, framing=None,
                       watermark=None, pre_spawn=None, on_spawn=None):
             edits.append(dst)
             Path(dst).write_bytes(b"\x00" * 2048)

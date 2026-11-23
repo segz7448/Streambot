@@ -39,7 +39,11 @@ class PresetTests(unittest.TestCase):
         # scales the full frame; the crop applies to the blurred
         # background fill only
         self.assertIn("split=2", g)
-        self.assertIn("[src_fg]scale=1080:-2[fg]", g)
+        # foreground fits INSIDE both canvas dimensions (portrait or
+        # wide), even-sized, SAR normalized - never a width-only scale
+        self.assertIn("[src_fg]scale=1080:1920:"
+                      "force_original_aspect_ratio=decrease:"
+                      "force_divisible_by=2,setsar=1[fg]", g)
         self.assertIn("overlay=(W-w)/2:(H-h)/2", g)
         self.assertNotIn("[src_fg]crop", g)
 
@@ -64,3 +68,40 @@ class PresetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlannerFramingTests(unittest.TestCase):
+    def test_plan_defaults_to_full_framing(self):
+        from app.intelligence.planner import plan_clip
+
+        class _Mem:
+            def get(self, *a):
+                return None
+
+        plan = plan_clip("auto", "chan", _Mem())
+        self.assertEqual(plan.framing, "full")
+        self.assertTrue(any("full framing" in r for r in plan.reasons))
+
+    def test_plan_explicit_crop_preference_only(self):
+        from app.intelligence.planner import plan_clip
+
+        class _Mem:
+            def get(self, kind, key):
+                if (kind, key) == ("preference", "framing"):
+                    return {"value": "crop", "confidence": "stated"}
+                return None
+
+        plan = plan_clip("auto", "chan", _Mem())
+        self.assertEqual(plan.framing, "crop")
+
+    def test_plan_inferred_crop_preference_ignored(self):
+        from app.intelligence.planner import plan_clip
+
+        class _Mem:
+            def get(self, kind, key):
+                if (kind, key) == ("preference", "framing"):
+                    return {"value": "crop", "confidence": "inferred"}
+                return None
+
+        plan = plan_clip("auto", "chan", _Mem())
+        self.assertEqual(plan.framing, "full")

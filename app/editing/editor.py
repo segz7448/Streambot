@@ -49,12 +49,17 @@ def full_frame_filter(preset: OutputPreset) -> str:
     center crop discards (e.g. a corner facecam), at the cost of a
     smaller active picture; the canvas is still an upscale of the
     source, never new detail."""
+    # foreground fits INSIDE both canvas dimensions (decrease), so a
+    # portrait/taller source is preserved exactly like a wide one;
+    # even dimensions and SAR normalized for the encoder
     return (
         f"split=2[src_bg][src_fg];"
         f"[src_bg]scale={preset.width}:{preset.height}:"
         f"force_original_aspect_ratio=increase:force_divisible_by=2,"
         f"crop={preset.width}:{preset.height},boxblur=20:2[bg];"
-        f"[src_fg]scale={preset.width}:-2[fg];"
+        f"[src_fg]scale={preset.width}:{preset.height}:"
+        f"force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        f"setsar=1[fg];"
         f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
     )
 

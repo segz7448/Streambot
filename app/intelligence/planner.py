@@ -46,6 +46,7 @@ class ClipPlan:
     title: str
     tags: list[str] = field(default_factory=list)
     watermark: str = ""
+    framing: str = "full"
     reasons: list[str] = field(default_factory=list)
 
 
@@ -104,6 +105,19 @@ def plan_clip(event_kind: str, source_login: str, memory,
         tags.insert(0, game.lower().replace(" ", ""))
     reasons.append("tags are creative preference, not platform policy")
 
+    # framing: this project preserves the whole source frame; only an
+    # explicit stated owner preference opts into the crop window
+    framing_row = memory.get("preference", "framing")
+    framing = "full"
+    if framing_row and framing_row["confidence"] == "stated" \
+            and framing_row["value"] == "crop":
+        framing = "crop"
+        reasons.append("crop framing from explicit owner preference")
+    else:
+        reasons.append("full framing: whole source frame preserved "
+                       "(no blind crop); a vertical canvas is not "
+                       "crop intent")
+
     wm_row = memory.get("preference", "watermark")
     watermark = wm_row["value"] if wm_row else ""
     if watermark:
@@ -111,4 +125,5 @@ def plan_clip(event_kind: str, source_login: str, memory,
 
     return ClipPlan(target_seconds=target, preset=preset, title=title,
                     tags=[t.strip() for t in tags if t.strip()],
-                    watermark=watermark, reasons=reasons)
+                    watermark=watermark, framing=framing,
+                    reasons=reasons)
