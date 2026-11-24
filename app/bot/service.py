@@ -860,6 +860,10 @@ def main() -> None:
     from ..core.logging import setup_service_logging
     setup_service_logging(os.path.join(state_dir, "logs"))
     log.info("service process starting pid=%d", os.getpid())
+    # durable death diagnostics: heartbeat + breadcrumbs + faulthandler.
+    # SIGKILL/host kills still leave no trace; see app.core.diagnostics.
+    from ..core import diagnostics
+    diagnostics.install(state_dir)
     if os.environ.get("NOVA_TITLE_SOURCE", "").strip().lower() != "off":
         # unofficial anonymous live-title read (owner-requested player route);
         # NOVA_TITLE_SOURCE=off keeps the gate closed. Read-only, no capture.
