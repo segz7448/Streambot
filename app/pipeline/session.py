@@ -332,6 +332,12 @@ class ClipSession:
                 log.exception("could not record drained session")
         if proven:
             self._finalized = True
+            hook = getattr(self, "_on_finalized", None)
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:
+                    log.exception("finalized hook failed")
 
     @staticmethod
     def _mark_state(db_path, session_id, state, error=None) -> None:

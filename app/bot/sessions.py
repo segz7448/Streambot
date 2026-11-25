@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import sqlite3
 import re
 import threading
@@ -17,9 +18,39 @@ from pathlib import Path
 from ..core import content_gate
 from ..distribution.relay import validate_feed
 from ..pipeline.session import ClipSession
+from . import source_lock
 
 _lock = threading.Lock()
 _sessions: dict[str, ClipSession] = {}
+
+_DEFAULT_MAX_HEIGHT = 720
+
+
+def _playback_max_height() -> int:
+    """Capture quality cap (px height) for public playback recording.
+
+    Default 720 (the historical cap). NOVA_PLAYBACK_MAX_HEIGHT raises or
+    lowers it for new sessions; an unparsable or out-of-range value falls
+    back to the default with a warning, never a silent widening. Raising
+    the cap only lets a higher SOURCE variant through (recorded as a
+    source copy); it does not by itself prove the device sustains the
+    higher rate, and a 16:9 source cropped to a 9:16 output still needs
+    enlargement - the crop window of a 1920x1080 frame is only ~607x1080.
+    """
+    raw = os.environ.get("NOVA_PLAYBACK_MAX_HEIGHT", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_HEIGHT
+    try:
+        height = int(raw)
+    except ValueError:
+        _log.warning("NOVA_PLAYBACK_MAX_HEIGHT=%r unparsable; using %d",
+                     raw, _DEFAULT_MAX_HEIGHT)
+        return _DEFAULT_MAX_HEIGHT
+    if not 144 <= height <= 2160:
+        _log.warning("NOVA_PLAYBACK_MAX_HEIGHT=%d out of range; using %d",
+                     height, _DEFAULT_MAX_HEIGHT)
+        return _DEFAULT_MAX_HEIGHT
+    return height
 
 
 @contextlib.contextmanager
@@ -240,6 +271,9 @@ def _discard_failed_start(username: str, session) -> None:
     except Exception:
         alive = True
     if not alive and _sessions.get(username) is session:
+        lock = getattr(session, "_source_lock", None)
+        if lock is not None:
+            lock.release()
         del _sessions[username]
 
 
@@ -358,8 +392,20 @@ def _startclip_owned(state_dir, username, ffmpeg, ffprobe, session_factory,
             refused = _gate_refusal(username, cached=True)  # no provider here
             if refused is not None:
                 return refused
+        # cross-process exclusion: the source lock outlives this
+        # process's in-memory registry, so another process (acceptance
+        # runner, CLI) cannot start the same source concurrently
+        if existing is not None:
+            old = getattr(existing, "_source_lock", None)
+            if old is not None:
+                old.release()   # replaced session already ended; free its lock
+        lock, why = source_lock.acquire(state_dir, username)
+        if lock is None:
+            return f"Not started: {why}. Nothing is recording."
         session = session_factory(ffmpeg, ffprobe, feed, username,
                                   state_dir)
+        session._source_lock = lock
+        session._on_finalized = lock.release
         _bind(session)
         _sessions[username] = session      # tracked BEFORE any effect
         try:
@@ -503,8 +549,9 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
         if refused is not None:
             release()
             return refused
+        max_height = _playback_max_height()
         resolved = (resolve_fn or tp.resolve)(
-            username, authorized=True,
+            username, authorized=True, max_height=max_height,
             should_stop=lambda: res._stopping.is_set() or not
             source_auth.allowed(state_dir, username, "record"),
             **(hooks or {}))
@@ -521,7 +568,7 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
     except BaseException:
         release()
         raise
-    pb = {"initial_resolved": resolved}
+    pb = {"initial_resolved": resolved, "max_height": max_height}
     pb.update({k: v for k, v in (hooks or {}).items()
                if k in ("opener", "host_ok")})
     try:
@@ -535,18 +582,27 @@ def startplayback_reply(state_dir: Path, username: str, ffmpeg: str,
             elif (refused := _gate_refusal(username, cached=True)) is not None:
                 msg = refused      # title stopped matching during startup
             else:
-                msg = None
-                session = session_factory(ffmpeg, ffprobe, "", username,
-                                          state_dir, playback=pb)
-                _bind(session)
-                res._released = True
-                _sessions[username] = session  # tracked BEFORE any effect
-                try:
-                    session.start()
-                except BaseException:
-                    _discard_failed_start(username, session)
-                    raise
-                _launched()
+                old = getattr(existing, "_source_lock", None)
+                if old is not None:
+                    old.release()   # replaced session already ended
+                lock, why = source_lock.acquire(state_dir, username)
+                if lock is None:
+                    msg = (f"Not started: {why}. Nothing is recording.")
+                else:
+                    msg = None
+                    session = session_factory(ffmpeg, ffprobe, "", username,
+                                              state_dir, playback=pb)
+                    session._source_lock = lock
+                    session._on_finalized = lock.release
+                    _bind(session)
+                    res._released = True
+                    _sessions[username] = session  # tracked BEFORE any effect
+                    try:
+                        session.start()
+                    except BaseException:
+                        _discard_failed_start(username, session)
+                        raise
+                    _launched()
         if msg is not None:
             release()
             return msg

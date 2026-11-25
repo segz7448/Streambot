@@ -16,7 +16,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-from app.bot import sessions as bot_sessions, source_auth
+from app.bot import sessions as bot_sessions, source_auth, source_lock
 from app.core import database
 from app.ingestion import twitch_playback as tp
 from app.pipeline.session import ClipSession, recover_interrupted_sessions
@@ -644,6 +644,10 @@ class StartPlayback(Base):
         self.assertIn("Repost to YouTube is OFF", out); self.assertIn("NOT backfilled", out)
         self.assertIn("HELD", out)
         source_auth.set_scope(self.sd, "streamerx", "repost", True)
+        for _s in bot_sessions._sessions.values():
+            _lk = getattr(_s, "_source_lock", None)
+            if _lk is not None:
+                _lk.release()
         bot_sessions._sessions.clear()
         out, st = self.reply("streamerx", lambda *a, **k: object())
         self.assertIn("Repost to YouTube is ON", out)
