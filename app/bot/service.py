@@ -57,7 +57,9 @@ class BotService:
         self.started_at = time.time()
         # polling-liveness record: positive proof past "Application started"
         # that getUpdates succeeds, without logging any content
-        self.poll_watch = PollWatch()
+        self.poll_watch = PollWatch(
+            error_log_path=str(store.path.parent / "logs"
+                               / "poll-errors.jsonl"))
         self.app = Application.builder() \
             .bot(PollWatchedBot(self.poll_watch, token=token)) \
             .post_init(self._start_handoff_consumer) \

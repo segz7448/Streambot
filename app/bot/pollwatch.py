@@ -14,8 +14,19 @@ parameters, payloads, chat ids or message text.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import threading
 import time
+
+from ..core import diagnostics
+
+log = logging.getLogger(__name__)
+
+# Durable poll-error record: class names + timestamps only, so a process
+# loss keeps its polling-error history instead of dying with it in memory.
+# Bounded to one rotating file; write failures never affect polling.
+_ERROR_LOG_CAP_BYTES = 64 * 1024  # ~900 error lines + one .1 generation
 
 from telegram import Bot
 
@@ -23,8 +34,10 @@ from telegram import Bot
 class PollWatch:
     """Content-free polling liveness record. Thread-safe."""
 
-    def __init__(self, clock=time.time):
+    def __init__(self, clock=time.time, error_log_path: str | None = None):
         self._clock = clock
+        self._error_log_path = error_log_path
+        self._last_persist_warn_at: float | None = None
         self._lock = threading.Lock()
         self.started_at = clock()
         self.last_ok_at: float | None = None
@@ -42,10 +55,38 @@ class PollWatch:
             self.updates_received += max(0, int(updates))
 
     def note_poll_error(self, kind: str) -> None:
+        now = self._clock()
         with self._lock:
             self.error_count += 1
             self.last_error_kind = kind
-            self.last_error_at = self._clock()
+            self.last_error_at = now
+            self._persist_error(kind, now)
+
+    def _persist_error(self, kind: str, now: float) -> None:
+        """Append {iso, ts, kind} to the durable error log. Content-free by
+        contract: the exception CLASS NAME only, never message text, URLs,
+        tokens or request bodies. Best-effort: any failure is logged and
+        swallowed so diagnostics can never take polling down."""
+        path = self._error_log_path
+        if not path:
+            return
+        try:
+            diagnostics._rotate_if_oversize(path, _ERROR_LOG_CAP_BYTES)
+            line = json.dumps({"iso": diagnostics._iso(now), "ts": now,
+                               "kind": str(kind)[:64]},
+                              separators=(",", ":"))
+            with diagnostics._open_private_append(path) as fh:
+                fh.write(line + "\n")
+        except Exception:
+            # Rate-limit the warning itself: under a persistent disk failure
+            # every poll error would otherwise add a log line (bounded on
+            # disk by nova.log's 2MB x 3 rotation, but churning useful
+            # history). One warning per 5 minutes is enough to notice.
+            last = self._last_persist_warn_at
+            if last is None or now - last >= 300:
+                self._last_persist_warn_at = now
+                log.warning("could not write poll error record",
+                            exc_info=True)
 
     def note_outbound(self) -> None:
         with self._lock:
