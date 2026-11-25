@@ -90,6 +90,9 @@ class BotService:
         self.router.register("clipnow", self._clipnow,
                              "create a Twitch clip via the official API "
                              "(requires configured Twitch OAuth)")
+        self.router.register("clipmark", self._clipmark,
+                             "mark the current moment in an active "
+                             "recording: /clipmark <user> [seconds-ago]")
         self.router.register("destinations", self._destinations,
                              "list/add/remove clip delivery destinations: "
                              "/destinations [add <chat_id> <label>|remove <chat_id>]")
@@ -202,6 +205,11 @@ class BotService:
     def _clipnow(self, cmd) -> str:
         from . import ops
         return ops.clipnow_reply(self._state_dir(), cmd.args, cmd.update_id)
+
+    def _clipmark(self, cmd) -> str:
+        from . import manual_mark
+        return manual_mark.clipmark_reply(
+            self._state_dir(), cmd.args, cmd.update_id)
 
     def _destinations(self, cmd) -> str:
         from . import ops

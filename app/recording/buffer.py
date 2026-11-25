@@ -589,11 +589,42 @@ class RollingBuffer:
                 if s.created_at > start
                 and s.created_at - s.duration_seconds < end]
 
+    def _pending_mark_floor(self) -> float | None:
+        """Earliest content time still needed by a pending manual mark
+        (its moment minus the pre-event window); None when none pending.
+        Pre-roll for a waiting mark must not be rotated away, but only until
+        its wait deadline: a hung tick loop can never pin an unbounded
+        growing capture past that bounded wait."""
+        if self._db_path is None:
+            return None
+        try:
+            conn = connect(self._db_path)
+            try:
+                at = conn.execute(
+                    "SELECT MIN(detected_at) FROM candidate_events"
+                    " WHERE session_id=? AND kind='manual_mark'"
+                    " AND status IN ('PENDING','QUEUED')"
+                    " AND (json_extract(metadata_json,'$.wait_deadline_at')"
+                    " IS NULL OR json_extract(metadata_json,"
+                    "'$.wait_deadline_at') > ?)",
+                    (self.session_id, time.time())).fetchone()[0]
+            finally:
+                conn.close()
+        except Exception:
+            return None
+        if at is None:
+            return None
+        return float(at) - self.pre_event_segments * self.segment_seconds
+
     def enforce_storage_cap(self, keep_after: float | None = None,
                             protect_newest: int = 2) -> int:
         """Delete oldest segments until under the cap. The newest segments
         (one may be actively written by ffmpeg) and segments inside the
         retention window of an event (keep_after) are preserved."""
+        floor = self._pending_mark_floor()
+        if floor is not None:
+            keep_after = floor if keep_after is None else min(keep_after,
+                                                              floor)
         segs = self.segments()
         total = sum(s.path.stat().st_size for s in segs)
         removed = 0

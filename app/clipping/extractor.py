@@ -23,7 +23,8 @@ class ClipPlan:
 
 def plan_clip(buffer: RollingBuffer, event_time: float,
               pre_seconds: float = 20.0,
-              post_seconds: float = 10.0) -> ClipPlan | None:
+              post_seconds: float = 10.0,
+              allow_stream_start: bool = False) -> ClipPlan | None:
     """Select buffered segments covering [event-pre, event+post].
 
     Segment mtimes mark each segment's END. Returns None when the buffer no
@@ -43,7 +44,17 @@ def plan_clip(buffer: RollingBuffer, event_time: float,
     window_start = first.created_at - first.duration_seconds
     wanted_start = event_time - pre_seconds
     if wanted_start < window_start - 0.5:
-        return None  # pre-event footage already rotated out
+        # Pre-roll missing. Two different causes:
+        #  - rotated out of the buffer (earlier segments existed and were
+        #    deleted): cannot clip, as before;
+        #  - the recording itself began less than pre_seconds before the
+        #    moment (the first segment of the session, sequence 0, is
+        #    still present, so nothing earlier ever existed): when the
+        #    caller opts in (manual marks) and the marked moment is
+        #    covered, clip from the recording start with a shorter pre-roll.
+        if not (allow_stream_start and first.sequence == 0
+                and event_time >= window_start):
+            return None  # pre-event footage already rotated out
     start_offset = max(0.0, wanted_start - window_start)
     window_end = window[-1].created_at
     duration = min(event_time + post_seconds, window_end) - (window_start + start_offset)
@@ -63,13 +74,16 @@ def extract_args(ffmpeg: str, concat_list: str, plan: ClipPlan,
 def extract_clip(ffmpeg: str, buffer: RollingBuffer, event_time: float,
                  out_path: str, pre_seconds: float = 10.0 - 10.0 + 20.0,
                  post_seconds: float = 10.0,
-                 pre_spawn=None, on_spawn=None) -> tuple[Path, float] | None:
+                 pre_spawn=None, on_spawn=None,
+                 allow_stream_start: bool = False
+                 ) -> tuple[Path, float] | None:
     """Extract the event window. Returns (path, real window duration in
     seconds) so callers can record how long the clip actually is; the
     planned duration comes from the segment layout, never assumed equal
     to pre+post (a window clipped by stream start or the live edge is
     shorter). Returns None when the window rotated out of the buffer."""
-    plan = plan_clip(buffer, event_time, pre_seconds, post_seconds)
+    plan = plan_clip(buffer, event_time, pre_seconds, post_seconds,
+                     allow_stream_start=allow_stream_start)
     if plan is None:
         return None
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:

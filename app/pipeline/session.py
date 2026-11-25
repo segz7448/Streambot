@@ -490,7 +490,12 @@ class ClipSession:
                     self._gate_closed = True
                     self.error = "live title gate closed; capture ended"
                     break
+                # closed segments become durable recording_segments rows
+                # WHILE recording (workers only reconcile at start/stop);
+                # manual-mark coverage depends on these rows
+                await self._owned(reconcile_durable_segments, buf, db_path)
                 await self._owned(clipper.process_pending)
+                await self._owned(notify_mark_outcomes, self.state_dir)
                 if not finishing:
                     # edit/QC is heavy; never block the recorder loop
                     finishing = True
@@ -580,7 +585,10 @@ class ClipSession:
                     # buffer tail closes so its true duration persists
                     buf.mark_drained()
                     await self._owned(detector.process_new_segments, True)
+                    await self._owned(reconcile_durable_segments, buf,
+                                      db_path)
                     await self._owned(clipper.process_pending)
+                    await self._owned(notify_mark_outcomes, self.state_dir)
                     await self._owned(
                         self._finish_clips, session_id, work,
                         self.state_dir / "runtime")
@@ -608,6 +616,25 @@ class ClipSession:
                     self.phase = "interrupted"
                     self.error = f"finalize failed: {exc.__class__.__name__}"
                     self._mark_state(db_path, session_id, "INTERRUPTED", self.error)
+
+
+def reconcile_durable_segments(buf, db_path) -> int:
+    """Record CLOSED on-disk segments as durable recording_segments rows
+    during recording. reconcile() never writes the open tail."""
+    try:
+        return buf.reconcile(db_path)
+    except Exception as exc:
+        log.warning("live segment reconcile failed: %s", exc.__class__.__name__)
+        return 0
+
+
+def notify_mark_outcomes(state_dir) -> int:
+    from ..bot import ops
+    try:
+        return ops.notify_manual_mark_outcomes(Path(state_dir))
+    except Exception as exc:
+        log.warning("mark outcome notify failed: %s", exc.__class__.__name__)
+        return 0
 
 
 def recover_interrupted_sessions(state_dir: Path) -> int:
@@ -1150,10 +1177,105 @@ def reclaim_dead_claims(conn, session_id: int, username: str,
     return out
 
 
+def extract_pending_manual_marks(state_dir, ffmpeg, ffprobe,
+                                 should_continue=None, on_spawn=None,
+                                 proc: str = "/proc",
+                                 clipper_factory=None) -> int:
+    """Extract durable owner marks left PENDING by an interrupted session.
+
+    This is the candidate-producing half of manual-mark recovery. It runs
+    only after the session's recorded leader and every recorded writer are
+    positively dead, then registers its extraction children in the same
+    session writer manifest. Heuristic candidates are untouched: recovery
+    must not turn a restart into a second automatic-selection pass.
+    Returns the number of raw clips produced; finishing them to HELD is
+    the existing sealed-clip recovery step.
+    """
+    from ..bot import source_auth
+    from ..bot.restartproof import (proof_for_session, record_spawn_intent,
+                                    record_spawned)
+    from ..clipping.auto import AutoClipper
+    from ..clipping.extractor import extract_clip as _extract
+    from ..clipping.manual import MANUAL_MARK_KIND
+    from ..intelligence.providers import HeuristicProvider
+    from ..recording.buffer import RollingBuffer, ffprobe_probe
+    import functools
+
+    state_dir = Path(state_dir)
+    db_path = str(state_dir / "nova.db")
+    if not Path(db_path).exists():
+        return 0
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        rows = conn.execute(
+            "SELECT s.id, t.username FROM stream_sessions s"
+            " JOIN twitch_sources t ON t.id=s.source_id"
+            " WHERE s.state='INTERRUPTED' AND EXISTS ("
+            " SELECT 1 FROM candidate_events e WHERE e.session_id=s.id"
+            " AND e.kind=? AND e.status IN ('PENDING','QUEUED'))",
+            (MANUAL_MARK_KIND,)).fetchall()
+    finally:
+        conn.close()
+
+    produced = 0
+    for sid, username in rows:
+        if should_continue is not None and not should_continue():
+            log.warning("manual-mark recovery stopped early (shutdown)")
+            break
+        if not source_auth.allowed(state_dir, username, "record"):
+            log.warning("manual-mark recovery skipped for session %s (%s): "
+                        "record authorization is off", sid, username)
+            continue
+        ok, why = proof_for_session(state_dir, username, sid, proc=proc)
+        if not ok:
+            log.warning("manual-mark recovery fenced for session %s: %s",
+                        sid, why)
+            continue
+        work = state_dir / "sessions" / username
+        registry = work / f"writers-{sid}.json"
+
+        def _pre_spawn(_p=registry):
+            return record_spawn_intent(_p)
+
+        def _on_spawn(pid, pgid, token, _p=registry, _hook=on_spawn):
+            bound = record_spawned(_p, token, pid, pgid)
+            if not bound:
+                return False
+            if _hook is None:
+                return True
+            try:
+                return bool(_hook(pid, pgid, token))
+            except Exception:
+                return False
+
+        buf = RollingBuffer(str(work), session_id=sid,
+                            probe=ffprobe_probe(ffprobe,
+                                                pre_spawn=_pre_spawn,
+                                                on_spawn=_on_spawn))
+        buf.bind_db(db_path)
+        buf.mark_drained()
+        buf.reconcile(db_path)
+        if clipper_factory is not None:
+            clipper = clipper_factory(buf, db_path, _pre_spawn, _on_spawn)
+        else:
+            clipper = AutoClipper(
+                buf, db_path, HeuristicProvider(), ffmpeg, str(work),
+                event_kinds=(MANUAL_MARK_KIND,),
+                extract_fn=functools.partial(_extract,
+                                             pre_spawn=_pre_spawn,
+                                             on_spawn=_on_spawn))
+        produced += clipper.process_pending()
+    notify_mark_outcomes(state_dir)
+    return produced
+
+
 def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
                                   should_continue=None,
                                   on_spawn=None,
-                                  outcome_cb=None) -> int:
+                                  outcome_cb=None,
+                                  proc: str = "/proc",
+                                  manual_clipper_factory=None) -> int:
     """Sealed-input recovery for sessions left INTERRUPTED: finish the
     clips whose raw input carries durable producer seal evidence so the
     work is not stranded invisible. Narrow and fail-closed on purpose:
@@ -1200,6 +1322,13 @@ def finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
     db = state_dir / "nova.db"
     if not db.exists():
         return 0
+    # First turn durable owner marks in interrupted sessions into sealed
+    # raw clips. The existing recovery below then edits/QCs only those
+    # sealed inputs; heuristic candidates are not replayed.
+    extract_pending_manual_marks(
+        state_dir, ffmpeg, ffprobe, should_continue=should_continue,
+        on_spawn=on_spawn, proc=proc, clipper_factory=manual_clipper_factory)
+
     conn = connect(str(db))
     migrate(conn)
     run_token = f"recovery-{uuid.uuid4().hex[:12]}"

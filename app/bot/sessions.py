@@ -631,7 +631,8 @@ def _interrupted_unfinished(conn) -> dict:
 
 
 def recoverclips_reply(state_dir: Path, ffmpeg: str, ffprobe: str, *,
-                       should_continue=None) -> str:
+                       should_continue=None,
+                       manual_clipper_factory=None) -> str:
     """Synchronous recovery worker (runs on the background thread via
     RecoveryTracker, never on the command loop): finish SEALED PENDING
     clips left by interrupted sessions to HELD for owner review. No
@@ -655,12 +656,16 @@ def recoverclips_reply(state_dir: Path, ffmpeg: str, ffprobe: str, *,
     # the recovery call always runs (even with nothing pending) so the
     # outcome reflects actual work; "nothing to do" is only honest when
     # nothing was pending AND nothing was finished
-    held = finalize_interrupted_sessions(state_dir, ffmpeg, ffprobe,
-                                         should_continue=should_continue)
-    if held == 0 and not eligible:
+    outcomes: list = []
+    held = finalize_interrupted_sessions(
+        state_dir, ffmpeg, ffprobe,
+        should_continue=should_continue,
+        outcome_cb=lambda cid, outcome: outcomes.append((cid, outcome)),
+        manual_clipper_factory=manual_clipper_factory)
+    if held == 0 and not eligible and not outcomes:
         return ("Recovery: nothing to do - no interrupted sessions "
                 "with unfinished clips.")
-    return _recovery_outcome_text(state_dir, held, eligible)
+    return _recovery_outcome_text(state_dir, held, eligible, outcomes)
 
 
 def _recovery_outcome_text(state_dir: Path, held: int,

@@ -360,6 +360,23 @@ def process_recording(ffmpeg: str, ffprobe: str, src_path: str,
     from ..core.jobs import JobQueue
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # same owner generation cap as the live path, checked in the
+        # write transaction that creates the clips row
+        from .quota import GENERATION_DAILY_CAP, check_quota
+        quota = check_quota(conn, session_id, now, cap=GENERATION_DAILY_CAP)
+        if not quota["allowed"]:
+            conn.rollback()
+            conn.close()
+            try:
+                Path(edited).unlink(missing_ok=True)
+            except OSError:
+                pass
+            result["status"] = "quota_exceeded"
+            result["detail"] = (
+                f"daily clip generation limit reached "
+                f"({quota['count']}/{quota['cap']}, scope "
+                f"{quota['scope']}); no clip was created")
+            return result
         cur = conn.execute(
             "INSERT INTO candidate_events (session_id, detected_at,"
             " kind, confidence, status, metadata_json) VALUES"

@@ -43,6 +43,37 @@ class PlanClipTests(unittest.TestCase):
         old = self.now - 600
         self.assertIsNone(plan_clip(self.buf, old, pre_seconds=10))
 
+    def test_stream_start_preroll_clips_only_when_opted_in(self):
+        ev = self.now - 26          # 4s after the recording began
+        self.assertIsNone(plan_clip(self.buf, ev, pre_seconds=10,
+                                    post_seconds=3))
+        plan = plan_clip(self.buf, ev, pre_seconds=10, post_seconds=3,
+                         allow_stream_start=True)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.start_offset, 0.0)
+        self.assertAlmostEqual(plan.duration, 7.0, delta=0.6)
+
+    def test_phone_case_mark_2s_in_with_3s_preroll(self):
+        ev = self.now - 30 + 2.2    # exact phone-run shape: 2.2s, pre 3s
+        self.assertIsNone(plan_clip(self.buf, ev, pre_seconds=3,
+                                    post_seconds=2))
+        plan = plan_clip(self.buf, ev, pre_seconds=3, post_seconds=2,
+                         allow_stream_start=True)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.start_offset, 0.0)
+
+    def test_rotation_is_never_treated_as_stream_start(self):
+        (self.buf.dir / "seg-000000.ts").unlink()    # earliest rotated out
+        ev = self.now - 21
+        self.assertIsNone(plan_clip(self.buf, ev, pre_seconds=10,
+                                    post_seconds=3,
+                                    allow_stream_start=True))
+
+    def test_stream_start_opt_in_needs_the_moment_itself_covered(self):
+        self.assertIsNone(plan_clip(self.buf, self.now - 40, pre_seconds=10,
+                                    post_seconds=3,
+                                    allow_stream_start=True))
+
     def test_extract_args_exact_cut(self):
         plan = plan_clip(self.buf, self.now - 16, pre_seconds=10, post_seconds=5)
         args = extract_args("ffmpeg", "list.txt", plan, "out.mp4")

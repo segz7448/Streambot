@@ -5,6 +5,8 @@ phone; app.bot.service handlers delegate here.
 """
 from __future__ import annotations
 
+import os
+
 import logging
 from pathlib import Path
 
@@ -136,8 +138,9 @@ def _journal_read(state_dir: Path) -> dict:
     return locked_read(state_dir / JOURNAL, {})
 
 
-SIDE_EFFECTING = ("clipnow", "relay", "ingest", "deliveries", "publish",
-                # /recoverclips starts a tracked background recovery; a
+SIDE_EFFECTING = ("clipnow", "clipmark", "relay", "ingest",
+                  "deliveries", "publish",
+                  # /recoverclips starts a tracked background recovery; a
                 # stranded one is marked UNCERTAIN and the owner is
                 # asked to re-send - boot never blind-replays recovery
                 "recoverclips")
@@ -714,3 +717,187 @@ def destinations_reply(state_dir: Path, args: str) -> str:
         return (f"Destination {chat_id} removed." if store.remove(chat_id)
                 else f"No destination {chat_id}.")
     return USAGE_DESTINATIONS
+
+
+_MARK_OUTCOME_TEXT = {
+    "MARK_UNCOVERED": ("Mark #{id} was NOT clipped: recorded footage never "
+                       "reached the moment you marked. No clip was made."),
+    "QUOTA_EXCEEDED": ("Mark #{id} was NOT clipped: the daily clip limit "
+                       "was already reached. No clip was made."),
+    "EXPIRED": ("Mark #{id} was NOT clipped: the footage before your mark "
+                "had already rotated out of the buffer."),
+    "FAILED": "Mark #{id} was NOT clipped: extraction failed.",
+    "MERGED": ("Mark #{id} was not clipped separately: it is the same "
+               "moment as an existing clip, so no duplicate was made."),
+}
+_MARK_TERMINAL = tuple(_MARK_OUTCOME_TEXT)
+
+
+MARK_NOTICE_MAX_SENDS = 20     # messages per call (rest wait for next tick)
+MARK_NOTICE_PAGE = 200         # rows fetched per page
+MARK_NOTICE_MAX_PAGES = 5      # pages scanned per call
+
+
+def _mark_notice_key_sql() -> str:
+    terms = ",".join(f"'{t}'" for t in _MARK_TERMINAL)
+    return (f"CASE WHEN e.status IN ({terms}) THEN 'final:'||e.status"
+            " WHEN k.status IN ('FAILED','QC_FAILED')"
+            " THEN 'clipfail:'||k.status ELSE 'trunc' END")
+
+
+def notify_manual_mark_outcomes(state_dir: Path, notify_fn=None) -> int:
+    """Tell the owner how each manual mark ended when it did not simply
+    become a clip (uncovered, over the limit, rotated, failed, merged),
+    when the clip's post-roll was cut short, when the finished clip failed
+    edit/QC, and when a previously reported failure was later recovered.
+
+    Delivery is AT-LEAST-ONCE, not exactly-once. The send happens first
+    and the durable record (table mark_notices in nova.db, no age
+    eviction) is written right after it, so a crash in that window
+    repeats ONE message on restart. Two notifiers running concurrently
+    against the same state (no cross-process lock here) can also both
+    send before either records, so duplicates are possible beyond the
+    crash window; this is not exactly-once. A send that raises is not recorded
+    and is retried on the next tick. Restarts and replays after the record
+    exists never re-announce.
+
+    Scan is bounded and cannot starve old marks: already-announced marks
+    are excluded in SQL, rows are read oldest-first by id cursor (at most
+    MARK_NOTICE_MAX_PAGES x MARK_NOTICE_PAGE rows per call), and at most
+    MARK_NOTICE_MAX_SENDS messages go out per call; the remainder is
+    picked up on later ticks. Never raises. Returns messages sent."""
+    import json as _json
+    import time as _t
+    from ..core.database import connect
+    state_dir = Path(state_dir)
+    sent = 0
+    keysql = _mark_notice_key_sql()
+    terms = ",".join(f"'{t}'" for t in _MARK_TERMINAL)
+    try:
+        conn = connect(str(state_dir / "nova.db"))
+    except Exception as exc:
+        log.warning("mark outcome scan failed: %s", exc)
+        return 0
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS mark_notices ("
+            " event_id INTEGER NOT NULL, key TEXT NOT NULL,"
+            " sent_at REAL NOT NULL, PRIMARY KEY (event_id, key))")
+        conn.commit()
+        if notify_fn is None:
+            from ..distribution.telegram_delivery import (
+                notify_admin_text_sync)
+            from ..core.tokensrc import source as _tsrc
+            if _tsrc() == "none":
+                return 0
+            token_path = os.environ.get("NOVA_TOKEN_FILE", "")
+            send = lambda t: notify_admin_text_sync(
+                token_path, str(state_dir), t)
+        else:
+            send = notify_fn
+
+        def deliver(eid, key, text, drop_prefix=None, drop_exact=None):
+            nonlocal sent
+            try:
+                send(text)
+            except Exception as exc:
+                log.warning("mark #%s outcome notice not sent: %s",
+                            eid, exc)
+                return False
+            try:
+                if drop_prefix:
+                    conn.execute(
+                        "DELETE FROM mark_notices WHERE event_id=?"
+                        " AND (key LIKE ? OR key LIKE ?)",
+                        (eid, drop_prefix[0], drop_prefix[1]))
+                if drop_exact:
+                    conn.execute("DELETE FROM mark_notices WHERE"
+                                 " event_id=? AND key=?", (eid, drop_exact))
+                conn.execute(
+                    "INSERT OR REPLACE INTO mark_notices VALUES (?,?,?)",
+                    (eid, key, _t.time()))
+                conn.commit()
+            except Exception as exc:
+                log.warning("mark #%s notice record failed: %s", eid, exc)
+            sent += 1
+            return True
+
+        cursor = 0
+        for _page in range(MARK_NOTICE_MAX_PAGES):
+            if sent >= MARK_NOTICE_MAX_SENDS:
+                break
+            rows = conn.execute(
+                "SELECT id, status, meta, cstatus, nkey FROM ("
+                " SELECT e.id AS id, e.status AS status,"
+                "  e.metadata_json AS meta, k.status AS cstatus,"
+                f"  {keysql} AS nkey"
+                " FROM candidate_events e"
+                " LEFT JOIN clips k ON k.event_id=e.id"
+                " WHERE e.kind='manual_mark' AND e.id>?"
+                f"  AND (e.status IN ({terms})"
+                "   OR k.status IN ('FAILED','QC_FAILED')"
+                "   OR (e.status='CLIPPED' AND"
+                "       json_valid(e.metadata_json) AND"
+                "       json_extract(e.metadata_json,"
+                "        '$.post_window_truncated')=1))"
+                ") x WHERE NOT EXISTS (SELECT 1 FROM mark_notices n"
+                " WHERE n.event_id=x.id AND n.key=x.nkey)"
+                " ORDER BY id ASC LIMIT ?",
+                (cursor, MARK_NOTICE_PAGE)).fetchall()
+            if not rows:
+                break
+            for eid, status, meta_json, cstatus, nkey in rows:
+                cursor = max(cursor, eid)
+                if sent >= MARK_NOTICE_MAX_SENDS:
+                    cursor = eid - 1   # resume here next tick (stateless)
+                    break
+                if status in _MARK_TERMINAL:
+                    text = _MARK_OUTCOME_TEXT[status].format(id=eid)
+                elif cstatus in ("FAILED", "QC_FAILED"):
+                    text = (f"Mark #{eid} produced a clip that failed "
+                            "editing or quality checks, so it was not "
+                            "delivered.")
+                else:
+                    try:
+                        meta = _json.loads(meta_json or "{}")
+                    except ValueError:
+                        meta = {}
+                    if not meta.get("post_window_truncated"):
+                        continue
+                    text = (f"Mark #{eid} was clipped, but the footage "
+                            "after your moment was cut short (recording "
+                            "ended or stalled). The moment itself is in "
+                            "the clip.")
+                # a new failure supersedes an earlier 'recovered' record
+                deliver(eid, nkey, text,
+                        drop_exact="recovered"
+                        if nkey != "trunc" else None)
+        # Recovered: a failure was announced, the mark later became a
+        # good clip. Correct the earlier message once.
+        if sent < MARK_NOTICE_MAX_SENDS:
+            rec = conn.execute(
+                "SELECT e.id FROM candidate_events e"
+                " LEFT JOIN clips k ON k.event_id=e.id"
+                " WHERE e.kind='manual_mark' AND e.status='CLIPPED'"
+                " AND k.status IN ('HELD','DELIVERED')"
+                " AND EXISTS (SELECT 1 FROM mark_notices n WHERE"
+                "  n.event_id=e.id AND (n.key LIKE 'final:%'"
+                "  OR n.key LIKE 'clipfail:%'))"
+                " AND NOT EXISTS (SELECT 1 FROM mark_notices n WHERE"
+                "  n.event_id=e.id AND n.key='recovered')"
+                " ORDER BY e.id ASC LIMIT ?",
+                (MARK_NOTICE_MAX_SENDS - sent,)).fetchall()
+            for (eid,) in rec:
+                deliver(eid, "recovered",
+                        f"Update: mark #{eid} was recovered and clipped "
+                        "after the earlier failure notice. Ignore that "
+                        "notice.",
+                        drop_prefix=("final:%", "clipfail:%"))
+    except Exception as exc:
+        log.warning("mark outcome scan failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return sent
